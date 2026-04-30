@@ -1,0 +1,17 @@
+# Normalize all text to LF in repo and on checkout.
+* text=auto eol=lf
+
+# Force LF for source files.
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h text eol=lf
+*.c text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.cmake text eol=lf
+*.sql text eol=lf
+CMakeLists.txt text eol=lf

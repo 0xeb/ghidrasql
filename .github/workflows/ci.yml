@@ -1,0 +1,131 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*", "V*"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-cli:
+    name: Build CLI (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            cli_artifact: cli-linux
+            cli_path: build/bin/ghidrasql
+          - name: macOS
+            os: macos-latest
+            cli_artifact: cli-macos
+            cli_path: build/bin/ghidrasql
+          - name: Windows
+            os: windows-latest
+            cli_artifact: cli-windows
+            cli_path: build/bin/Release/ghidrasql.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout libghidra
+        uses: actions/checkout@v4
+        with:
+          repository: 0xeb/libghidra
+          path: libghidra
+          fetch-depth: 1
+          token: ${{ secrets.LIBGHIDRA_REPO_TOKEN }}
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DGHIDRASQL_LIBGHIDRA_DIR=${{ github.workspace }}/libghidra/cpp
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Smoke test CLI
+        run: ${{ matrix.cli_path }} --version
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.cli_artifact }}
+          path: ${{ matrix.cli_path }}
+
+  publish-draft-release:
+    name: Publish Draft Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-cli]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux
+          path: cli-linux
+
+      - name: Download macOS CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-macos
+          path: cli-macos
+
+      - name: Download Windows CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-windows
+          path: cli-windows
+
+      - name: Prepare release zips
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/linux release/macos release/windows
+          cp cli-linux/ghidrasql release/linux/ghidrasql
+          cp cli-macos/ghidrasql release/macos/ghidrasql
+          cp cli-windows/ghidrasql.exe release/windows/ghidrasql.exe
+          cp README.md release/linux/
+          cp README.md release/macos/
+          cp README.md release/windows/
+          (
+            cd release/linux
+            zip -9 "../ghidrasql-cli-linux-${GITHUB_REF_NAME}.zip" ghidrasql README.md
+          )
+          (
+            cd release/macos
+            zip -9 "../ghidrasql-cli-macos-${GITHUB_REF_NAME}.zip" ghidrasql README.md
+          )
+          (
+            cd release/windows
+            zip -9 "../ghidrasql-cli-windows-${GITHUB_REF_NAME}.zip" ghidrasql.exe README.md
+          )
+          ls -la release
+
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ghidrasql ${{ github.ref_name }}
+          draft: true
+          prerelease: ${{ contains(github.ref_name, 'alpha') }}
+          generate_release_notes: true
+          files: |
+            release/ghidrasql-cli-linux-${{ github.ref_name }}.zip
+            release/ghidrasql-cli-macos-${{ github.ref_name }}.zip
+            release/ghidrasql-cli-windows-${{ github.ref_name }}.zip
