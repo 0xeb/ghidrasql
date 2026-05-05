@@ -48,16 +48,16 @@ std::optional<model::FunctionRow> read_function_row_for(
     return std::nullopt;
 }
 
-std::vector<model::DecompLvarRow> read_seeded_decomp_lvar_rows_for(
+std::vector<model::DecompLvarRow> read_source_decomp_lvar_rows_for(
     const std::shared_ptr<Source>& source, std::int64_t func_addr)
 {
-    std::vector<model::DecompLvarRow> seeded;
-    if (!source->read_decomp_lvars(seeded) || seeded.empty()) {
+    std::vector<model::DecompLvarRow> source_rows;
+    if (!source->read_decomp_lvars(source_rows) || source_rows.empty()) {
         return {};
     }
     std::vector<model::DecompLvarRow> out;
-    out.reserve(seeded.size());
-    for (const auto& row : seeded) {
+    out.reserve(source_rows.size());
+    for (const auto& row : source_rows) {
         if (row.func_addr == func_addr) {
             out.push_back(row);
         }
@@ -84,67 +84,8 @@ std::vector<model::DecompLvarRow> merge_decomp_lvar_rows(
 
 }  // namespace
 
-std::string build_row_counts_json(const model::LiveDataset& dataset) {
-    xsql::json row_counts = {
-        {"funcs", dataset.functions.size()},
-        {"segments", dataset.segments.size()},
-        {"memory_blocks", dataset.memory_blocks.size()},
-        {"memory_bytes", dataset.memory_bytes.size()},
-        {"names", dataset.symbols.size()},
-        {"imports", dataset.imports.size()},
-        {"exports", dataset.exports.size()},
-        {"strings", dataset.strings.size()},
-        {"xrefs", dataset.xrefs.size()},
-        {"call_edges", dataset.call_edges.size()},
-        {"function_calls", dataset.function_calls.size()},
-        {"blocks", dataset.blocks.size()},
-        {"cfg_edges", dataset.cfg_edges.size()},
-        {"loops", dataset.loops.size()},
-        {"switch_tables", dataset.switch_tables.size()},
-        {"dominators", dataset.dominators.size()},
-        {"post_dominators", dataset.post_dominators.size()},
-        {"instructions", dataset.instructions.size()},
-        {"comments", dataset.comments.size()},
-        {"data_items", dataset.data_items.size()},
-        {"function_locals", dataset.function_locals.size()},
-        {"stack_vars", dataset.stack_vars.size()},
-        {"register_vars", dataset.register_vars.size()},
-        {"function_chunks", dataset.function_chunks.size()},
-        {"tail_calls", dataset.tail_calls.size()},
-        {"program_options", dataset.program_options.size()},
-        {"analysis_passes", dataset.analysis_passes.size()},
-        {"transactions", dataset.transactions.size()},
-        {"project_properties", dataset.project_properties.size()},
-        {"relocations", dataset.relocations.size()},
-        {"constants", dataset.constants.size()},
-        {"equates", dataset.equates.size()},
-        {"types", dataset.types.size()},
-        {"type_members", dataset.type_members.size()},
-        {"type_enums", dataset.type_enums.size()},
-        {"type_enum_members", dataset.type_enum_members.size()},
-        {"type_unions", dataset.type_unions.size()},
-        {"type_aliases", dataset.type_aliases.size()},
-        {"signatures", dataset.signatures.size()},
-        {"function_params", dataset.function_params.size()},
-        {"function_frames", dataset.function_frames.size()},
-        {"text_index", dataset.text_index.size()},
-        {"search_index", dataset.search_index.size()},
-        {"xref_index", dataset.xref_index.size()},
-        {"function_metrics", dataset.function_metrics.size()},
-        {"pseudocode", dataset.pseudocode.size()},
-        {"decomp_lvars", dataset.decomp_lvars.size()},
-        {"decomp_comments", dataset.decomp_comments.size()},
-        {"decomp_tokens", dataset.decomp_tokens.size()},
-        {"breakpoints", dataset.breakpoints.size()},
-        {"bookmarks", dataset.bookmarks.size()},
-        {"sql_capabilities", dataset.capabilities.size()},
-        {"parity_findings", dataset.parity_findings.size()},
-        {"perf_benchmarks", dataset.perf_benchmarks.size()},
-    };
-    return row_counts.dump();
-}
-
 std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
+    std::vector<model::ProjectFileRow> project_files;
     std::vector<model::FunctionRow> funcs;
     std::vector<model::SegmentRow> segments;
     std::vector<model::MemoryBlockRow> memory_blocks;
@@ -175,6 +116,7 @@ std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
     std::vector<model::ParityFindingRow> parity_findings;
     std::vector<model::PerfBenchmarkRow> perf_benchmarks;
 
+    source->read_project_files(project_files);
     source->read_functions(funcs);
     source->read_segments(segments);
     source->read_memory_blocks(memory_blocks);
@@ -206,6 +148,11 @@ std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
     source->read_perf_benchmarks(perf_benchmarks);
 
     xsql::json row_counts = {
+        {"project_files", project_files.size()},
+        {"project_programs", std::count_if(
+            project_files.begin(),
+            project_files.end(),
+            [](const model::ProjectFileRow& row) { return row.is_program != 0; })},
         {"funcs", funcs.size()},
         {"segments", segments.size()},
         {"memory_blocks", memory_blocks.size()},
@@ -398,66 +345,21 @@ std::int64_t parse_param_count_from_prototype(const std::string& prototype) {
     return static_cast<std::int64_t>(split_csv_params(inside).size());
 }
 
-const model::SignatureRow* signature_for_function(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    std::int64_t func_addr)
-{
-    if (!dataset) {
-        return nullptr;
-    }
-    for (const auto& sig : dataset->signatures) {
-        if (sig.owner_kind == "function" && sig.owner_addr == func_addr) {
-            return &sig;
-        }
-    }
-    return nullptr;
-}
-
-std::string function_return_type(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    const model::FunctionRow& row)
-{
-    if (const auto* sig = signature_for_function(dataset, row.address)) {
-        if (!sig->return_type.empty()) {
-            return sig->return_type;
-        }
-        if (!sig->prototype.empty()) {
-            return parse_return_type_from_prototype(sig->prototype);
-        }
-    }
+std::string function_return_type(const model::FunctionRow& row) {
     if (!row.signature.empty()) {
         return parse_return_type_from_prototype(row.signature);
     }
     return "void";
 }
 
-std::int64_t function_arg_count(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    const model::FunctionRow& row)
-{
-    if (const auto* sig = signature_for_function(dataset, row.address)) {
-        if (sig->param_count >= 0) {
-            return sig->param_count;
-        }
-        if (!sig->prototype.empty()) {
-            return parse_param_count_from_prototype(sig->prototype);
-        }
-    }
+std::int64_t function_arg_count(const model::FunctionRow& row) {
     if (!row.signature.empty()) {
         return parse_param_count_from_prototype(row.signature);
     }
     return 0;
 }
 
-std::string function_calling_convention(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    const model::FunctionRow& row)
-{
-    if (const auto* sig = signature_for_function(dataset, row.address)) {
-        if (!sig->calling_convention.empty()) {
-            return sig->calling_convention;
-        }
-    }
+std::string function_calling_convention(const model::FunctionRow& row) {
     (void)row;
     return "";
 }
@@ -569,31 +471,6 @@ std::int64_t function_for_address(
         }
     }
     return 0;
-}
-
-std::int64_t function_for_address(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    std::int64_t address)
-{
-    if (!dataset) {
-        return 0;
-    }
-    return function_for_address(dataset->functions, address);
-}
-
-std::string segment_name_for_address(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    std::int64_t address)
-{
-    if (!dataset) {
-        return {};
-    }
-    for (const auto& seg : dataset->segments) {
-        if (address >= seg.start_ea && address < seg.end_ea) {
-            return seg.name;
-        }
-    }
-    return {};
 }
 
 std::vector<SegmentRange> build_segment_ranges(const std::vector<model::SegmentRow>& segments) {
@@ -740,50 +617,10 @@ size_t telemetry_scaled(size_t base_rows, double ratio, size_t floor_rows) {
     return std::max(rounded, floor_rows);
 }
 
-size_t telemetry_func_floor(const std::shared_ptr<const model::LiveDataset>& dataset, size_t floor_rows) {
-    if (!dataset) {
-        return 0;
-    }
-    return std::max<size_t>(dataset->functions.size(), floor_rows);
-}
-
-size_t telemetry_instr_hint(const std::shared_ptr<const model::LiveDataset>& dataset) {
-    if (!dataset) {
-        return size_t(4096);
-    }
-    if (!dataset->instructions.empty()) {
-        return dataset->instructions.size();
-    }
-    // Tuned from real large-program telemetry (notepad.exe + kernel32.dll, ~57.4 instructions/function).
-    return telemetry_scaled(telemetry_func_floor(dataset), 57.4, 2048);
-}
-
-size_t telemetry_name_hint(const std::shared_ptr<const model::LiveDataset>& dataset) {
-    if (!dataset) {
-        return size_t(1024);
-    }
-    if (!dataset->symbols.empty()) {
-        return dataset->symbols.size();
-    }
-    // Tuned from real large-program telemetry (notepad.exe + kernel32.dll, ~8.6 names/function).
-    return telemetry_scaled(telemetry_func_floor(dataset), 8.6, 128);
-}
-
-size_t telemetry_xref_hint(const std::shared_ptr<const model::LiveDataset>& dataset) {
-    if (!dataset) {
-        return size_t(4096);
-    }
-    if (!dataset->xrefs.empty()) {
-        return dataset->xrefs.size();
-    }
-    // Tuned from real large-program telemetry (notepad.exe + kernel32.dll, ~27.8 xrefs/function).
-    return telemetry_scaled(telemetry_func_floor(dataset), 27.8, 1024);
-}
-
 std::vector<model::PseudocodeRow> derive_pseudocode_rows(const std::shared_ptr<Source>& source) {
-    std::vector<model::PseudocodeRow> seeded;
-    if (source->read_pseudocode(seeded) && !seeded.empty()) {
-        return seeded;
+    std::vector<model::PseudocodeRow> source_rows;
+    if (source->read_pseudocode(source_rows) && !source_rows.empty()) {
+        return source_rows;
     }
 
     std::vector<model::FunctionRow> functions;
@@ -803,9 +640,9 @@ std::vector<model::PseudocodeRow> derive_pseudocode_rows(const std::shared_ptr<S
 }
 
 std::vector<model::DecompLvarRow> derive_decomp_lvar_rows(const std::shared_ptr<Source>& source) {
-    std::vector<model::DecompLvarRow> seeded;
-    if (source->read_decomp_lvars(seeded) && !seeded.empty()) {
-        return seeded;
+    std::vector<model::DecompLvarRow> source_rows;
+    if (source->read_decomp_lvars(source_rows) && !source_rows.empty()) {
+        return source_rows;
     }
 
     std::vector<model::FunctionRow> functions;
@@ -822,9 +659,9 @@ std::vector<model::DecompLvarRow> derive_decomp_lvar_rows(const std::shared_ptr<
 }
 
 std::vector<model::DecompCommentRow> derive_decomp_comment_rows(const std::shared_ptr<Source>& source) {
-    std::vector<model::DecompCommentRow> seeded;
-    if (source->read_decomp_comments(seeded) && !seeded.empty()) {
-        return seeded;
+    std::vector<model::DecompCommentRow> source_rows;
+    if (source->read_decomp_comments(source_rows) && !source_rows.empty()) {
+        return source_rows;
     }
 
     std::vector<model::CommentRow> comments;
@@ -903,9 +740,9 @@ std::vector<model::DecompLvarRow> derive_decomp_lvar_rows_for(
         return {};
     }
 
-    const auto seeded_rows = read_seeded_decomp_lvar_rows_for(source, func_addr);
-    if (!seeded_rows.empty()) {
-        return seeded_rows;
+    const auto source_rows = read_source_decomp_lvar_rows_for(source, func_addr);
+    if (!source_rows.empty()) {
+        return source_rows;
     }
 
     if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
@@ -951,9 +788,9 @@ std::vector<model::DecompCommentRow> derive_decomp_comment_rows_for(
 }
 
 std::vector<model::DecompTokenRow> derive_decomp_token_rows(const std::shared_ptr<Source>& source) {
-    std::vector<model::DecompTokenRow> seeded;
-    if (source->read_decomp_tokens(seeded) && !seeded.empty()) {
-        return seeded;
+    std::vector<model::DecompTokenRow> source_rows;
+    if (source->read_decomp_tokens(source_rows) && !source_rows.empty()) {
+        return source_rows;
     }
 
     // Fallback: derive tokens per function via decompile_detail.
@@ -981,11 +818,11 @@ std::vector<model::DecompTokenRow> derive_decomp_token_rows_for(
         return {};
     }
 
-    // Seeded path: if the source already has bulk token data, filter it.
-    std::vector<model::DecompTokenRow> seeded;
-    if (source->read_decomp_tokens(seeded) && !seeded.empty()) {
+    // Source-provided path: if the source already has bulk token data, filter it.
+    std::vector<model::DecompTokenRow> source_rows;
+    if (source->read_decomp_tokens(source_rows) && !source_rows.empty()) {
         std::vector<model::DecompTokenRow> out;
-        for (auto& r : seeded) {
+        for (auto& r : source_rows) {
             if (r.func_addr == func_addr) {
                 out.push_back(std::move(r));
             }

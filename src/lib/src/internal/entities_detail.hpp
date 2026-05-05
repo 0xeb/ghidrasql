@@ -34,7 +34,6 @@ struct FunctionRange {
     std::int64_t func_addr = 0;
 };
 
-std::string build_row_counts_json(const model::LiveDataset& dataset);
 std::string build_row_counts_json(const std::shared_ptr<Source>& source);
 std::string trim_copy(const std::string& input);
 std::vector<std::string> split_csv_params(const std::string& params);
@@ -42,15 +41,9 @@ std::string infer_param_name(const std::string& param_decl, size_t idx);
 std::string lower_copy(std::string text);
 std::string parse_return_type_from_prototype(const std::string& prototype);
 std::int64_t parse_param_count_from_prototype(const std::string& prototype);
-std::string function_return_type(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    const model::FunctionRow& row);
-std::int64_t function_arg_count(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    const model::FunctionRow& row);
-std::string function_calling_convention(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    const model::FunctionRow& row);
+std::string function_return_type(const model::FunctionRow& row);
+std::int64_t function_arg_count(const model::FunctionRow& row);
+std::string function_calling_convention(const model::FunctionRow& row);
 std::string normalize_type_token(std::string text);
 bool type_is_pointer_compat(const std::string& type_text);
 bool type_is_void_compat(const std::string& type_text);
@@ -61,12 +54,6 @@ const char* breakpoint_loc_type_name(int loc_type);
 std::int64_t function_for_address(
     const std::vector<model::FunctionRow>& functions,
     std::int64_t address);
-std::int64_t function_for_address(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    std::int64_t address);
-std::string segment_name_for_address(
-    const std::shared_ptr<const model::LiveDataset>& dataset,
-    std::int64_t address);
 std::vector<SegmentRange> build_segment_ranges(const std::vector<model::SegmentRow>& segments);
 std::string segment_name_for_address(const std::vector<SegmentRange>& ranges, std::int64_t address);
 std::vector<FunctionRange> build_function_ranges(const std::vector<model::FunctionRow>& functions);
@@ -76,10 +63,6 @@ std::string memory_ascii_from_value(int value);
 void normalize_memory_byte_row(model::MemoryByteRow& row);
 std::int64_t estimate_type_size(const std::string& type_text);
 size_t telemetry_scaled(size_t base_rows, double ratio, size_t floor_rows = 1);
-size_t telemetry_func_floor(const std::shared_ptr<const model::LiveDataset>& dataset, size_t floor_rows = 1);
-size_t telemetry_instr_hint(const std::shared_ptr<const model::LiveDataset>& dataset);
-size_t telemetry_name_hint(const std::shared_ptr<const model::LiveDataset>& dataset);
-size_t telemetry_xref_hint(const std::shared_ptr<const model::LiveDataset>& dataset);
 std::vector<model::PseudocodeRow> derive_pseudocode_rows(const std::shared_ptr<Source>& source);
 std::vector<model::DecompLvarRow> derive_decomp_lvar_rows(const std::shared_ptr<Source>& source);
 std::vector<model::DecompCommentRow> derive_decomp_comment_rows(const std::shared_ptr<Source>& source);

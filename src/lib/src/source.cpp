@@ -20,6 +20,7 @@ bool clear_and_fail(std::vector<Row>& out) {
 
 std::string Source::last_error() const { return {}; }
 
+bool Source::read_project_files(std::vector<model::ProjectFileRow>& out) const { return clear_and_fail(out); }
 bool Source::read_functions(std::vector<model::FunctionRow>& out) const { return clear_and_fail(out); }
 bool Source::read_segments(std::vector<model::SegmentRow>& out) const { return clear_and_fail(out); }
 bool Source::read_symbols(std::vector<model::SymbolRow>& out) const { return clear_and_fail(out); }
@@ -63,6 +64,14 @@ bool Source::read_function_tags(std::vector<model::FunctionTagRow>& out) const {
 bool Source::read_function_tag_mappings(std::vector<model::FunctionTagMappingRow>& out) const { return clear_and_fail(out); }
 bool Source::read_program_info(model::ProgramInfoRow& out) const {
     out = {};
+    return false;
+}
+bool Source::read_freshness_token(SourceFreshnessToken& out) const {
+    out = {};
+    return false;
+}
+bool Source::read_program_revision(std::int64_t& out) const {
+    out = 0;
     return false;
 }
 bool Source::read_pseudocode(std::vector<model::PseudocodeRow>& out) const { return clear_and_fail(out); }

@@ -31,6 +31,16 @@ struct ProgramInfoRow {
     std::int64_t revision = 0;
 };
 
+struct ProjectFileRow {
+    std::string path;
+    std::string name;
+    std::string folder_path;
+    std::string content_type;
+    std::string domain_object_class;
+    int is_folder = 0;
+    int is_program = 0;
+};
+
 struct FunctionRow {
     std::int64_t address = 0;
     std::string name;
@@ -551,79 +561,33 @@ struct LiveMetaRow {
     std::string lineage;
 };
 
-struct LiveDataset {
-    ProgramInfoRow info;
-    std::vector<FunctionRow> functions;
-    std::vector<SegmentRow> segments;
-    std::vector<MemoryBlockRow> memory_blocks;
-    std::vector<MemoryByteRow> memory_bytes;
-    std::vector<SymbolRow> symbols;
-    std::vector<ImportRow> imports;
-    std::vector<ExportRow> exports;
-    std::vector<StringRow> strings;
-    std::vector<XrefRow> xrefs;
-    std::vector<CallEdgeRow> call_edges;
-    std::vector<FunctionCallRow> function_calls;
-    std::vector<BlockRow> blocks;
-    std::vector<CfgEdgeRow> cfg_edges;
-    std::vector<LoopRow> loops;
-    std::vector<SwitchTableRow> switch_tables;
-    std::vector<DominatorRow> dominators;
-    std::vector<PostDominatorRow> post_dominators;
-    std::vector<InstructionRow> instructions;
-    std::vector<CommentRow> comments;
-    std::vector<DataItemRow> data_items;
-    std::vector<FunctionLocalRow> function_locals;
-    std::vector<StackVarRow> stack_vars;
-    std::vector<RegisterVarRow> register_vars;
-    std::vector<FunctionChunkRow> function_chunks;
-    std::vector<TailCallRow> tail_calls;
-    std::vector<ProgramOptionRow> program_options;
-    std::vector<AnalysisPassRow> analysis_passes;
-    std::vector<TransactionRow> transactions;
-    std::vector<ProjectPropertyRow> project_properties;
-    std::vector<RelocationRow> relocations;
-    std::vector<ConstantRow> constants;
-    std::vector<EquateRow> equates;
-    std::vector<TypeRow> types;
-    std::vector<TypeMemberRow> type_members;
-    std::vector<TypeEnumRow> type_enums;
-    std::vector<TypeEnumMemberRow> type_enum_members;
-    std::vector<TypeUnionRow> type_unions;
-    std::vector<TypeAliasRow> type_aliases;
-    std::vector<SignatureRow> signatures;
-    std::vector<FunctionParamRow> function_params;
-    std::vector<FunctionFrameRow> function_frames;
-    std::vector<TextIndexRow> text_index;
-    std::vector<SearchIndexRow> search_index;
-    std::vector<XrefIndexRow> xref_index;
-    std::vector<FunctionMetricRow> function_metrics;
-    std::vector<PseudocodeRow> pseudocode;
-    std::vector<DecompLvarRow> decomp_lvars;
-    std::vector<DecompCommentRow> decomp_comments;
-    std::vector<DecompTokenRow> decomp_tokens;
-    std::vector<BreakpointRow> breakpoints;
-    std::vector<BookmarkRow> bookmarks;
-    std::vector<FunctionTagRow> function_tags;
-    std::vector<FunctionTagMappingRow> function_tag_mappings;
-    std::vector<CapabilityRow> capabilities;
-    std::vector<ParityFindingRow> parity_findings;
-    std::vector<PerfBenchmarkRow> perf_benchmarks;
-    std::vector<LiveMetaRow> live_meta;
-};
-
 }  // namespace ghidrasql::model
 
 namespace ghidrasql {
 
-class Source;
+struct SourceFreshnessToken {
+    std::string program_id;
+    std::int64_t modification_number = 0;
+    std::string program_path;
+    std::string file_id;
+    std::int64_t file_version = 0;
+    std::int64_t file_last_modified_time = 0;
 
-model::LiveDataset make_demo_dataset();
-model::LiveDataset make_benchmark_dataset(std::size_t copies);
-std::shared_ptr<Source> create_demo_live_source();
-std::shared_ptr<Source> create_benchmark_live_source(std::size_t copies);
-std::shared_ptr<Source> create_empty_live_source();
-std::shared_ptr<Source> create_live_source_from_seed(model::LiveDataset seed);
+    bool operator==(const SourceFreshnessToken& other) const {
+        return program_id == other.program_id &&
+            modification_number == other.modification_number &&
+            program_path == other.program_path &&
+            file_id == other.file_id &&
+            file_version == other.file_version &&
+            file_last_modified_time == other.file_last_modified_time;
+    }
+
+    bool operator!=(const SourceFreshnessToken& other) const {
+        return !(*this == other);
+    }
+};
+
+class Source;
 
 struct LibGhidraSourceOptions {
     std::string base_url = "http://127.0.0.1:18080";
@@ -643,6 +607,7 @@ struct LibGhidraSourceOptions {
 };
 
 struct SourceCallbacks {
+    std::function<bool(std::vector<model::ProjectFileRow>&)> read_project_files;
     std::function<bool(std::vector<model::FunctionRow>&)> read_functions;
     std::function<bool(std::vector<model::SegmentRow>&)> read_segments;
     std::function<bool(std::vector<model::SymbolRow>&)> read_symbols;
@@ -675,6 +640,8 @@ struct SourceCallbacks {
     std::function<bool(std::vector<model::FunctionTagRow>&)> read_function_tags;
     std::function<bool(std::vector<model::FunctionTagMappingRow>&)> read_function_tag_mappings;
     std::function<bool(model::ProgramInfoRow&)> read_program_info;
+    std::function<bool(SourceFreshnessToken&)> read_freshness_token;
+    std::function<bool(std::int64_t&)> read_program_revision;
     std::function<bool(std::vector<model::PseudocodeRow>&)> read_pseudocode;
     std::function<bool(std::vector<model::DecompLvarRow>&)> read_decomp_lvars;
     std::function<bool(std::vector<model::DecompCommentRow>&)> read_decomp_comments;
@@ -756,6 +723,7 @@ public:
     virtual std::string last_error() const;
 
     // Direct live row readers. Default implementation returns false (no data).
+    virtual bool read_project_files(std::vector<model::ProjectFileRow>& out) const;
     virtual bool read_functions(std::vector<model::FunctionRow>& out) const;
     virtual bool read_segments(std::vector<model::SegmentRow>& out) const;
     virtual bool read_symbols(std::vector<model::SymbolRow>& out) const;
@@ -789,6 +757,8 @@ public:
     virtual bool read_function_tags(std::vector<model::FunctionTagRow>& out) const;
     virtual bool read_function_tag_mappings(std::vector<model::FunctionTagMappingRow>& out) const;
     virtual bool read_program_info(model::ProgramInfoRow& out) const;
+    virtual bool read_freshness_token(SourceFreshnessToken& out) const;
+    virtual bool read_program_revision(std::int64_t& out) const;
     virtual bool read_pseudocode(std::vector<model::PseudocodeRow>& out) const;
     virtual bool read_decomp_lvars(std::vector<model::DecompLvarRow>& out) const;
     virtual bool read_decomp_comments(std::vector<model::DecompCommentRow>& out) const;
@@ -954,5 +924,3 @@ public:
 };
 
 }  // namespace ghidrasql
-
-

@@ -14,12 +14,29 @@
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
+#include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace ghidrasql::functions {
+
+namespace {
+
+void notify_source_mutation(const MutationCallback& on_source_mutation) {
+    if (on_source_mutation) {
+        on_source_mutation();
+    }
+}
+
+std::string local_mutation_key(std::int64_t func_addr, const std::string& local_id) {
+    return std::to_string(func_addr) + "\x1f" + local_id;
+}
+
+}  // namespace
 
 std::string to_hex(std::int64_t value) {
     std::ostringstream out;
@@ -329,7 +346,13 @@ std::string type_family(const std::string& decl) {
     return "unknown";
 }
 
-void register_sql_functions(xsql::Database& db, Source& source) {
+void register_sql_functions(
+    xsql::Database& db,
+    Source& source,
+    MutationCallback on_source_mutation)
+{
+    auto local_name_overrides = std::make_shared<std::unordered_map<std::string, std::string>>();
+
     db.register_function("hex", 1, [](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 1 || argv[0].is_null()) {
             ctx.result_null();
@@ -451,8 +474,10 @@ void register_sql_functions(xsql::Database& db, Source& source) {
         ctx.result_int64(static_cast<std::int64_t>(rows.size()));
     });
 
-    db.register_function("rebuild_strings", 0, [&source](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
-        source.refresh();
+    db.register_function("rebuild_strings", 0, [&source, on_source_mutation](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
+        if (source.refresh()) {
+            notify_source_mutation(on_source_mutation);
+        }
         std::vector<model::StringRow> rows;
         if (!source.read_strings(rows)) {
             ctx.result_int64(0);
@@ -462,6 +487,11 @@ void register_sql_functions(xsql::Database& db, Source& source) {
     });
 
     db.register_function("program_revision", 0, [&source](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
+        std::int64_t revision = 0;
+        if (source.read_program_revision(revision)) {
+            ctx.result_int64(revision);
+            return;
+        }
         model::ProgramInfoRow info;
         if (!source.read_program_info(info)) {
             ctx.result_int64(0);
@@ -470,19 +500,31 @@ void register_sql_functions(xsql::Database& db, Source& source) {
         ctx.result_int64(info.revision);
     });
 
-    db.register_function("save_database", 0, [&source](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
-        ctx.result_int(source.save_database() ? 1 : 0);
+    db.register_function("save_database", 0, [&source, on_source_mutation](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
+        const bool ok = source.save_database();
+        if (ok) {
+            notify_source_mutation(on_source_mutation);
+        }
+        ctx.result_int(ok ? 1 : 0);
     });
 
-    db.register_function("discard_changes", 0, [&source](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
-        ctx.result_int(source.discard_changes() ? 1 : 0);
+    db.register_function("discard_changes", 0, [&source, on_source_mutation](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
+        const bool ok = source.discard_changes();
+        if (ok) {
+            notify_source_mutation(on_source_mutation);
+        }
+        ctx.result_int(ok ? 1 : 0);
     });
 
-    db.register_function("refresh_database", 0, [&source](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
-        ctx.result_int(source.refresh() ? 1 : 0);
+    db.register_function("refresh_database", 0, [&source, on_source_mutation](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
+        const bool ok = source.refresh();
+        if (ok) {
+            notify_source_mutation(on_source_mutation);
+        }
+        ctx.result_int(ok ? 1 : 0);
     });
 
-    db.register_function("rename_local", 3, [&source](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    db.register_function("rename_local", 3, [&source, on_source_mutation, local_name_overrides](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 3 || argv[0].is_null() || argv[1].is_null() || argv[2].is_null()) {
             ctx.result_int(0);
             return;
@@ -494,10 +536,15 @@ void register_sql_functions(xsql::Database& db, Source& source) {
             ctx.result_int(0);
             return;
         }
-        ctx.result_int(source.rename_decomp_local(func_addr, local_id, new_name) ? 1 : 0);
+        const bool ok = source.rename_decomp_local(func_addr, local_id, new_name);
+        if (ok) {
+            (*local_name_overrides)[local_mutation_key(func_addr, local_id)] = new_name;
+            notify_source_mutation(on_source_mutation);
+        }
+        ctx.result_int(ok ? 1 : 0);
     });
 
-    db.register_function("parse_decls", 1, [&source](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    db.register_function("parse_decls", 1, [&source, on_source_mutation](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 1 || argv[0].is_null()) {
             ctx.result_int(-1);
             return;
@@ -507,10 +554,14 @@ void register_sql_functions(xsql::Database& db, Source& source) {
             ctx.result_int(0);
             return;
         }
-        ctx.result_int(source.parse_declarations(source_text));
+        const int parsed = source.parse_declarations(source_text);
+        if (parsed >= 0) {
+            notify_source_mutation(on_source_mutation);
+        }
+        ctx.result_int(parsed);
     });
 
-    db.register_function("set_local_type", 3, [&source](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    db.register_function("set_local_type", 3, [&source, on_source_mutation, local_name_overrides](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 3 || argv[0].is_null() || argv[1].is_null() || argv[2].is_null()) {
             ctx.result_int(0);
             return;
@@ -522,7 +573,39 @@ void register_sql_functions(xsql::Database& db, Source& source) {
             ctx.result_int(0);
             return;
         }
-        ctx.result_int(source.set_decomp_local_type(func_addr, local_id, new_type) ? 1 : 0);
+        std::string existing_name;
+        const auto override_it = local_name_overrides->find(local_mutation_key(func_addr, local_id));
+        if (override_it != local_name_overrides->end()) {
+            existing_name = override_it->second;
+        }
+        std::vector<model::DecompLvarRow> before_rows;
+        if (existing_name.empty() && source.read_decomp_lvars(before_rows)) {
+            for (const auto& row : before_rows) {
+                if (row.func_addr == func_addr && row.local_id == local_id) {
+                    existing_name = row.name;
+                    break;
+                }
+            }
+        }
+        const bool ok = source.set_decomp_local_type(func_addr, local_id, new_type);
+        if (ok) {
+            if (!existing_name.empty() && existing_name != local_id) {
+                // Restore user-set name. Variable.setDataType can shift storage and reset
+                // DEFAULT-source names; defensive on the HighVariable path.
+                if (!source.rename_decomp_local(func_addr, local_id, existing_name)) {
+                    const auto detail = source.last_error();
+                    std::clog << "ghidrasql warning: set_local_type changed type for "
+                              << local_id << " at " << to_hex(func_addr)
+                              << " but could not restore name '" << existing_name << "'";
+                    if (!detail.empty()) {
+                        std::clog << ": " << detail;
+                    }
+                    std::clog << '\n';
+                }
+            }
+            notify_source_mutation(on_source_mutation);
+        }
+        ctx.result_int(ok ? 1 : 0);
     });
 }
 

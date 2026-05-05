@@ -142,50 +142,6 @@ inline StringEncClass classify_string_encoding(const std::string& encoding) {
 }
 
 template <typename RowData>
-class PointerRowIterator final : public xsql::RowIterator {
-public:
-    using ColumnFn = std::function<void(xsql::FunctionContext&, int, const RowData&)>;
-
-    PointerRowIterator(
-        std::shared_ptr<const model::LiveDataset> dataset,
-        std::vector<const RowData*> rows,
-        ColumnFn column_fn)
-        : dataset_(std::move(dataset))
-        , rows_(std::move(rows))
-        , column_fn_(std::move(column_fn)) {}
-
-    bool next() override {
-        if (cursor_ < rows_.size()) {
-            ++cursor_;
-            return true;
-        }
-        return false;
-    }
-
-    bool eof() const override {
-        return cursor_ == 0 || cursor_ > rows_.size();
-    }
-
-    void column(xsql::FunctionContext& ctx, int col) override {
-        if (eof()) {
-            ctx.result_null();
-            return;
-        }
-        column_fn_(ctx, col, *rows_[cursor_ - 1]);
-    }
-
-    std::int64_t rowid() const override {
-        return cursor_ == 0 ? 0 : static_cast<std::int64_t>(cursor_ - 1);
-    }
-
-private:
-    std::shared_ptr<const model::LiveDataset> dataset_;
-    std::vector<const RowData*> rows_;
-    ColumnFn column_fn_;
-    size_t cursor_ = 0;
-};
-
-template <typename RowData>
 class OwnedRowIterator final : public xsql::RowIterator {
 public:
     using ColumnFn = std::function<void(xsql::FunctionContext&, int, const RowData&)>;
@@ -422,13 +378,13 @@ inline void column_function(xsql::FunctionContext& ctx, int col, const model::Fu
         case 5: ctx.result_int64(r.flags); return;
         case 6: ctx.result_text(r.namespace_name); return;
         case 7: ctx.result_text(r.signature); return;
-        case 8: ctx.result_text(function_return_type(nullptr, r)); return;
-        case 9: ctx.result_int64(function_arg_count(nullptr, r)); return;
-        case 10: ctx.result_text(function_calling_convention(nullptr, r)); return;
-        case 11: ctx.result_int(type_is_pointer_compat(function_return_type(nullptr, r)) ? 1 : 0); return;
-        case 12: ctx.result_int(type_is_void_compat(function_return_type(nullptr, r)) ? 1 : 0); return;
-        case 13: ctx.result_int(type_is_int_compat(function_return_type(nullptr, r)) ? 1 : 0); return;
-        case 14: ctx.result_int(type_is_integral_compat(function_return_type(nullptr, r)) ? 1 : 0); return;
+        case 8: ctx.result_text(function_return_type(r)); return;
+        case 9: ctx.result_int64(function_arg_count(r)); return;
+        case 10: ctx.result_text(function_calling_convention(r)); return;
+        case 11: ctx.result_int(type_is_pointer_compat(function_return_type(r)) ? 1 : 0); return;
+        case 12: ctx.result_int(type_is_void_compat(function_return_type(r)) ? 1 : 0); return;
+        case 13: ctx.result_int(type_is_int_compat(function_return_type(r)) ? 1 : 0); return;
+        case 14: ctx.result_int(type_is_integral_compat(function_return_type(r)) ? 1 : 0); return;
         default: ctx.result_null(); return;
     }
 }
@@ -570,25 +526,25 @@ inline xsql::CachedTableDef<model::FunctionRow> define_funcs(const std::shared_p
                 return true;
             })
         .column_text("return_type", [](const model::FunctionRow& r) {
-            return function_return_type(nullptr, r);
+            return function_return_type(r);
         })
         .column_int64("arg_count", [](const model::FunctionRow& r) {
-            return function_arg_count(nullptr, r);
+            return function_arg_count(r);
         })
         .column_text("calling_conv", [](const model::FunctionRow& r) {
-            return function_calling_convention(nullptr, r);
+            return function_calling_convention(r);
         })
         .column_int("return_is_ptr", [](const model::FunctionRow& r) {
-            return type_is_pointer_compat(function_return_type(nullptr, r)) ? 1 : 0;
+            return type_is_pointer_compat(function_return_type(r)) ? 1 : 0;
         })
         .column_int("return_is_void", [](const model::FunctionRow& r) {
-            return type_is_void_compat(function_return_type(nullptr, r)) ? 1 : 0;
+            return type_is_void_compat(function_return_type(r)) ? 1 : 0;
         })
         .column_int("return_is_int", [](const model::FunctionRow& r) {
-            return type_is_int_compat(function_return_type(nullptr, r)) ? 1 : 0;
+            return type_is_int_compat(function_return_type(r)) ? 1 : 0;
         })
         .column_int("return_is_integral", [](const model::FunctionRow& r) {
-            return type_is_integral_compat(function_return_type(nullptr, r)) ? 1 : 0;
+            return type_is_integral_compat(function_return_type(r)) ? 1 : 0;
         })
         .row_lookup([source](model::FunctionRow& row, std::int64_t raw_rowid) {
             if (raw_rowid < 0) {
@@ -2623,9 +2579,9 @@ inline xsql::CachedTableDef<model::ParityFindingRow> define_parity_findings(cons
     return xsql::cached_table<model::ParityFindingRow>("parity_findings")
         .no_shared_cache()
         .estimate_rows([source]() {
-            std::vector<model::ParityFindingRow> seeded_rows;
-            source->read_parity_findings(seeded_rows);
-            return seeded_rows.size();
+            std::vector<model::ParityFindingRow> source_rows;
+            source->read_parity_findings(source_rows);
+            return source_rows.size();
         })
         .cache_builder([source](std::vector<model::ParityFindingRow>& out) {
             out.clear();
@@ -2646,9 +2602,9 @@ inline xsql::CachedTableDef<model::PerfBenchmarkRow> define_perf_benchmarks(cons
     return xsql::cached_table<model::PerfBenchmarkRow>("perf_benchmarks")
         .no_shared_cache()
         .estimate_rows([source]() {
-            std::vector<model::PerfBenchmarkRow> seeded_rows;
-            source->read_perf_benchmarks(seeded_rows);
-            return seeded_rows.size();
+            std::vector<model::PerfBenchmarkRow> source_rows;
+            source->read_perf_benchmarks(source_rows);
+            return source_rows.size();
         })
         .cache_builder([source](std::vector<model::PerfBenchmarkRow>& out) {
             out.clear();
@@ -2972,10 +2928,57 @@ inline xsql::CachedTableDef<model::ProgramInfoRow> define_db_info(const std::sha
         .build();
 }
 
+inline xsql::CachedTableDef<model::ProjectFileRow> define_project_files(const std::shared_ptr<Source>& source) {
+    return xsql::cached_table<model::ProjectFileRow>("project_files")
+        .no_shared_cache()
+        .estimate_rows([]() { return size_t(32); })
+        .cache_builder([source](std::vector<model::ProjectFileRow>& out) {
+            if (!source->read_project_files(out)) {
+                out.clear();
+            }
+        })
+        .column_text("path", [](const model::ProjectFileRow& r) { return r.path; })
+        .column_text("name", [](const model::ProjectFileRow& r) { return r.name; })
+        .column_text("folder_path", [](const model::ProjectFileRow& r) { return r.folder_path; })
+        .column_text("content_type", [](const model::ProjectFileRow& r) { return r.content_type; })
+        .column_text("domain_object_class", [](const model::ProjectFileRow& r) { return r.domain_object_class; })
+        .column_int("is_folder", [](const model::ProjectFileRow& r) { return r.is_folder; })
+        .column_int("is_program", [](const model::ProjectFileRow& r) { return r.is_program; })
+        .build();
+}
+
+inline xsql::CachedTableDef<model::ProjectFileRow> define_project_programs(const std::shared_ptr<Source>& source) {
+    return xsql::cached_table<model::ProjectFileRow>("project_programs")
+        .no_shared_cache()
+        .estimate_rows([]() { return size_t(8); })
+        .cache_builder([source](std::vector<model::ProjectFileRow>& out) {
+            if (!source->read_project_files(out)) {
+                out.clear();
+                return;
+            }
+            out.erase(
+                std::remove_if(
+                    out.begin(),
+                    out.end(),
+                    [](const model::ProjectFileRow& row) { return row.is_program == 0; }),
+                out.end());
+        })
+        .column_text("path", [](const model::ProjectFileRow& r) { return r.path; })
+        .column_text("name", [](const model::ProjectFileRow& r) { return r.name; })
+        .column_text("folder_path", [](const model::ProjectFileRow& r) { return r.folder_path; })
+        .column_text("content_type", [](const model::ProjectFileRow& r) { return r.content_type; })
+        .column_text("domain_object_class", [](const model::ProjectFileRow& r) { return r.domain_object_class; })
+        .column_int("is_folder", [](const model::ProjectFileRow& r) { return r.is_folder; })
+        .column_int("is_program", [](const model::ProjectFileRow& r) { return r.is_program; })
+        .build();
+}
+
 struct TableRegistry::Impl {
     explicit Impl(std::shared_ptr<Source> source_)
         : query_scope(std::make_shared<QueryScopeState>())
         , source(std::move(source_))
+        , project_files(define_project_files(source))
+        , project_programs(define_project_programs(source))
         , funcs(define_funcs(source))
         , segments(define_segments(source))
         , memory_blocks(define_memory_blocks(source))
@@ -3036,6 +3039,8 @@ struct TableRegistry::Impl {
         , db_info(define_db_info(source)) {}
 
     void register_all(xsql::Database& db) {
+        register_cached(db, "project_files", &project_files);
+        register_cached(db, "project_programs", &project_programs);
         register_cached(db, "funcs", &funcs);
         register_cached(db, "segments", &segments);
         register_cached(db, "memory_blocks", &memory_blocks);
@@ -3099,6 +3104,8 @@ struct TableRegistry::Impl {
 
     void invalidate_all() const {
         query_scope->reset_all();
+        project_files.invalidate_cache();
+        project_programs.invalidate_cache();
         funcs.invalidate_cache();
         segments.invalidate_cache();
         memory_blocks.invalidate_cache();
@@ -3163,6 +3170,14 @@ struct TableRegistry::Impl {
         query_scope->reset_for_table(name);
         if (name == "funcs") {
             funcs.invalidate_cache();
+            return true;
+        }
+        if (name == "project_files") {
+            project_files.invalidate_cache();
+            return true;
+        }
+        if (name == "project_programs") {
+            project_programs.invalidate_cache();
             return true;
         }
         if (name == "segments") {
@@ -3422,6 +3437,8 @@ private:
 public:
     std::shared_ptr<QueryScopeState> query_scope;
     std::shared_ptr<Source> source;
+    xsql::CachedTableDef<model::ProjectFileRow> project_files;
+    xsql::CachedTableDef<model::ProjectFileRow> project_programs;
     xsql::CachedTableDef<model::FunctionRow> funcs;
     xsql::CachedTableDef<model::SegmentRow> segments;
     xsql::CachedTableDef<model::MemoryBlockRow> memory_blocks;

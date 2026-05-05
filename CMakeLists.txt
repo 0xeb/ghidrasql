@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ghidrasql VERSION 0.0.1 LANGUAGES C CXX)
+project(ghidrasql VERSION 0.0.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,8 @@ option(GHIDRASQL_STATIC_MSVC_RUNTIME
     ${MSVC})
 set(GHIDRASQL_LIBGHIDRA_DIR "" CACHE PATH
     "Path to libghidra C++ SDK (libghidra/cpp/)")
+set(GHIDRASQL_LIBXSQL_DIR "" CACHE PATH
+    "Path to a local libxsql checkout (overrides external/libxsql and FetchContent)")
 
 if(MSVC AND GHIDRASQL_STATIC_MSVC_RUNTIME)
     # Protobuf's protobuf_MSVC_STATIC_RUNTIME toggle is not config-specific,
@@ -52,6 +54,10 @@ endif()
 
 if(TARGET xsql::xsql)
     message(STATUS "ghidrasql: Using xsql::xsql from parent project")
+elseif(NOT GHIDRASQL_LIBXSQL_DIR STREQUAL ""
+        AND EXISTS "${GHIDRASQL_LIBXSQL_DIR}/CMakeLists.txt")
+    add_subdirectory("${GHIDRASQL_LIBXSQL_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/libxsql")
+    message(STATUS "ghidrasql: Added libxsql from GHIDRASQL_LIBXSQL_DIR=${GHIDRASQL_LIBXSQL_DIR}")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql" "${CMAKE_CURRENT_BINARY_DIR}/libxsql")
     message(STATUS "ghidrasql: Added libxsql from ghidrasql/external/libxsql")

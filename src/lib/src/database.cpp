@@ -19,6 +19,7 @@
 #include <cctype>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -105,7 +106,9 @@ public:
                 flush_batch_refresh();
             }
 
-            const std::int64_t revision_before = current_revision();
+            auto token_before = current_freshness_token();
+            const std::int64_t revision_before =
+                token_before ? token_before->modification_number : current_revision();
             auto result = execute_sql(stmt);
             results.push_back(result);
             if (!result.success) {
@@ -113,8 +116,11 @@ public:
                 return false;
             }
 
-            const std::int64_t revision_after = current_revision();
-            if (!readonly || revision_after != revision_before) {
+            auto token_after = current_freshness_token();
+            const bool source_changed = token_before && token_after
+                ? *token_after != *token_before
+                : current_revision() != revision_before;
+            if (!readonly || source_changed) {
                 pending_batch_refresh_ = true;
             }
         }
@@ -209,7 +215,10 @@ public:
             return false;
         }
         const bool ok = source_->refresh();
-        refresh_if_needed();
+        if (ok) {
+            invalidate_all_tables();
+            update_last_seen_revision();
+        }
         pending_batch_refresh_ = false;
         return ok;
     }
@@ -292,20 +301,65 @@ private:
         if (!source_) {
             return 0;
         }
+        SourceFreshnessToken token;
+        if (source_->read_freshness_token(token)) {
+            return token.modification_number;
+        }
+        std::int64_t revision = 0;
+        if (source_->read_program_revision(revision)) {
+            return revision;
+        }
         model::ProgramInfoRow info;
         return source_->read_program_info(info) ? info.revision : 0;
     }
 
+    std::optional<SourceFreshnessToken> current_freshness_token() const {
+        if (!source_) {
+            return std::nullopt;
+        }
+        SourceFreshnessToken token;
+        if (!source_->read_freshness_token(token)) {
+            return std::nullopt;
+        }
+        return token;
+    }
+
+    static xsql::json freshness_token_json(const SourceFreshnessToken& token) {
+        xsql::json j;
+        j["program_id"] = token.program_id;
+        j["modification_number"] = token.modification_number;
+        j["program_path"] = token.program_path;
+        j["file_id"] = token.file_id;
+        j["file_version"] = token.file_version;
+        j["file_last_modified_time"] = token.file_last_modified_time;
+        return j;
+    }
+
     void flush_batch_refresh() {
-        refresh_if_needed();
+        invalidate_all_tables();
+        update_last_seen_revision();
         pending_batch_refresh_ = false;
     }
 
     void init() {
         tables_ = std::make_unique<entities::TableRegistry>(source_);
         tables_->register_all(db_);
-        functions::register_sql_functions(db_, *source_);
+        functions::register_sql_functions(db_, *source_, [this]() {
+            note_source_mutation();
+        });
         register_cache_functions();
+    }
+
+    void note_source_mutation() {
+        if (!tables_) {
+            return;
+        }
+        if (in_batch_) {
+            pending_batch_refresh_ = true;
+            return;
+        }
+        invalidate_all_tables();
+        update_last_seen_revision();
     }
 
     void register_cache_functions() {
@@ -313,10 +367,33 @@ private:
             xsql::json j;
             j["cache_invalidations_total"] = cache_invalidations_total_;
             j["last_seen_revision"] = last_seen_revision_;
-            model::ProgramInfoRow info;
-            const bool has_info = source_ && source_->read_program_info(info);
-            j["source_revision"] = has_info ? info.revision : 0;
+            if (last_seen_token_) {
+                j["last_seen_freshness_token"] = freshness_token_json(*last_seen_token_);
+            }
+            std::int64_t source_revision = 0;
+            bool freshness_tracked = false;
+            bool revision_tracked = false;
+            SourceFreshnessToken source_token;
+            if (source_ && source_->read_freshness_token(source_token)) {
+                freshness_tracked = true;
+                revision_tracked = true;
+                source_revision = source_token.modification_number;
+                j["source_freshness_token"] = freshness_token_json(source_token);
+            } else {
+                revision_tracked = source_ && source_->read_program_revision(source_revision);
+            }
+            if (!revision_tracked) {
+                model::ProgramInfoRow info;
+                if (source_ && source_->read_program_info(info)) {
+                    source_revision = info.revision;
+                }
+            }
+            j["source_revision"] = source_revision;
+            j["revision_tracked"] = revision_tracked;
+            j["freshness_tracked"] = freshness_tracked;
             j["schema_tables"] = {
+                "project_files",
+                "project_programs",
                 "funcs",
                 "segments",
                 "memory_blocks",
@@ -409,19 +486,70 @@ private:
         if (!tables_ || !source_) {
             return;
         }
+        SourceFreshnessToken token;
+        if (source_->read_freshness_token(token)) {
+            if (!last_seen_token_ || token != *last_seen_token_) {
+                last_seen_token_ = token;
+                last_seen_revision_ = token.modification_number;
+                invalidate_all_tables();
+            }
+            return;
+        }
+
+        std::int64_t revision = 0;
+        if (source_->read_program_revision(revision)) {
+            last_seen_token_.reset();
+            if (last_seen_revision_ == std::numeric_limits<std::int64_t>::min() ||
+                revision != last_seen_revision_) {
+                last_seen_revision_ = revision;
+                invalidate_all_tables();
+            }
+            return;
+        }
+
         model::ProgramInfoRow info;
+        last_seen_token_.reset();
         last_seen_revision_ = source_->read_program_info(info) ? info.revision : 0;
-        // Live-SQL policy: one-shot queries rebuild their materialization on each
-        // call so normal query() usage never leans on sticky cross-query state.
-        // Batched script execution controls when this invalidation boundary happens.
+        // Sources that do not opt into cheap freshness polling keep the old
+        // conservative policy: every query starts from fresh table state.
+        invalidate_all_tables();
+    }
+
+    void invalidate_all_tables() {
+        if (!tables_) {
+            return;
+        }
         tables_->invalidate_all();
         ++cache_invalidations_total_;
+    }
+
+    void update_last_seen_revision() {
+        if (!source_) {
+            return;
+        }
+        SourceFreshnessToken token;
+        if (source_->read_freshness_token(token)) {
+            last_seen_token_ = token;
+            last_seen_revision_ = token.modification_number;
+            return;
+        }
+        last_seen_token_.reset();
+        std::int64_t revision = 0;
+        if (source_->read_program_revision(revision)) {
+            last_seen_revision_ = revision;
+            return;
+        }
+        model::ProgramInfoRow info;
+        if (source_->read_program_info(info)) {
+            last_seen_revision_ = info.revision;
+        }
     }
 
     xsql::Database db_;
     std::shared_ptr<Source> source_;
     std::unique_ptr<entities::TableRegistry> tables_;
     std::string error_;
+    std::optional<SourceFreshnessToken> last_seen_token_;
     std::int64_t last_seen_revision_ = std::numeric_limits<std::int64_t>::min();
     std::int64_t cache_invalidations_total_ = 0;
     int query_timeout_ms_ = 0;

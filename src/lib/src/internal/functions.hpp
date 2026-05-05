@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,8 @@ namespace ghidrasql {
 class Source;
 
 namespace functions {
+
+using MutationCallback = std::function<void()>;
 
 std::string to_hex(std::int64_t value);
 std::string normalize_text(std::string text);
@@ -32,7 +35,10 @@ std::string type_strip_cv(const std::string& decl);
 bool type_is_pointer(const std::string& decl);
 std::string type_family(const std::string& decl);
 
-void register_sql_functions(xsql::Database& db, Source& source);
+void register_sql_functions(
+    xsql::Database& db,
+    Source& source,
+    MutationCallback on_source_mutation = {});
 
 }  // namespace functions
 }  // namespace ghidrasql

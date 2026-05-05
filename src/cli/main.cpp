@@ -59,7 +59,11 @@ struct Args {
 
     // Program/project (shared)
     std::string binary_path;
+    std::vector<std::string> binary_paths;
     std::string program;
+    std::vector<std::string> programs;
+    std::string initial_program;
+    bool list_project_programs = false;
     std::string project;
     std::string project_name;
     bool analyze = true;        // default: analyze in headless
@@ -102,6 +106,30 @@ bool is_one_of(const std::string& value, std::initializer_list<const char*> allo
     return false;
 }
 
+std::string normalize_project_program_arg(std::string value) {
+    std::replace(value.begin(), value.end(), '\\', '/');
+    if (value.empty()) {
+        return value;
+    }
+    if (value.front() == '/') {
+        return value;
+    }
+    if (value.find('/') != std::string::npos) {
+        return "/" + value;
+    }
+    return value;
+}
+
+std::string selected_program_arg(const Args& args) {
+    if (!args.initial_program.empty()) {
+        return normalize_project_program_arg(args.initial_program);
+    }
+    if (!args.programs.empty()) {
+        return normalize_project_program_arg(args.programs.front());
+    }
+    return {};
+}
+
 // Map removed flags to their replacements for helpful error messages.
 struct FlagReplacement {
     const char* old_flag;
@@ -140,10 +168,12 @@ void print_help() {
         << "  -f, --file <path>          Execute SQL script and exit\n"
         << "  -i, --interactive          Interactive REPL (default when no action)\n"
         << "  --http                     Start HTTP API server\n"
+        << "  --list-project-programs    List programs in the current/opened project and exit\n"
         << "  --format <fmt>             Output format: table (default) or json\n\n"
         << "Program/project:\n"
-        << "  --binary <path>            Binary to import (headless only)\n"
-        << "  --program <name>           Existing program in project\n"
+        << "  --binary <path>            Binary to import (headless only; repeatable)\n"
+        << "  --program <name>           Existing program in project (repeatable)\n"
+        << "  --initial-program <name>   Project program to make active in this host\n"
         << "  --project <dir>            Project directory\n"
         << "  --project-name <name>      Project name\n"
         << "  --analyze                  Run analysis (default in headless)\n"
@@ -195,6 +225,8 @@ bool parse_args(int argc, char** argv, Args& args) {
             args.interactive = true;
         } else if (arg == "--http" || arg == "--serve") {
             args.serve = true;
+        } else if (arg == "--list-project-programs") {
+            args.list_project_programs = true;
         } else if (arg == "--port") {
             if (++i >= argc) {
                 std::cerr << "missing value for --port\n";
@@ -262,12 +294,20 @@ bool parse_args(int argc, char** argv, Args& args) {
                 return false;
             }
             args.binary_path = argv[i];
+            args.binary_paths.emplace_back(argv[i]);
         } else if (arg == "--program") {
             if (++i >= argc) {
                 std::cerr << "missing value for --program\n";
                 return false;
             }
             args.program = argv[i];
+            args.programs.emplace_back(argv[i]);
+        } else if (arg == "--initial-program") {
+            if (++i >= argc) {
+                std::cerr << "missing value for --initial-program\n";
+                return false;
+            }
+            args.initial_program = argv[i];
         } else if (arg == "--project") {
             if (++i >= argc) {
                 std::cerr << "missing value for --project\n";
@@ -361,10 +401,12 @@ bool validate_headless_args(Args& args) {
     require_value(args.project, "--project");
     require_value(args.project_name, "--project-name");
 
-    const bool has_binary = !args.binary_path.empty();
-    const bool has_program = !args.program.empty();
-    if (has_binary == has_program) {
-        std::cerr << "headless mode requires exactly one of --binary or --program\n";
+    const bool has_seed =
+        !args.binary_paths.empty() || !args.programs.empty() || !args.initial_program.empty();
+    if (!has_seed) {
+        std::cerr
+            << "headless mode requires at least one of --binary, --program, "
+            << "or --initial-program\n";
         ok = false;
     }
 
@@ -510,6 +552,14 @@ int run_script(ghidrasql::QueryEngine& engine, const std::string& path, const st
     return 0;
 }
 
+int print_project_programs(ghidrasql::QueryEngine& engine, const std::string& format = "") {
+    auto result = engine.query(
+        "SELECT path, name, folder_path, content_type, domain_object_class "
+        "FROM project_programs ORDER BY path");
+    print_result(result, format);
+    return result.success ? 0 : 1;
+}
+
 int run_repl(
     ghidrasql::QueryEngine& engine,
     std::shared_ptr<ghidrasql::Source> source,
@@ -646,8 +696,17 @@ int run_repl(
 libghidra::client::HeadlessOptions make_headless_opts(const Args& args) {
     libghidra::client::HeadlessOptions opts;
     opts.ghidra_dir = args.ghidra;
-    opts.binary = args.binary_path;
-    opts.program = args.program;
+    if (!args.binary_paths.empty()) {
+        opts.binary = args.binary_paths.front();
+        opts.binaries.assign(args.binary_paths.begin() + 1, args.binary_paths.end());
+    }
+    if (!args.programs.empty()) {
+        opts.program = normalize_project_program_arg(args.programs.front());
+        for (auto it = args.programs.begin() + 1; it != args.programs.end(); ++it) {
+            opts.programs.push_back(normalize_project_program_arg(*it));
+        }
+    }
+    opts.initial_program = normalize_project_program_arg(args.initial_program);
     opts.port = args.rpc_port;
     opts.bind = "127.0.0.1";
     opts.project_dir = args.project;
@@ -713,7 +772,9 @@ int run_headless_live_query_local(const Args& args) {
 
     int exit_code = 0;
     ghidrasql::QueryEngine engine(source);
-    if (!args.query.empty()) {
+    if (args.list_project_programs) {
+        exit_code = print_project_programs(engine, args.format);
+    } else if (!args.query.empty()) {
         auto result = engine.query(args.query);
         print_result(result, args.format);
         if (!result.success) {
@@ -910,6 +971,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (args.list_project_programs &&
+        (args.serve || !args.query.empty() || !args.sql_file.empty() || args.interactive)) {
+        std::cerr << "--list-project-programs cannot be combined with --http, -q, -f, or -i\n";
+        return 1;
+    }
+
     // Headless mode (--ghidra)
     if (has_ghidra) {
         if (!validate_headless_args(args)) {
@@ -945,12 +1012,14 @@ int main(int argc, char** argv) {
     opts.base_url = args.url;
     opts.auth_token = args.auth_token;
 
-    // Auto-open when --project + --program are both set
-    const bool has_open_params = !args.project.empty() && !args.program.empty();
+    const std::string selected_program = selected_program_arg(args);
+
+    // Auto-open when --project + --program/--initial-program are both set.
+    const bool has_open_params = !args.project.empty() && !selected_program.empty();
     opts.auto_open_program = has_open_params;
     opts.project_path = args.project;
     opts.project_name = args.project_name;
-    opts.program_path = args.program;
+    opts.program_path = selected_program;
     opts.analyze = args.analyze && args.analyze_explicit;
     opts.read_only = args.readonly;
     opts.auto_save_interval = args.auto_save_interval;
@@ -988,6 +1057,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "HTTP started at " << http.url() << "\n";
+    }
+
+    if (args.list_project_programs) {
+        return print_project_programs(engine, args.format);
     }
 
     if (!args.query.empty()) {

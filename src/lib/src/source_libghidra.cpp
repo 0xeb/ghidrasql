@@ -51,6 +51,30 @@ public:
         return last_error_;
     }
 
+    bool read_project_files(std::vector<model::ProjectFileRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_project_open_locked()) return false;
+        libghidra::client::ListProjectFilesRequest req;
+        req.include_folders = true;
+        auto listed = client_.ListProjectFiles(req);
+        if (!ok_or_record_error_locked(listed, "ListProjectFiles")) return false;
+        out.reserve(listed.value->files.size());
+        for (const auto& row : listed.value->files) {
+            model::ProjectFileRow mapped;
+            mapped.path = row.path;
+            mapped.name = row.name;
+            mapped.folder_path = row.folder_path;
+            mapped.content_type = row.content_type;
+            mapped.domain_object_class = row.domain_object_class;
+            mapped.is_folder = row.is_folder ? 1 : 0;
+            mapped.is_program = row.is_program ? 1 : 0;
+            out.push_back(std::move(mapped));
+        }
+        last_error_.clear();
+        return true;
+    }
+
     bool read_functions(std::vector<model::FunctionRow>& out) const override {
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
@@ -981,11 +1005,11 @@ public:
         out.tool_name = status.value->service_name.empty() ? "libghidra" : status.value->service_name;
         out.analysis_id = std::string("libghidra:") + status.value->host_mode;
         out.is_headless = status.value->host_mode == "headless" ? 1 : 0;
-        out.revision = to_i64(status.value->program_revision);
+        out.revision = to_i64(status.value->modification_number);
 
         auto rev = client_.GetRevision();
         if (rev.ok()) {
-            out.revision = to_i64(rev.value->revision);
+            out.revision = to_i64(rev.value->modification_number);
         }
 
         if (opened_program_.has_value()) {
@@ -997,6 +1021,44 @@ public:
             out.program_name = options_.program_path.empty() ? "active-program" : options_.program_path;
         }
         out.program_path = options_.program_path.empty() ? out.program_name : options_.program_path;
+        last_error_.clear();
+        return true;
+    }
+
+    bool read_freshness_token(SourceFreshnessToken& out) const override {
+        out = {};
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto rev = client_.GetRevision();
+        if (!ok_or_record_error_locked(rev, "GetRevision")) {
+            return false;
+        }
+        out.program_id = std::to_string(rev.value->program_id);
+        out.modification_number = to_i64(rev.value->modification_number);
+        out.program_path = rev.value->program_path;
+        out.file_id = rev.value->file_id;
+        out.file_version = rev.value->file_version;
+        out.file_last_modified_time = rev.value->file_last_modified_time;
+        if (out.program_path.empty()) {
+            out.program_path = options_.program_path;
+        }
+        last_error_.clear();
+        return true;
+    }
+
+    bool read_program_revision(std::int64_t& out) const override {
+        out = 0;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto rev = client_.GetRevision();
+        if (!ok_or_record_error_locked(rev, "GetRevision")) {
+            return false;
+        }
+        out = to_i64(rev.value->modification_number);
         last_error_.clear();
         return true;
     }
@@ -1027,7 +1089,7 @@ public:
 
         auto rev = client_.GetRevision();
         if (rev.ok()) {
-            const auto since = std::to_string(rev.value->revision);
+            const auto since = std::to_string(rev.value->modification_number);
             for (auto& row : out) {
                 row.since_rev = since;
             }
@@ -2145,6 +2207,37 @@ private:
                !options_.project_name.empty() || !options_.program_path.empty();
     }
 
+    bool should_open_project_locked() const {
+        return !options_.project_path.empty() || !options_.project_name.empty();
+    }
+
+    bool ensure_project_open_locked() const {
+        if (opened_program_.has_value()) {
+            return true;
+        }
+        if (should_open_program_locked() && !options_.program_path.empty()) {
+            return ensure_session_open_locked();
+        }
+        if (opened_project_) {
+            return true;
+        }
+        if (!should_open_project_locked()) {
+            return true;
+        }
+        libghidra::client::OpenProjectRequest req;
+        req.project_path = options_.project_path;
+        req.project_name = options_.project_name;
+        req.create = false;
+        req.read_only = options_.read_only;
+        auto opened = client_.OpenProject(req);
+        if (!ok_or_record_error_locked(opened, "OpenProject")) {
+            return false;
+        }
+        opened_project_ = true;
+        last_error_.clear();
+        return true;
+    }
+
     bool ensure_session_open_locked() const {
         if (!should_open_program_locked()) {
             return true;
@@ -2163,6 +2256,7 @@ private:
             return false;
         }
         opened_program_ = *opened.value;
+        opened_project_ = true;
         last_error_.clear();
         return true;
     }
@@ -2322,6 +2416,7 @@ private:
     mutable std::mutex mu_;
     mutable std::string last_error_;
     mutable std::optional<libghidra::client::OpenProgramResponse> opened_program_;
+    mutable bool opened_project_ = false;
     mutable libghidra::client::HttpClient client_;
     mutable int mutation_count_ = 0;
 };

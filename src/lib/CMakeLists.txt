@@ -7,7 +7,6 @@ add_library(ghidrasql STATIC
     src/functions.cpp
     src/http.cpp
     src/source.cpp
-    src/source_factories.cpp
     src/source_libghidra.cpp
     src/source_callbacks.cpp
 )

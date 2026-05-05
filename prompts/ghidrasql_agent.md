@@ -21,6 +21,12 @@ A comprehensive reference for AI agents to effectively use GhidraSQL — an SQL 
 - **Write operations** — rename functions, retype variables, add comments, define types
 - Scriptable analysis without writing Ghidra plugins or Java scripts
 
+**Project scope:** a Ghidra project may contain many programs, but GhidraSQL's
+analysis tables (`funcs`, `instructions`, `pseudocode`, etc.) always refer to
+one active program. Use `project_programs` or `--list-project-programs` to
+enumerate project contents, then choose the active domain path with `--program
+/folder/name` or `--initial-program /folder/name`.
+
 ---
 
 ## CRITICAL: Performance Rules
@@ -943,6 +949,8 @@ Additional tables available for specialized analysis:
 | `analysis_passes` | Analysis history |
 | `transactions` | Transaction log |
 | `project_properties` | Project metadata |
+| `project_files` | Project files and folders (`path`, `folder_path`, `content_type`, `is_program`) |
+| `project_programs` | Program-only project files; use this before switching active programs |
 | `sql_capabilities` | Feature capability matrix |
 | `parity_findings` | Cross-tool parity analysis findings |
 | `perf_benchmarks` | Performance benchmark results |
@@ -1201,10 +1209,16 @@ SELECT name, kind, size FROM types WHERE name = 'Session';
 |----------|-------------|
 | `string_count()` | Get current string count from source |
 | `rebuild_strings()` | Refresh string table and return count |
-| `program_revision()` | Get current program revision number |
+| `program_revision()` | Get Ghidra's native modification number for the current program |
 | `save_database()` | **Save pending changes** to Ghidra project. Returns 1 on success. |
 | `discard_changes()` | Discard all pending changes. Returns 1 on success. |
 | `refresh_database()` | Refresh source live readers so the next query is rebuilt from fresh source state. Returns 1 on success. |
+
+### Cache / Freshness Model
+
+GhidraSQL materializes virtual tables because decompiler-backed tables are expensive. With libghidra live sources, caches may persist across `/query` calls while the native freshness token is unchanged. The token includes `program_id`, Ghidra's `modification_number`, program path, and cheap project-file metadata when available, so program switches and Ghidra UI/API edits invalidate cached tables before reading.
+
+For custom sources that do not expose a freshness token, GhidraSQL keeps the conservative behavior: every one-shot query invalidates table materialization. Inside multi-statement scripts, writes and freshness changes force invalidation before later reads. Use `refresh_database()` or `.refresh` when you want to force a full refresh.
 
 ---
 
@@ -1440,7 +1454,7 @@ When running in interactive mode, these dot-commands are available:
 | `.info` | Show database metadata (program info, row counts, capabilities) |
 | `.save` | Save pending changes (calls `save_database()`) |
 | `.discard` | Discard pending changes (calls `discard_changes()`) |
-| `.refresh` | Refresh source so the next query is rebuilt from fresh source state |
+| `.refresh` | Force source refresh and cache invalidation |
 | `.http` | Show HTTP server status |
 | `.http start` | Start HTTP server |
 | `.http stop` | Stop HTTP server |
@@ -1457,6 +1471,15 @@ GhidraSQL can run as an HTTP server for remote queries.
 ```bash
 # Start with HTTP server
 ghidrasql --ghidra C:/ghidra_dist/ghidra_12.1_DEV --binary program.exe --http
+
+# List programs in a multi-program project and exit
+ghidrasql --ghidra C:/ghidra_dist/ghidra_12.1_DEV \
+  --project C:/work/projects --project-name firmware --list-project-programs
+
+# Import multiple binaries and make one project program active
+ghidrasql --ghidra C:/ghidra_dist/ghidra_12.1_DEV \
+  --project C:/work/projects --project-name firmware \
+  --binary loader.exe --binary payload.exe --initial-program /payload.exe --http
 
 # Custom port and auth
 ghidrasql --url http://localhost:18080 --http --port 9000 --auth mysecret

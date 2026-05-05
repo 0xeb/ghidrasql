@@ -16,6 +16,10 @@ public:
         : callbacks_(std::move(callbacks))
     {}
 
+    bool read_project_files(std::vector<model::ProjectFileRow>& out) const override {
+        return read_rows(callbacks_.read_project_files, out);
+    }
+
     bool read_functions(std::vector<model::FunctionRow>& out) const override {
         return read_rows(callbacks_.read_functions, out);
     }
@@ -130,6 +134,22 @@ public:
             return false;
         }
         return callbacks_.read_program_info(out);
+    }
+
+    bool read_freshness_token(SourceFreshnessToken& out) const override {
+        if (!callbacks_.read_freshness_token) {
+            out = {};
+            return false;
+        }
+        return callbacks_.read_freshness_token(out);
+    }
+
+    bool read_program_revision(std::int64_t& out) const override {
+        if (!callbacks_.read_program_revision) {
+            out = 0;
+            return false;
+        }
+        return callbacks_.read_program_revision(out);
     }
 
     bool read_pseudocode(std::vector<model::PseudocodeRow>& out) const override {
