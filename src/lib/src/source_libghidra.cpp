@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -80,24 +82,33 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
         return paginate_locked(2048, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            trace_rpc_locked("ListFunctions");
             auto listed = client_.ListFunctions(kAllAddressesMin, kAllAddressesMax, ps, off);
             if (!ok_or_record_error_locked(listed, "ListFunctions")) return false;
             const auto& rows = listed.value->functions;
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::FunctionRow mapped;
-                mapped.address = to_i64(row.entry_address);
-                mapped.name = row.name;
-                mapped.size = to_i64(row.size);
-                mapped.end_ea = row.end_address != 0 ? to_i64(row.end_address) : (mapped.address + mapped.size);
-                mapped.flags = row.is_thunk ? 1 : 0;
-                mapped.namespace_name = row.namespace_name;
-                mapped.signature = row.prototype;
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_function(row));
             }
             return true;
         });
+    }
+
+    bool read_function_at(std::int64_t address, model::FunctionRow& out) const override {
+        out = {};
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        trace_rpc_locked("GetFunction");
+        auto got = client_.GetFunction(to_u64(address));
+        if (!ok_or_record_error_locked(got, "GetFunction")) return false;
+        if (!got.value->function.has_value()) {
+            last_error_.clear();
+            return false;
+        }
+        out = map_function(*got.value->function);
+        last_error_.clear();
+        return true;
     }
 
     bool read_segments(std::vector<model::SegmentRow>& out) const override {
@@ -205,13 +216,26 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::StringRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.content = row.value;
-                mapped.length = static_cast<std::int64_t>(row.length);
-                mapped.type = row.data_type;
-                mapped.encoding = row.encoding;
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_string(row));
+            }
+            return true;
+        });
+    }
+
+    bool read_strings_at(std::int64_t address, std::vector<model::StringRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(64, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListDefinedStrings(to_u64(address), to_u64(address), ps, off);
+            if (!ok_or_record_error_locked(listed, "ListDefinedStrings")) return false;
+            const auto& rows = listed.value->strings;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                if (to_i64(row.address) == address) {
+                    dest.push_back(map_string(row));
+                }
             }
             return true;
         });
@@ -457,22 +481,26 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::DataItemRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.name = row.name;
-                mapped.data_type = row.data_type;
-                mapped.size = to_i64(row.size);
-                mapped.value_repr = row.value_repr;
-                mapped.segment_name.clear();
+                dest.push_back(map_data_item(row));
+            }
+            return true;
+        });
+    }
 
-                std::string lowered = mapped.data_type;
-                std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
-                    return static_cast<char>(std::tolower(c));
-                });
-                mapped.is_string =
-                    lowered.find("string") != std::string::npos || lowered.find("char") != std::string::npos ? 1 : 0;
-                mapped.is_initialized = 0;
-                dest.push_back(std::move(mapped));
+    bool read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(64, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListDataItems(to_u64(address), to_u64(address), ps, off);
+            if (!ok_or_record_error_locked(listed, "ListDataItems")) return false;
+            const auto& rows = listed.value->data_items;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                if (to_i64(row.address) == address) {
+                    dest.push_back(map_data_item(row));
+                }
             }
             return true;
         });
@@ -794,17 +822,25 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::InstructionRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.mnemonic = row.mnemonic;
-                mapped.operands = row.operand_text;
-                mapped.disasm = row.disassembly;
-                mapped.size = static_cast<int>(row.length);
-                mapped.bytes.clear();
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_instruction(row));
             }
             return true;
         });
+    }
+
+    bool read_instruction_at(std::int64_t address, model::InstructionRow& out) const override {
+        out = {};
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        auto got = client_.GetInstruction(to_u64(address));
+        if (!ok_or_record_error_locked(got, "GetInstruction")) return false;
+        if (!got.value->instruction.has_value()) {
+            last_error_.clear();
+            return false;
+        }
+        out = map_instruction(*got.value->instruction);
+        last_error_.clear();
+        return true;
     }
 
     bool read_comments(std::vector<model::CommentRow>& out) const override {
@@ -818,12 +854,7 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::CommentRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.comment = row.text;
-                mapped.repeatable = row.kind == libghidra::client::CommentKind::kRepeatable ? 1 : 0;
-                mapped.source = comment_kind_to_string(row.kind);
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_comment(row));
             }
             return true;
         });
@@ -836,21 +867,46 @@ public:
             return false;
         }
         // Narrow range: only fetch comments at this exact address.
-        auto listed = client_.GetComments(to_u64(address), to_u64(address) + 1, 256, 0);
+        auto listed = client_.GetComments(to_u64(address), to_u64(address), 256, 0);
         if (!ok_or_record_error_locked(listed, "GetComments")) {
             out.clear();
             return false;
         }
         for (const auto& row : listed.value->comments) {
-            model::CommentRow mapped;
-            mapped.address = to_i64(row.address);
-            mapped.comment = row.text;
-            mapped.repeatable = row.kind == libghidra::client::CommentKind::kRepeatable ? 1 : 0;
-            mapped.source = comment_kind_to_string(row.kind);
-            out.push_back(std::move(mapped));
+            if (to_i64(row.address) == address) {
+                out.push_back(map_comment(row));
+            }
         }
         last_error_.clear();
         return true;
+    }
+
+    bool read_comments_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::CommentRow>& out) const override {
+        out.clear();
+        if (end_address < start_address) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        return paginate_locked(4096, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.GetComments(to_u64(start_address), to_u64(end_address), ps, off);
+            if (!ok_or_record_error_locked(listed, "GetComments")) return false;
+            const auto& rows = listed.value->comments;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                const auto row_address = to_i64(row.address);
+                if (row_address >= start_address && row_address <= end_address) {
+                    dest.push_back(map_comment(row));
+                }
+            }
+            return true;
+        });
     }
 
     bool read_breakpoints(std::vector<model::BreakpointRow>& out) const override {
@@ -864,17 +920,26 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::BreakpointRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.enabled = row.enabled ? 1 : 0;
-                mapped.type = breakpoint_type_from_kind(row.kind);
-                mapped.size = to_i64(row.size);
-                mapped.flags = 0;
-                mapped.pass_count = 0;
-                mapped.condition = row.condition;
-                mapped.group = row.group;
-                mapped.loc_type = 0;
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_breakpoint(row));
+            }
+            return true;
+        });
+    }
+
+    bool read_breakpoints_at(std::int64_t address, std::vector<model::BreakpointRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(64, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListBreakpoints(to_u64(address), to_u64(address), ps, off, "", "");
+            if (!ok_or_record_error_locked(listed, "ListBreakpoints")) return false;
+            const auto& rows = listed.value->breakpoints;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                if (to_i64(row.address) == address) {
+                    dest.push_back(map_breakpoint(row));
+                }
             }
             return true;
         });
@@ -891,12 +956,26 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::BookmarkRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.type = row.type;
-                mapped.category = row.category;
-                mapped.comment = row.comment;
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_bookmark(row));
+            }
+            return true;
+        });
+    }
+
+    bool read_bookmarks_at(std::int64_t address, std::vector<model::BookmarkRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(64, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListBookmarks(to_u64(address), to_u64(address), ps, off, "", "");
+            if (!ok_or_record_error_locked(listed, "ListBookmarks")) return false;
+            const auto& rows = listed.value->bookmarks;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                if (to_i64(row.address) == address) {
+                    dest.push_back(map_bookmark(row));
+                }
             }
             return true;
         });
@@ -955,14 +1034,26 @@ public:
             count = rows.size();
             dest.reserve(dest.size() + count);
             for (const auto& row : rows) {
-                model::SymbolRow mapped;
-                mapped.address = to_i64(row.address);
-                mapped.name = row.name;
-                mapped.symbol_kind = row.type;
-                mapped.namespace_name = row.namespace_name;
-                mapped.is_primary = row.is_primary ? 1 : 0;
-                mapped.is_external = row.is_external ? 1 : 0;
-                dest.push_back(std::move(mapped));
+                dest.push_back(map_symbol(row));
+            }
+            return true;
+        });
+    }
+
+    bool read_symbols_at(std::int64_t address, std::vector<model::SymbolRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(64, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListSymbols(to_u64(address), to_u64(address), ps, off);
+            if (!ok_or_record_error_locked(listed, "ListSymbols")) return false;
+            const auto& rows = listed.value->symbols;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                if (to_i64(row.address) == address) {
+                    dest.push_back(map_symbol(row));
+                }
             }
             return true;
         });
@@ -1109,6 +1200,7 @@ public:
         if (!ensure_session_open_locked()) {
             return false;
         }
+        trace_rpc_locked("RenameFunction");
         auto renamed = client_.RenameFunction(to_u64(address), new_name);
         if (!ok_or_record_error_locked(renamed, "RenameFunction") || !renamed.value->renamed) {
             return false;
@@ -1302,6 +1394,7 @@ public:
         if (!ensure_session_open_locked()) {
             return false;
         }
+        trace_rpc_locked("SetFunctionSignature");
         auto updated = client_.SetFunctionSignature(to_u64(owner_addr), prototype);
         if (!ok_or_record_error_locked(updated, "SetFunctionSignature")) {
             return false;
@@ -2311,6 +2404,69 @@ private:
         return out.str();
     }
 
+    static model::FunctionRow map_function(const libghidra::client::FunctionRecord& row) {
+        model::FunctionRow mapped;
+        mapped.address = to_i64(row.entry_address);
+        mapped.name = row.name;
+        mapped.size = to_i64(row.size);
+        mapped.end_ea = row.end_address != 0 ? to_i64(row.end_address) : (mapped.address + mapped.size);
+        mapped.flags = row.is_thunk ? 1 : 0;
+        mapped.namespace_name = row.namespace_name;
+        mapped.signature = row.prototype;
+        return mapped;
+    }
+
+    static model::SymbolRow map_symbol(const libghidra::client::SymbolRecord& row) {
+        model::SymbolRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.name = row.name;
+        mapped.symbol_kind = row.type;
+        mapped.namespace_name = row.namespace_name;
+        mapped.is_primary = row.is_primary ? 1 : 0;
+        mapped.is_external = row.is_external ? 1 : 0;
+        return mapped;
+    }
+
+    static model::StringRow map_string(const libghidra::client::DefinedStringRecord& row) {
+        model::StringRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.content = row.value;
+        mapped.length = static_cast<std::int64_t>(row.length);
+        mapped.type = row.data_type;
+        mapped.encoding = row.encoding;
+        return mapped;
+    }
+
+    static model::DataItemRow map_data_item(const libghidra::client::DataItemRecord& row) {
+        model::DataItemRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.name = row.name;
+        mapped.data_type = row.data_type;
+        mapped.size = to_i64(row.size);
+        mapped.value_repr = row.value_repr;
+        mapped.segment_name.clear();
+
+        std::string lowered = mapped.data_type;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        mapped.is_string =
+            lowered.find("string") != std::string::npos || lowered.find("char") != std::string::npos ? 1 : 0;
+        mapped.is_initialized = 0;
+        return mapped;
+    }
+
+    static model::InstructionRow map_instruction(const libghidra::client::InstructionRecord& row) {
+        model::InstructionRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.mnemonic = row.mnemonic;
+        mapped.operands = row.operand_text;
+        mapped.disasm = row.disassembly;
+        mapped.size = static_cast<int>(row.length);
+        mapped.bytes.clear();
+        return mapped;
+    }
+
     static std::string comment_kind_to_string(libghidra::client::CommentKind kind) {
         switch (kind) {
             case libghidra::client::CommentKind::kEol:
@@ -2327,6 +2483,15 @@ private:
             default:
                 return "unspecified";
         }
+    }
+
+    static model::CommentRow map_comment(const libghidra::client::CommentRecord& row) {
+        model::CommentRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.comment = row.text;
+        mapped.repeatable = row.kind == libghidra::client::CommentKind::kRepeatable ? 1 : 0;
+        mapped.source = comment_kind_to_string(row.kind);
+        return mapped;
     }
 
     static libghidra::client::CommentKind string_to_comment_kind(const std::string& kind) {
@@ -2351,6 +2516,29 @@ private:
             return 1;
         }
         return 0;
+    }
+
+    static model::BreakpointRow map_breakpoint(const libghidra::client::BreakpointRecord& row) {
+        model::BreakpointRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.enabled = row.enabled ? 1 : 0;
+        mapped.type = breakpoint_type_from_kind(row.kind);
+        mapped.size = to_i64(row.size);
+        mapped.flags = 0;
+        mapped.pass_count = 0;
+        mapped.condition = row.condition;
+        mapped.group = row.group;
+        mapped.loc_type = 0;
+        return mapped;
+    }
+
+    static model::BookmarkRow map_bookmark(const libghidra::client::BookmarkRecord& row) {
+        model::BookmarkRow mapped;
+        mapped.address = to_i64(row.address);
+        mapped.type = row.type;
+        mapped.category = row.category;
+        mapped.comment = row.comment;
+        return mapped;
     }
 
     static std::string normalize_type_kind(const std::string& kind) {
@@ -2378,6 +2566,21 @@ private:
 
     static std::string breakpoint_kind_from_type(int type) {
         return type == 0 ? "SOFTWARE" : "HARDWARE";
+    }
+
+    static bool rpc_trace_enabled() {
+        static const bool enabled = []() {
+            const char* value = std::getenv("GHIDRASQL_RPC_TRACE");
+            return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
+    void trace_rpc_locked(const char* op) const {
+        if (!rpc_trace_enabled()) {
+            return;
+        }
+        std::cerr << "[ghidrasql] libghidra RPC " << op << '\n';
     }
 
     int derive_bitness_locked() const {

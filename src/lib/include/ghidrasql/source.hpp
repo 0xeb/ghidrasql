@@ -609,16 +609,20 @@ struct LibGhidraSourceOptions {
 struct SourceCallbacks {
     std::function<bool(std::vector<model::ProjectFileRow>&)> read_project_files;
     std::function<bool(std::vector<model::FunctionRow>&)> read_functions;
+    std::function<bool(std::int64_t, model::FunctionRow&)> read_function_at;
     std::function<bool(std::vector<model::SegmentRow>&)> read_segments;
     std::function<bool(std::vector<model::SymbolRow>&)> read_symbols;
+    std::function<bool(std::int64_t, std::vector<model::SymbolRow>&)> read_symbols_at;
     std::function<bool(std::vector<model::ImportRow>&)> read_imports;
     std::function<bool(std::vector<model::ExportRow>&)> read_exports;
     std::function<bool(std::vector<model::StringRow>&)> read_strings;
+    std::function<bool(std::int64_t, std::vector<model::StringRow>&)> read_strings_at;
     std::function<bool(std::vector<model::XrefRow>&)> read_xrefs;
     std::function<bool(std::vector<model::FunctionCallRow>&)> read_function_calls;
     std::function<bool(std::vector<model::CallEdgeRow>&)> read_call_edges;
     std::function<bool(std::vector<model::MemoryBlockRow>&)> read_memory_blocks;
     std::function<bool(std::vector<model::DataItemRow>&)> read_data_items;
+    std::function<bool(std::int64_t, std::vector<model::DataItemRow>&)> read_data_items_at;
     std::function<bool(std::vector<model::BlockRow>&)> read_blocks;
     std::function<bool(std::vector<model::CfgEdgeRow>&)> read_cfg_edges;
     std::function<bool(std::vector<model::SwitchTableRow>&)> read_switch_tables;
@@ -627,7 +631,10 @@ struct SourceCallbacks {
     std::function<bool(std::vector<model::LoopRow>&)> read_loops;
     std::function<bool(std::vector<model::FunctionParamRow>&)> read_function_params;
     std::function<bool(std::vector<model::InstructionRow>&)> read_instructions;
+    std::function<bool(std::int64_t, model::InstructionRow&)> read_instruction_at;
     std::function<bool(std::vector<model::CommentRow>&)> read_comments;
+    std::function<bool(std::int64_t, std::vector<model::CommentRow>&)> read_comments_at;
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::CommentRow>&)> read_comments_in_range;
     std::function<bool(std::vector<model::TypeRow>&)> read_types;
     std::function<bool(std::vector<model::TypeMemberRow>&)> read_type_members;
     std::function<bool(std::vector<model::TypeEnumRow>&)> read_type_enums;
@@ -636,7 +643,9 @@ struct SourceCallbacks {
     std::function<bool(std::vector<model::TypeAliasRow>&)> read_type_aliases;
     std::function<bool(std::vector<model::SignatureRow>&)> read_signatures;
     std::function<bool(std::vector<model::BreakpointRow>&)> read_breakpoints;
+    std::function<bool(std::int64_t, std::vector<model::BreakpointRow>&)> read_breakpoints_at;
     std::function<bool(std::vector<model::BookmarkRow>&)> read_bookmarks;
+    std::function<bool(std::int64_t, std::vector<model::BookmarkRow>&)> read_bookmarks_at;
     std::function<bool(std::vector<model::FunctionTagRow>&)> read_function_tags;
     std::function<bool(std::vector<model::FunctionTagMappingRow>&)> read_function_tag_mappings;
     std::function<bool(model::ProgramInfoRow&)> read_program_info;
@@ -725,16 +734,20 @@ public:
     // Direct live row readers. Default implementation returns false (no data).
     virtual bool read_project_files(std::vector<model::ProjectFileRow>& out) const;
     virtual bool read_functions(std::vector<model::FunctionRow>& out) const;
+    virtual bool read_function_at(std::int64_t address, model::FunctionRow& out) const;
     virtual bool read_segments(std::vector<model::SegmentRow>& out) const;
     virtual bool read_symbols(std::vector<model::SymbolRow>& out) const;
+    virtual bool read_symbols_at(std::int64_t address, std::vector<model::SymbolRow>& out) const;
     virtual bool read_imports(std::vector<model::ImportRow>& out) const;
     virtual bool read_exports(std::vector<model::ExportRow>& out) const;
     virtual bool read_strings(std::vector<model::StringRow>& out) const;
+    virtual bool read_strings_at(std::int64_t address, std::vector<model::StringRow>& out) const;
     virtual bool read_xrefs(std::vector<model::XrefRow>& out) const;
     virtual bool read_function_calls(std::vector<model::FunctionCallRow>& out) const;
     virtual bool read_call_edges(std::vector<model::CallEdgeRow>& out) const;
     virtual bool read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const;
     virtual bool read_data_items(std::vector<model::DataItemRow>& out) const;
+    virtual bool read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const;
     virtual bool read_blocks(std::vector<model::BlockRow>& out) const;
     virtual bool read_cfg_edges(std::vector<model::CfgEdgeRow>& out) const;
     virtual bool read_switch_tables(std::vector<model::SwitchTableRow>& out) const;
@@ -743,8 +756,13 @@ public:
     virtual bool read_loops(std::vector<model::LoopRow>& out) const;
     virtual bool read_function_params(std::vector<model::FunctionParamRow>& out) const;
     virtual bool read_instructions(std::vector<model::InstructionRow>& out) const;
+    virtual bool read_instruction_at(std::int64_t address, model::InstructionRow& out) const;
     virtual bool read_comments(std::vector<model::CommentRow>& out) const;
     virtual bool read_comments_at(std::int64_t address, std::vector<model::CommentRow>& out) const;
+    virtual bool read_comments_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::CommentRow>& out) const;
     virtual bool read_types(std::vector<model::TypeRow>& out) const;
     virtual bool read_type_members(std::vector<model::TypeMemberRow>& out) const;
     virtual bool read_type_enums(std::vector<model::TypeEnumRow>& out) const;
@@ -753,7 +771,9 @@ public:
     virtual bool read_type_aliases(std::vector<model::TypeAliasRow>& out) const;
     virtual bool read_signatures(std::vector<model::SignatureRow>& out) const;
     virtual bool read_breakpoints(std::vector<model::BreakpointRow>& out) const;
+    virtual bool read_breakpoints_at(std::int64_t address, std::vector<model::BreakpointRow>& out) const;
     virtual bool read_bookmarks(std::vector<model::BookmarkRow>& out) const;
+    virtual bool read_bookmarks_at(std::int64_t address, std::vector<model::BookmarkRow>& out) const;
     virtual bool read_function_tags(std::vector<model::FunctionTagRow>& out) const;
     virtual bool read_function_tag_mappings(std::vector<model::FunctionTagMappingRow>& out) const;
     virtual bool read_program_info(model::ProgramInfoRow& out) const;

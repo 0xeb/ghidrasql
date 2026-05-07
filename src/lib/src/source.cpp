@@ -22,16 +22,58 @@ std::string Source::last_error() const { return {}; }
 
 bool Source::read_project_files(std::vector<model::ProjectFileRow>& out) const { return clear_and_fail(out); }
 bool Source::read_functions(std::vector<model::FunctionRow>& out) const { return clear_and_fail(out); }
+bool Source::read_function_at(std::int64_t address, model::FunctionRow& out) const {
+    std::vector<model::FunctionRow> all;
+    if (!read_functions(all)) {
+        out = {};
+        return false;
+    }
+    for (const auto& row : all) {
+        if (row.address == address) {
+            out = row;
+            return true;
+        }
+    }
+    out = {};
+    return false;
+}
 bool Source::read_segments(std::vector<model::SegmentRow>& out) const { return clear_and_fail(out); }
 bool Source::read_symbols(std::vector<model::SymbolRow>& out) const { return clear_and_fail(out); }
+bool Source::read_symbols_at(std::int64_t address, std::vector<model::SymbolRow>& out) const {
+    std::vector<model::SymbolRow> all;
+    if (!read_symbols(all)) { out.clear(); return false; }
+    out.clear();
+    for (auto& row : all) {
+        if (row.address == address) out.push_back(std::move(row));
+    }
+    return true;
+}
 bool Source::read_imports(std::vector<model::ImportRow>& out) const { return clear_and_fail(out); }
 bool Source::read_exports(std::vector<model::ExportRow>& out) const { return clear_and_fail(out); }
 bool Source::read_strings(std::vector<model::StringRow>& out) const { return clear_and_fail(out); }
+bool Source::read_strings_at(std::int64_t address, std::vector<model::StringRow>& out) const {
+    std::vector<model::StringRow> all;
+    if (!read_strings(all)) { out.clear(); return false; }
+    out.clear();
+    for (auto& row : all) {
+        if (row.address == address) out.push_back(std::move(row));
+    }
+    return true;
+}
 bool Source::read_xrefs(std::vector<model::XrefRow>& out) const { return clear_and_fail(out); }
 bool Source::read_function_calls(std::vector<model::FunctionCallRow>& out) const { return clear_and_fail(out); }
 bool Source::read_call_edges(std::vector<model::CallEdgeRow>& out) const { return clear_and_fail(out); }
 bool Source::read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const { return clear_and_fail(out); }
 bool Source::read_data_items(std::vector<model::DataItemRow>& out) const { return clear_and_fail(out); }
+bool Source::read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const {
+    std::vector<model::DataItemRow> all;
+    if (!read_data_items(all)) { out.clear(); return false; }
+    out.clear();
+    for (auto& row : all) {
+        if (row.address == address) out.push_back(std::move(row));
+    }
+    return true;
+}
 bool Source::read_blocks(std::vector<model::BlockRow>& out) const { return clear_and_fail(out); }
 bool Source::read_cfg_edges(std::vector<model::CfgEdgeRow>& out) const { return clear_and_fail(out); }
 bool Source::read_switch_tables(std::vector<model::SwitchTableRow>& out) const { return clear_and_fail(out); }
@@ -40,6 +82,21 @@ bool Source::read_post_dominators(std::vector<model::PostDominatorRow>& out) con
 bool Source::read_loops(std::vector<model::LoopRow>& out) const { return clear_and_fail(out); }
 bool Source::read_function_params(std::vector<model::FunctionParamRow>& out) const { return clear_and_fail(out); }
 bool Source::read_instructions(std::vector<model::InstructionRow>& out) const { return clear_and_fail(out); }
+bool Source::read_instruction_at(std::int64_t address, model::InstructionRow& out) const {
+    std::vector<model::InstructionRow> all;
+    if (!read_instructions(all)) {
+        out = {};
+        return false;
+    }
+    for (const auto& row : all) {
+        if (row.address == address) {
+            out = row;
+            return true;
+        }
+    }
+    out = {};
+    return false;
+}
 bool Source::read_comments(std::vector<model::CommentRow>& out) const { return clear_and_fail(out); }
 bool Source::read_comments_at(std::int64_t address, std::vector<model::CommentRow>& out) const {
     // Default: fall back to bulk read + filter.
@@ -51,6 +108,20 @@ bool Source::read_comments_at(std::int64_t address, std::vector<model::CommentRo
     }
     return true;
 }
+bool Source::read_comments_in_range(
+    std::int64_t start_address,
+    std::int64_t end_address,
+    std::vector<model::CommentRow>& out) const {
+    std::vector<model::CommentRow> all;
+    if (!read_comments(all)) { out.clear(); return false; }
+    out.clear();
+    for (auto& c : all) {
+        if (c.address >= start_address && c.address <= end_address) {
+            out.push_back(std::move(c));
+        }
+    }
+    return true;
+}
 bool Source::read_types(std::vector<model::TypeRow>& out) const { return clear_and_fail(out); }
 bool Source::read_type_members(std::vector<model::TypeMemberRow>& out) const { return clear_and_fail(out); }
 bool Source::read_type_enums(std::vector<model::TypeEnumRow>& out) const { return clear_and_fail(out); }
@@ -59,7 +130,25 @@ bool Source::read_type_unions(std::vector<model::TypeUnionRow>& out) const { ret
 bool Source::read_type_aliases(std::vector<model::TypeAliasRow>& out) const { return clear_and_fail(out); }
 bool Source::read_signatures(std::vector<model::SignatureRow>& out) const { return clear_and_fail(out); }
 bool Source::read_breakpoints(std::vector<model::BreakpointRow>& out) const { return clear_and_fail(out); }
+bool Source::read_breakpoints_at(std::int64_t address, std::vector<model::BreakpointRow>& out) const {
+    std::vector<model::BreakpointRow> all;
+    if (!read_breakpoints(all)) { out.clear(); return false; }
+    out.clear();
+    for (auto& row : all) {
+        if (row.address == address) out.push_back(std::move(row));
+    }
+    return true;
+}
 bool Source::read_bookmarks(std::vector<model::BookmarkRow>& out) const { return clear_and_fail(out); }
+bool Source::read_bookmarks_at(std::int64_t address, std::vector<model::BookmarkRow>& out) const {
+    std::vector<model::BookmarkRow> all;
+    if (!read_bookmarks(all)) { out.clear(); return false; }
+    out.clear();
+    for (auto& row : all) {
+        if (row.address == address) out.push_back(std::move(row));
+    }
+    return true;
+}
 bool Source::read_function_tags(std::vector<model::FunctionTagRow>& out) const { return clear_and_fail(out); }
 bool Source::read_function_tag_mappings(std::vector<model::FunctionTagMappingRow>& out) const { return clear_and_fail(out); }
 bool Source::read_program_info(model::ProgramInfoRow& out) const {
@@ -173,16 +262,10 @@ std::optional<model::DecompilationDetail> Source::decompile_detail(std::int64_t 
         detail.func_name = pseudo_it->func_name;
     }
 
-    std::vector<model::FunctionRow> functions;
-    if (read_functions(functions)) {
-        for (const auto& fn : functions) {
-            if (fn.address != address) {
-                continue;
-            }
-            detail.func_name = fn.name;
-            detail.prototype = fn.signature;
-            break;
-        }
+    model::FunctionRow function;
+    if (read_function_at(address, function)) {
+        detail.func_name = function.name;
+        detail.prototype = function.signature;
     }
 
     std::vector<model::DecompLvarRow> locals;

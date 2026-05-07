@@ -24,12 +24,26 @@ public:
         return read_rows(callbacks_.read_functions, out);
     }
 
+    bool read_function_at(std::int64_t address, model::FunctionRow& out) const override {
+        if (callbacks_.read_function_at) {
+            return callbacks_.read_function_at(address, out);
+        }
+        return Source::read_function_at(address, out);
+    }
+
     bool read_segments(std::vector<model::SegmentRow>& out) const override {
         return read_rows(callbacks_.read_segments, out);
     }
 
     bool read_symbols(std::vector<model::SymbolRow>& out) const override {
         return read_rows(callbacks_.read_symbols, out);
+    }
+
+    bool read_symbols_at(std::int64_t address, std::vector<model::SymbolRow>& out) const override {
+        if (callbacks_.read_symbols_at) {
+            return callbacks_.read_symbols_at(address, out);
+        }
+        return Source::read_symbols_at(address, out);
     }
 
     bool read_imports(std::vector<model::ImportRow>& out) const override {
@@ -42,6 +56,13 @@ public:
 
     bool read_strings(std::vector<model::StringRow>& out) const override {
         return read_rows(callbacks_.read_strings, out);
+    }
+
+    bool read_strings_at(std::int64_t address, std::vector<model::StringRow>& out) const override {
+        if (callbacks_.read_strings_at) {
+            return callbacks_.read_strings_at(address, out);
+        }
+        return Source::read_strings_at(address, out);
     }
 
     bool read_xrefs(std::vector<model::XrefRow>& out) const override {
@@ -62,6 +83,13 @@ public:
 
     bool read_data_items(std::vector<model::DataItemRow>& out) const override {
         return read_rows(callbacks_.read_data_items, out);
+    }
+
+    bool read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const override {
+        if (callbacks_.read_data_items_at) {
+            return callbacks_.read_data_items_at(address, out);
+        }
+        return Source::read_data_items_at(address, out);
     }
 
     bool read_blocks(std::vector<model::BlockRow>& out) const override {
@@ -96,9 +124,35 @@ public:
         return read_rows(callbacks_.read_instructions, out);
     }
 
+    bool read_instruction_at(std::int64_t address, model::InstructionRow& out) const override {
+        if (callbacks_.read_instruction_at) {
+            return callbacks_.read_instruction_at(address, out);
+        }
+        return Source::read_instruction_at(address, out);
+    }
+
     bool read_comments(std::vector<model::CommentRow>& out) const override {
         return read_rows(callbacks_.read_comments, out);
     }
+
+    bool read_comments_at(std::int64_t address, std::vector<model::CommentRow>& out) const override {
+        if (callbacks_.read_comments_at) {
+            return callbacks_.read_comments_at(address, out);
+        }
+        return Source::read_comments_at(address, out);
+    }
+
+    bool read_comments_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::CommentRow>& out) const override
+    {
+        if (callbacks_.read_comments_in_range) {
+            return callbacks_.read_comments_in_range(start_address, end_address, out);
+        }
+        return Source::read_comments_in_range(start_address, end_address, out);
+    }
+
     bool read_types(std::vector<model::TypeRow>& out) const override {
         return read_rows(callbacks_.read_types, out);
     }
@@ -124,8 +178,23 @@ public:
     bool read_breakpoints(std::vector<model::BreakpointRow>& out) const override {
         return read_rows(callbacks_.read_breakpoints, out);
     }
+
+    bool read_breakpoints_at(std::int64_t address, std::vector<model::BreakpointRow>& out) const override {
+        if (callbacks_.read_breakpoints_at) {
+            return callbacks_.read_breakpoints_at(address, out);
+        }
+        return Source::read_breakpoints_at(address, out);
+    }
+
     bool read_bookmarks(std::vector<model::BookmarkRow>& out) const override {
         return read_rows(callbacks_.read_bookmarks, out);
+    }
+
+    bool read_bookmarks_at(std::int64_t address, std::vector<model::BookmarkRow>& out) const override {
+        if (callbacks_.read_bookmarks_at) {
+            return callbacks_.read_bookmarks_at(address, out);
+        }
+        return Source::read_bookmarks_at(address, out);
     }
 
     bool read_program_info(model::ProgramInfoRow& out) const override {

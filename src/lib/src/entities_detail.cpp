@@ -29,23 +29,11 @@ namespace {
 std::optional<model::FunctionRow> read_function_row_for(
     const std::shared_ptr<Source>& source, std::int64_t func_addr)
 {
-    std::vector<model::FunctionRow> functions;
-    if (!source->read_functions(functions)) {
+    model::FunctionRow function;
+    if (!source->read_function_at(func_addr, function)) {
         return std::nullopt;
     }
-    // Binary search — functions are sorted by address from the RPC layer.
-    auto it = std::lower_bound(functions.begin(), functions.end(), func_addr,
-        [](const model::FunctionRow& fn, std::int64_t addr) { return fn.address < addr; });
-    if (it != functions.end() && it->address == func_addr) {
-        return *it;
-    }
-    // Fallback linear scan if not sorted.
-    for (const auto& fn : functions) {
-        if (fn.address == func_addr) {
-            return fn;
-        }
-    }
-    return std::nullopt;
+    return function;
 }
 
 std::vector<model::DecompLvarRow> read_source_decomp_lvar_rows_for(
@@ -759,18 +747,17 @@ std::vector<model::DecompCommentRow> derive_decomp_comment_rows_for(
     // Resolve the function's address range so we can scope the comment lookup.
     auto fn = read_function_row_for(source, func_addr);
 
-    // Fallback: derive from listing comments scoped to the function's address range.
     std::vector<model::CommentRow> comments;
-    if (!source->read_comments(comments) || comments.empty()) {
+    const std::int64_t range_start = func_addr;
+    const std::int64_t range_end =
+        fn.has_value() && fn->end_ea > func_addr ? (fn->end_ea - 1) : func_addr;
+    if (!source->read_comments_in_range(range_start, range_end, comments) || comments.empty()) {
         return {};
     }
 
-    const std::int64_t range_start = func_addr;
-    const std::int64_t range_end = fn.has_value() ? fn->end_ea : func_addr;
-
     std::vector<model::DecompCommentRow> out;
     for (const auto& c : comments) {
-        if (c.address < range_start || c.address >= range_end) {
+        if (c.address < range_start || c.address > range_end) {
             continue;
         }
         model::DecompCommentRow row;

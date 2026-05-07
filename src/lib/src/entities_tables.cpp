@@ -37,6 +37,7 @@ inline void report_write_error(
 }
 
 constexpr std::int64_t kCommentsPerAddress = 0x10;
+constexpr std::int64_t kRowsPerAddress = 0x1000;
 
 inline std::int64_t encode_address_slot_rowid(std::int64_t address, size_t slot) {
     return address * kCommentsPerAddress + static_cast<std::int64_t>(slot);
@@ -48,6 +49,19 @@ inline bool decode_address_slot_rowid(std::int64_t raw_rowid, std::int64_t& addr
     }
     address = raw_rowid / kCommentsPerAddress;
     slot = static_cast<size_t>(raw_rowid % kCommentsPerAddress);
+    return true;
+}
+
+inline std::int64_t encode_address_rowid(std::int64_t address, size_t slot) {
+    return address * kRowsPerAddress + static_cast<std::int64_t>(slot);
+}
+
+inline bool decode_address_rowid(std::int64_t raw_rowid, std::int64_t& address, size_t& slot) {
+    if (raw_rowid < 0) {
+        return false;
+    }
+    address = raw_rowid / kRowsPerAddress;
+    slot = static_cast<size_t>(raw_rowid % kRowsPerAddress);
     return true;
 }
 
@@ -338,10 +352,43 @@ inline void column_export(xsql::FunctionContext& ctx, int col, const model::Expo
 inline void column_string(xsql::FunctionContext& ctx, int col, const model::StringRow& r) {
     switch (col) {
         case 0: ctx.result_int64(r.address); return;
-        case 1: ctx.result_int64(r.length); return;
-        case 2: ctx.result_text(r.type); return;
-        case 3: ctx.result_text(r.encoding); return;
-        case 4: ctx.result_text(r.content); return;
+        case 1: ctx.result_int64(r.address); return;
+        case 2: ctx.result_int64(r.length); return;
+        case 3: ctx.result_text(r.type); return;
+        case 4:
+            switch (classify_string_encoding(r.encoding)) {
+                case StringEncClass::kUtf16: ctx.result_text("utf16"); return;
+                case StringEncClass::kUtf32: ctx.result_text("utf32"); return;
+                default: ctx.result_text("ascii"); return;
+            }
+        case 5:
+            switch (classify_string_encoding(r.encoding)) {
+                case StringEncClass::kUtf16: ctx.result_int(2); return;
+                case StringEncClass::kUtf32: ctx.result_int(4); return;
+                default: ctx.result_int(1); return;
+            }
+        case 6:
+            switch (classify_string_encoding(r.encoding)) {
+                case StringEncClass::kUtf16: ctx.result_text("2-byte"); return;
+                case StringEncClass::kUtf32: ctx.result_text("4-byte"); return;
+                default: ctx.result_text("1-byte"); return;
+            }
+        case 7: ctx.result_int(0); return;
+        case 8: ctx.result_text("linear"); return;
+        case 9: ctx.result_text(r.encoding); return;
+        case 10: ctx.result_text(r.content); return;
+        default: ctx.result_null(); return;
+    }
+}
+
+inline void column_symbol(xsql::FunctionContext& ctx, int col, const model::SymbolRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.address); return;
+        case 1: ctx.result_text(r.name); return;
+        case 2: ctx.result_text(r.symbol_kind); return;
+        case 3: ctx.result_text(r.namespace_name); return;
+        case 4: ctx.result_int(r.is_primary); return;
+        case 5: ctx.result_int(r.is_external); return;
         default: ctx.result_null(); return;
     }
 }
@@ -349,23 +396,11 @@ inline void column_string(xsql::FunctionContext& ctx, int col, const model::Stri
 inline std::optional<model::FunctionRow> find_function_row_by_address(
     const std::shared_ptr<Source>& source,
     std::int64_t func_addr) {
-    std::vector<model::FunctionRow> rows;
-    if (!source->read_functions(rows)) {
+    model::FunctionRow row;
+    if (!source->read_function_at(func_addr, row)) {
         return std::nullopt;
     }
-    // Binary search — functions are sorted by address from the RPC layer.
-    auto it = std::lower_bound(rows.begin(), rows.end(), func_addr,
-        [](const model::FunctionRow& fn, std::int64_t addr) { return fn.address < addr; });
-    if (it != rows.end() && it->address == func_addr) {
-        return *it;
-    }
-    // Fallback linear scan if not sorted.
-    for (const auto& row : rows) {
-        if (row.address == func_addr) {
-            return row;
-        }
-    }
-    return std::nullopt;
+    return row;
 }
 
 inline void column_function(xsql::FunctionContext& ctx, int col, const model::FunctionRow& r) {
@@ -408,6 +443,20 @@ inline void column_instruction(xsql::FunctionContext& ctx, int col, const model:
         case 3: ctx.result_text(r.disasm); return;
         case 4: ctx.result_int(r.size); return;
         case 5: ctx.result_text(r.bytes); return;
+        default: ctx.result_null(); return;
+    }
+}
+
+inline void column_data_item(xsql::FunctionContext& ctx, int col, const model::DataItemRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.address); return;
+        case 1: ctx.result_text(r.name); return;
+        case 2: ctx.result_text(r.data_type); return;
+        case 3: ctx.result_int64(r.size); return;
+        case 4: ctx.result_text(r.value_repr); return;
+        case 5: ctx.result_text(r.segment_name); return;
+        case 6: ctx.result_int(r.is_string); return;
+        case 7: ctx.result_int(r.is_initialized); return;
         default: ctx.result_null(); return;
     }
 }
@@ -708,6 +757,32 @@ inline xsql::CachedTableDef<model::SymbolRow> define_names(const std::shared_ptr
             }
             return true;
         })
+        .row_lookup([source](model::SymbolRow& row, std::int64_t raw_rowid) {
+            std::int64_t address = 0;
+            size_t slot = 0;
+            if (!decode_address_rowid(raw_rowid, address, slot)) {
+                return false;
+            }
+            std::vector<model::SymbolRow> rows;
+            if (!source->read_symbols_at(address, rows) || slot >= rows.size()) {
+                return false;
+            }
+            row = std::move(rows[slot]);
+            return true;
+        })
+        .filter_eq("address",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::SymbolRow> rows;
+                source->read_symbols_at(address, rows);
+                std::vector<std::pair<std::int64_t, model::SymbolRow>> indexed;
+                indexed.reserve(rows.size());
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    indexed.emplace_back(encode_address_rowid(address, i), std::move(rows[i]));
+                }
+                return std::make_unique<IndexedOwnedRowIterator<model::SymbolRow>>(
+                    std::move(indexed),
+                    column_symbol);
+            }, 1.0, 4.0)
         .index_on("address", [](const model::SymbolRow& r) { return r.address; })
         .build();
 }
@@ -845,6 +920,14 @@ inline xsql::CachedTableDef<model::StringRow> define_strings(const std::shared_p
             },
             12.0,
             8.0)
+        .filter_eq("address",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::StringRow> rows;
+                source->read_strings_at(address, rows);
+                return std::make_unique<OwnedRowIterator<model::StringRow>>(
+                    std::move(rows),
+                    column_string);
+            }, 1.0, 2.0)
         .index_on("address", [](const model::StringRow& r) { return r.address; })
         .build();
 }
@@ -1112,6 +1195,17 @@ inline xsql::CachedTableDef<model::InstructionRow> define_instructions(const std
             },
             10.0,
             64.0)
+        .filter_eq("address",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                model::InstructionRow row;
+                std::vector<model::InstructionRow> rows;
+                if (source->read_instruction_at(address, row)) {
+                    rows.push_back(std::move(row));
+                }
+                return std::make_unique<OwnedRowIterator<model::InstructionRow>>(
+                    std::move(rows),
+                    column_instruction);
+            }, 1.0, 1.0)
         .index_on("address", [](const model::InstructionRow& r) { return r.address; })
         .build();
 }
@@ -1313,6 +1407,32 @@ inline xsql::CachedTableDef<model::DataItemRow> define_data_items(const std::sha
             }
             return true;
         })
+        .row_lookup([source](model::DataItemRow& row, std::int64_t raw_rowid) {
+            std::int64_t address = 0;
+            size_t slot = 0;
+            if (!decode_address_rowid(raw_rowid, address, slot)) {
+                return false;
+            }
+            std::vector<model::DataItemRow> rows;
+            if (!source->read_data_items_at(address, rows) || slot >= rows.size()) {
+                return false;
+            }
+            row = std::move(rows[slot]);
+            return true;
+        })
+        .filter_eq("address",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::DataItemRow> rows;
+                source->read_data_items_at(address, rows);
+                std::vector<std::pair<std::int64_t, model::DataItemRow>> indexed;
+                indexed.reserve(rows.size());
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    indexed.emplace_back(encode_address_rowid(address, i), std::move(rows[i]));
+                }
+                return std::make_unique<IndexedOwnedRowIterator<model::DataItemRow>>(
+                    std::move(indexed),
+                    column_data_item);
+            }, 1.0, 2.0)
         .build();
 }
 
@@ -2645,6 +2765,33 @@ inline xsql::CachedTableDef<model::LiveMetaRow> define_live_meta(const std::shar
         .build();
 }
 
+inline void column_breakpoint(xsql::FunctionContext& ctx, int col, const model::BreakpointRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.address); return;
+        case 1: ctx.result_int(r.enabled); return;
+        case 2: ctx.result_int(r.type); return;
+        case 3: ctx.result_text(breakpoint_type_name(r.type)); return;
+        case 4: ctx.result_int64(r.size); return;
+        case 5: ctx.result_int64(r.flags); return;
+        case 6: ctx.result_int(r.pass_count); return;
+        case 7: ctx.result_text(r.condition); return;
+        case 8: ctx.result_text(r.group); return;
+        case 9: ctx.result_int(r.loc_type); return;
+        case 10: ctx.result_text(breakpoint_loc_type_name(r.loc_type)); return;
+        default: ctx.result_null(); return;
+    }
+}
+
+inline void column_bookmark(xsql::FunctionContext& ctx, int col, const model::BookmarkRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.address); return;
+        case 1: ctx.result_text(r.type); return;
+        case 2: ctx.result_text(r.category); return;
+        case 3: ctx.result_text(r.comment); return;
+        default: ctx.result_null(); return;
+    }
+}
+
 inline xsql::CachedTableDef<model::BreakpointRow> define_breakpoints(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::BreakpointRow>("breakpoints")
         .no_shared_cache()
@@ -2747,6 +2894,32 @@ inline xsql::CachedTableDef<model::BreakpointRow> define_breakpoints(const std::
             }
             return true;
         })
+        .row_lookup([source](model::BreakpointRow& row, std::int64_t raw_rowid) {
+            std::int64_t address = 0;
+            size_t slot = 0;
+            if (!decode_address_rowid(raw_rowid, address, slot)) {
+                return false;
+            }
+            std::vector<model::BreakpointRow> rows;
+            if (!source->read_breakpoints_at(address, rows) || slot >= rows.size()) {
+                return false;
+            }
+            row = std::move(rows[slot]);
+            return true;
+        })
+        .filter_eq("address",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::BreakpointRow> rows;
+                source->read_breakpoints_at(address, rows);
+                std::vector<std::pair<std::int64_t, model::BreakpointRow>> indexed;
+                indexed.reserve(rows.size());
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    indexed.emplace_back(encode_address_rowid(address, i), std::move(rows[i]));
+                }
+                return std::make_unique<IndexedOwnedRowIterator<model::BreakpointRow>>(
+                    std::move(indexed),
+                    column_breakpoint);
+            }, 1.0, 2.0)
         .build();
 }
 
@@ -2827,6 +3000,32 @@ inline xsql::CachedTableDef<model::BookmarkRow> define_bookmarks(const std::shar
             }
             return true;
         })
+        .row_lookup([source](model::BookmarkRow& row, std::int64_t raw_rowid) {
+            std::int64_t address = 0;
+            size_t slot = 0;
+            if (!decode_address_rowid(raw_rowid, address, slot)) {
+                return false;
+            }
+            std::vector<model::BookmarkRow> rows;
+            if (!source->read_bookmarks_at(address, rows) || slot >= rows.size()) {
+                return false;
+            }
+            row = std::move(rows[slot]);
+            return true;
+        })
+        .filter_eq("address",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::BookmarkRow> rows;
+                source->read_bookmarks_at(address, rows);
+                std::vector<std::pair<std::int64_t, model::BookmarkRow>> indexed;
+                indexed.reserve(rows.size());
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    indexed.emplace_back(encode_address_rowid(address, i), std::move(rows[i]));
+                }
+                return std::make_unique<IndexedOwnedRowIterator<model::BookmarkRow>>(
+                    std::move(indexed),
+                    column_bookmark);
+            }, 1.0, 4.0)
         .build();
 }
 
