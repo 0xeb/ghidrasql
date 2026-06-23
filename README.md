@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.jpg" alt="ghidrasql logo" width="360">
+</p>
+
 # ghidrasql
 
 SQL interface for Ghidra program databases. Query functions, cross-references, types, decompilation output, and more using standard SQL.
