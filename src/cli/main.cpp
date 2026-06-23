@@ -574,11 +574,14 @@ int run_repl(
             return "HTTP already running at " + http.url();
         }
         int port = http.start(
-            [&](const std::string& sql) {
-                std::vector<ghidrasql::QueryResult> results;
-                std::string error;
-                const bool ok = engine.execute_script(sql, results, error);
-                return ghidrasql::script_results_to_json(results, ok, error).dump();
+            [&](const std::string& sql, xsql::ScriptStatementResult& out) {
+                const ghidrasql::QueryResult r = engine.query(sql);
+                out.columns = r.columns;
+                out.rows.reserve(r.rows.size());
+                for (const auto& row : r.rows) out.rows.push_back(row.values);
+                out.success = r.success;
+                out.error = r.error;
+                out.elapsed_ms = r.elapsed_ms;
             },
             [&]() { return engine.info(); },
             http_options,
@@ -871,11 +874,14 @@ int run_headless_live_server(const Args& args) {
     http_options.auth_token = args.auth_token;
 
     const int started_port = http.start(
-        [&](const std::string& sql) {
-            std::vector<ghidrasql::QueryResult> results;
-            std::string error;
-            const bool ok = engine.execute_script(sql, results, error);
-            return ghidrasql::script_results_to_json(results, ok, error).dump();
+        [&](const std::string& sql, xsql::ScriptStatementResult& out) {
+            const ghidrasql::QueryResult r = engine.query(sql);
+            out.columns = r.columns;
+            out.rows.reserve(r.rows.size());
+            for (const auto& row : r.rows) out.rows.push_back(row.values);
+            out.success = r.success;
+            out.error = r.error;
+            out.elapsed_ms = r.elapsed_ms;
         },
         [&]() { return engine.info(); },
         http_options,
@@ -1043,11 +1049,14 @@ int main(int argc, char** argv) {
 
     if (args.serve) {
         int started_port = http.start(
-            [&](const std::string& sql) {
-                std::vector<ghidrasql::QueryResult> results;
-                std::string error;
-                const bool ok = engine.execute_script(sql, results, error);
-                return ghidrasql::script_results_to_json(results, ok, error).dump();
+            [&](const std::string& sql, xsql::ScriptStatementResult& out) {
+                const ghidrasql::QueryResult r = engine.query(sql);
+                out.columns = r.columns;
+                out.rows.reserve(r.rows.size());
+                for (const auto& row : r.rows) out.rows.push_back(row.values);
+                out.success = r.success;
+                out.error = r.error;
+                out.elapsed_ms = r.elapsed_ms;
             },
             [&]() { return engine.info(); },
             http_options,
