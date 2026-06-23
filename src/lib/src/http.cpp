@@ -130,7 +130,8 @@ int HttpServer::start(QueryFn query_fn, InfoFn info_fn, Options options, Refresh
     // a worker is currently busy and how long the oldest in-flight call has
     // been running. The wrapper does not change the response body; it only
     // brackets the call with two atomic updates.
-    cfg.query_fn = [this, fn = std::move(query_fn)](const std::string& sql) -> std::string {
+    cfg.statement_executor = [this, fn = std::move(query_fn)](
+            const std::string& sql, xsql::ScriptStatementResult& out) {
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         latest_query_started_at_ms_.store(now_ms, std::memory_order_relaxed);
@@ -139,7 +140,7 @@ int HttpServer::start(QueryFn query_fn, InfoFn info_fn, Options options, Refresh
             std::atomic<int>* counter;
             ~CountGuard() { counter->fetch_sub(1, std::memory_order_relaxed); }
         } guard{&active_queries_};
-        return fn(sql);
+        fn(sql, out);
     };
 
     cfg.status_fn = [this]() -> xsql::json {

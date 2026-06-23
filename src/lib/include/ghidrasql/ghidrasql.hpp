@@ -163,7 +163,10 @@ public:
         kForceKilled = 4,
     };
 
-    using QueryFn = std::function<std::string(const std::string&)>;
+    // Single-statement executor: runs one SQL statement and fills `out`.
+    // The thinclient owns multi-statement orchestration + output formatting.
+    using QueryFn = std::function<void(const std::string& sql,
+                                       xsql::ScriptStatementResult& out)>;
     using InfoFn = std::function<std::string()>;
     using RefreshFn = std::function<bool()>;
 
