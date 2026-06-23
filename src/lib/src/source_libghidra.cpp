@@ -16,8 +16,6 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
-#include <unordered_map>
-#include <unordered_set>
 
 #ifdef GHIDRASQL_HAS_LIBGHIDRA
 #include <libghidra/http.hpp>
@@ -30,7 +28,12 @@ namespace ghidrasql {
 class LibGhidraSource final : public Source {
 public:
     static constexpr std::uint64_t kAllAddressesMin = 0;
-    static constexpr std::uint64_t kAllAddressesMax = std::numeric_limits<std::uint64_t>::max();
+    // Use INT64_MAX, not UINT64_MAX: the LibGhidraHost decodes the protobuf uint64 range
+    // end into a signed Java long, so UINT64_MAX arrives as -1 and trips a getMaxAddress()
+    // fallback that empties range-filtered tables for programs with EXTERNAL/low-offset
+    // spaces. A large positive sentinel stays positive on the host. See ghidrasql #2/#3/#6.
+    static constexpr std::uint64_t kAllAddressesMax =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
 
     explicit LibGhidraSource(LibGhidraSourceOptions options)
         : options_(std::move(options)),

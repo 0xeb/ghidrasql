@@ -2,3 +2,6 @@
 /ghidra-extension/GhidraSql/os/
 CLAUDE.md
 errors.md
+
+# clangd index
+.cache/
