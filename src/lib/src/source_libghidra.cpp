@@ -1135,6 +1135,8 @@ public:
             out.language_id = opened_program_->language_id;
             out.compiler_spec = opened_program_->compiler_spec;
             out.image_base = to_i64(opened_program_->image_base);
+            out.md5 = opened_program_->md5;
+            out.sha256 = opened_program_->sha256;
         } else {
             out.program_name = active_path.empty() ? "active-program" : active_path;
         }
