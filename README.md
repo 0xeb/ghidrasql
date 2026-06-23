@@ -129,6 +129,10 @@ ghidrasql --ghidra /path/to/ghidra_dist \
   --serve --port 8081
 
 # Then query it: curl -X POST http://localhost:8081/query -d "SELECT * FROM funcs LIMIT 5"
+
+# Output format for terminals/pipes (default is JSON; agents should consume JSON):
+#   curl -X POST "http://localhost:8081/query?format=text" -d "SELECT name,size FROM funcs LIMIT 5"
+#   format=json (default) | text (ASCII table) | csv | tsv
 ```
 
 ## Example Queries
