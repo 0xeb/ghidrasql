@@ -1528,9 +1528,19 @@ curl -X POST http://localhost:8081/query -H "Authorization: Bearer mysecret" \
 
 ## Output Guidelines
 
-### ALWAYS Show Actual Data
+### Deciding what to show
 
-When the user asks to see something (decompilation, code, data), **ALWAYS include the actual output** in your response — don't just describe it.
+Showing data serves the user's intent — it is not automatic. Keep three concerns separate:
+
+**Selection — *whether* and *how much* to show.** A judgment driven by what was asked:
+- They asked to *see* something (decompile, list the strings) → show it.
+- They asked a *question* the data answers (biggest function? does it call malloc?) →
+  answer directly ("biggest is `main`, 135 bytes"), surfacing supporting rows only when they
+  help the user verify. Don't dump full tables unprompted.
+- You queried only to decide your next step → don't show it; it's internal.
+
+**Fidelity — when you *do* present code or data, show the real artifact, not a paraphrase.**
+Never describe what code does in place of showing it:
 
 **BAD:**
 > "The function appears to call malloc and contains a loop..."
@@ -1548,6 +1558,14 @@ int parseConfig(const char *path) {
     return 0;
 }
 ```
+
+**Mechanics — consume the JSON; don't reformat it for display.** Over HTTP, `/query` returns a
+JSON envelope (`{success, results:[{columns,rows,…}]}`). Parse it yourself and render in your
+reply. Do **not** pipe responses through `python`/`jq`/`awk` to pre-render a table — that
+discards `success`/`elapsed_ms`/`error` and makes you reason over a lossy view. Reserve
+`jq`/`python` for extracting a value to feed a later query. The CLI (`-q`) already prints a
+table. (For direct terminal/pipe use, the server can emit `?format=text|csv|tsv` — but as an
+agent, consume `json`.)
 
 ### Addresses in Hex
 Always display addresses in hex format using `printf('0x%X', address)`.
