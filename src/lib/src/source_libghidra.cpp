@@ -1106,15 +1106,39 @@ public:
             out.revision = to_i64(rev.value->modification_number);
         }
 
+        // The host knows the active program's path via the revision even when the client
+        // never issued an explicit OpenProgram (e.g. headless --binary, where the host binds
+        // the imported program as the active program). Use it so db_info reports the real
+        // program instead of the "active-program" placeholder.
+        std::string active_path = rev.ok() ? rev.value->program_path : std::string();
+        if (active_path.empty()) {
+            active_path = options_.program_path;
+        }
+
+        if (!opened_program_.has_value() && !active_path.empty()) {
+            // Best-effort open to populate language/compiler/image-base metadata. Non-fatal:
+            // analysis queries already run against the active program regardless of this.
+            libghidra::client::OpenProgramRequest req;
+            req.project_path = options_.project_path;
+            req.project_name = options_.project_name;
+            req.program_path = active_path;
+            req.read_only = options_.read_only;
+            auto opened = client_.OpenProgram(req);
+            if (opened.ok()) {
+                opened_program_ = *opened.value;
+                opened_project_ = true;
+            }
+        }
+
         if (opened_program_.has_value()) {
             out.program_name = opened_program_->program_name;
             out.language_id = opened_program_->language_id;
             out.compiler_spec = opened_program_->compiler_spec;
             out.image_base = to_i64(opened_program_->image_base);
         } else {
-            out.program_name = options_.program_path.empty() ? "active-program" : options_.program_path;
+            out.program_name = active_path.empty() ? "active-program" : active_path;
         }
-        out.program_path = options_.program_path.empty() ? out.program_name : options_.program_path;
+        out.program_path = active_path.empty() ? out.program_name : active_path;
         last_error_.clear();
         return true;
     }
