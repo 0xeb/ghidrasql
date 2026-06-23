@@ -63,6 +63,19 @@ gradle installExtension -PGHIDRA_INSTALL_DIR=/path/to/ghidra_dist
 cd ../../..
 ```
 
+**Enable the plugin in the Ghidra GUI** — only needed for the *connect-to-GUI* workflow
+(`ghidrasql --url …`); the headless `--binary` path does not need it.
+
+1. In the CodeBrowser, open **File → Configure**.
+2. In the **Ghidra Core** group click **Configure**, search for **libghidra**, check
+   **LibGhidraHostPlugin**, then **OK**.
+3. Start the host from **Tools → libghidra Host → Start Server…** (default port `18080`;
+   **Stop Server** and **Status** are in the same menu).
+
+If the plugin doesn't appear right after installing the extension, clear Ghidra's OSGi
+bundle cache (`~/Library/ghidra/<version>/osgi/` on macOS, `~/.ghidra/.../osgi/` on
+Linux/Windows) and restart Ghidra.
+
 ### 3. Build ghidrasql
 
 ```bash
