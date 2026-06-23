@@ -115,6 +115,12 @@ cmake --build build --config Release
 cd ghidrasql
 cmake -B build -DGHIDRASQL_LIBGHIDRA_DIR=../libghidra/cpp \
       -DCMAKE_BUILD_TYPE=Release
+# Memory-constrained machines: do NOT use a bare `-j`.
+# A bare `-j` runs one compiler per core; each C++ unit
+# here can use ~1.75 GB, so 8x at once needs ~14 GB and OOM-crashes an 8 GB machine. Cap the job count so peak RAM ≈ jobs x 1.75 GB:
+#   - 8 GB RAM  -> -j 2  (~3.5 GB)
+#   - 16 GB RAM -> -j 4  (~7 GB)
+# Rule of thumb: jobs = floor((free_RAM_GB - 2) / 2).
 cmake --build build -j
 ```
 
