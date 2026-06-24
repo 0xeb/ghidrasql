@@ -143,6 +143,11 @@ int HttpServer::start(QueryFn query_fn, InfoFn info_fn, Options options, Refresh
         fn(sql, out);
     };
 
+    // Non-queue server: serialize concurrent /query requests. The libghidra
+    // host can deadlock on overlapping decompiler reads (pseudocode/decomp_*),
+    // so one request at a time is the safe default.
+    cfg.serialize_requests = true;
+
     cfg.status_fn = [this]() -> xsql::json {
         xsql::json extra;
         extra["running"] = is_running();
