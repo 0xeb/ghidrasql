@@ -65,7 +65,7 @@ else()
     message(STATUS "ghidrasql: Fetching libxsql from GitHub (shallow clone)...")
     FetchContent_Declare(libxsql
         GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        v1.0.8
+        GIT_TAG        v1.0.10
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libxsql)
