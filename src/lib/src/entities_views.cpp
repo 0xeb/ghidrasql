@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include "internal/entities_detail.hpp"
 
@@ -12,26 +11,26 @@ namespace ghidrasql::entities {
     void create_entity_views(xsql::Database& db) {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS functions AS
-            SELECT address, name, size, end_ea, flags, namespace, signature
+            SELECT addr, name, size, end_addr, flags, namespace, prototype
             FROM funcs
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS memory_layout AS
-            SELECT start_ea, end_ea, name, class, perm, bitness, size, is_read, is_write, is_exec
+            SELECT start_addr, end_addr, name, class, perm, bitness, size, is_read, is_write, is_exec
             FROM memory_blocks
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS memory_hexdump AS
             SELECT
-                address,
+                addr,
                 printf('%02X', value) AS byte_hex,
                 segment_name,
                 func_addr,
                 source_kind
-            FROM memory_bytes
-            ORDER BY address
+            FROM bytes
+            ORDER BY addr
         )");
 
         db.exec(R"(
@@ -42,13 +41,13 @@ namespace ghidrasql::entities {
                     func_addr,
                     source_kind,
                     COUNT(*) AS item_size,
-                    MIN(address) AS item_start_ea,
-                    MAX(address) + 1 AS item_end_ea
-                FROM memory_bytes
+                    MIN(addr) AS item_start_addr,
+                    MAX(addr) + 1 AS item_end_addr
+                FROM bytes
                 GROUP BY item_addr, func_addr, source_kind
             )
             SELECT
-                mb.address,
+                mb.addr,
                 mb.value,
                 printf('%02X', mb.value) AS byte_hex,
                 mb.ascii,
@@ -59,9 +58,9 @@ namespace ghidrasql::entities {
                 mb.item_addr,
                 mb.item_offset,
                 ia.item_size,
-                ia.item_start_ea,
-                ia.item_end_ea
-            FROM memory_bytes mb
+                ia.item_start_addr,
+                ia.item_end_addr
+            FROM bytes mb
             LEFT JOIN item_agg ia
                 ON ia.item_addr = mb.item_addr
                AND ia.func_addr = mb.func_addr
@@ -73,20 +72,20 @@ namespace ghidrasql::entities {
             WITH agg AS (
                 SELECT
                     item_addr,
-                    MIN(address) AS start_ea,
-                    MAX(address) + 1 AS end_ea,
+                    MIN(addr) AS start_addr,
+                    MAX(addr) + 1 AS end_addr,
                     COUNT(*) AS byte_count,
                     SUM(CASE WHEN is_printable = 1 THEN 1 ELSE 0 END) AS printable_count,
                     func_addr,
                     source_kind,
                     segment_name
-                FROM memory_bytes
+                FROM bytes
                 GROUP BY item_addr, func_addr, source_kind, segment_name
             )
             SELECT
                 item_addr,
-                start_ea,
-                end_ea,
+                start_addr,
+                end_addr,
                 byte_count,
                 printable_count,
                 func_addr,
@@ -104,29 +103,29 @@ namespace ghidrasql::entities {
                 COALESCE(df.name, ds.name, printf('sub_%X', c.dst_func_addr)) AS dst_func_name,
                 c.call_site
             FROM call_edges c
-            LEFT JOIN funcs sf ON sf.address = c.src_func_addr
-            LEFT JOIN funcs df ON df.address = c.dst_func_addr
-            LEFT JOIN names ds ON ds.address = c.dst_func_addr
+            LEFT JOIN funcs sf ON sf.addr = c.src_func_addr
+            LEFT JOIN funcs df ON df.addr = c.dst_func_addr
+            LEFT JOIN names ds ON ds.addr = c.dst_func_addr
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS string_refs AS
             SELECT
-                s.address AS string_addr,
+                s.addr AS string_addr,
                 s.content AS string_value,
                 s.length AS string_length,
-                xi.from_ea AS ref_addr,
-                f.address AS func_addr,
+                xi.from_addr AS ref_addr,
+                f.addr AS func_addr,
                 f.name AS func_name
             FROM strings s
-            JOIN xref_index xi ON xi.to_ea = s.address
-            LEFT JOIN funcs f ON f.address = xi.src_func_addr
+            JOIN xref_index xi ON xi.to_addr = s.addr
+            LEFT JOIN funcs f ON f.addr = xi.src_func_addr
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS typed_data_items AS
             SELECT
-                d.address,
+                d.addr,
                 d.name,
                 d.data_type,
                 d.size,
@@ -134,17 +133,17 @@ namespace ghidrasql::entities {
                 d.segment_name,
                 d.is_string,
                 d.is_initialized,
-                COUNT(x.from_ea) AS xref_count
+                COUNT(x.from_addr) AS xref_count
             FROM data_items d
-            LEFT JOIN xrefs x ON x.to_ea = d.address
-            GROUP BY d.address, d.name, d.data_type, d.size, d.value_repr, d.segment_name, d.is_string, d.is_initialized
-            ORDER BY d.address
+            LEFT JOIN xrefs x ON x.to_addr = d.addr
+            GROUP BY d.addr, d.name, d.data_type, d.size, d.value_repr, d.segment_name, d.is_string, d.is_initialized
+            ORDER BY d.addr
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS apply_type_data AS
             SELECT
-                d.address,
+                d.addr,
                 d.data_type AS type_name
             FROM data_items d
         )");
@@ -154,13 +153,13 @@ namespace ghidrasql::entities {
             INSTEAD OF INSERT ON apply_type_data
             BEGIN
                 SELECT CASE
-                    WHEN NEW.address IS NULL OR NEW.type_name IS NULL OR trim(NEW.type_name) = ''
-                    THEN RAISE(ABORT, 'apply_type_data requires address and type_name')
+                    WHEN NEW.addr IS NULL OR NEW.type_name IS NULL OR trim(NEW.type_name) = ''
+                    THEN RAISE(ABORT, 'apply_type_data requires addr and type_name')
                 END;
 
                 UPDATE data_items
                 SET data_type = NEW.type_name
-                WHERE address = NEW.address;
+                WHERE addr = NEW.addr;
             END
         )");
 
@@ -218,26 +217,26 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS disasm_calls AS
             SELECT
                 src_func_addr AS func_addr,
-                call_site AS ea,
+                call_site AS addr,
                 CASE
                     WHEN dst_func_addr IS NOT NULL AND dst_func_addr != 0 THEN dst_func_addr
                     ELSE dst_addr
                 END AS callee_addr,
                 COALESCE(df.name, dn.name, '') AS callee_name,
-                call_site AS call_ea,
+                call_site AS call_addr,
                 kind
             FROM call_edges c
-            LEFT JOIN funcs df ON df.address = c.dst_func_addr
-            LEFT JOIN names dn ON dn.address = c.dst_addr
+            LEFT JOIN funcs df ON df.addr = c.dst_func_addr
+            LEFT JOIN names dn ON dn.addr = c.dst_addr
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS disasm_blocks AS
             SELECT
-                func_addr AS func_ea,
-                start_ea,
-                end_ea,
-                (end_ea - start_ea) AS size,
+                func_addr AS func_addr,
+                start_addr,
+                end_addr,
+                (end_addr - start_addr) AS size,
                 in_degree,
                 out_degree
             FROM blocks
@@ -255,7 +254,7 @@ namespace ghidrasql::entities {
                     1 AS is_expr,
                     0 AS op,
                     'cot_call' AS op_name,
-                    c.call_site AS ea,
+                    c.call_site AS addr,
                     CAST(NULL AS INTEGER) AS parent_id,
                     2 AS depth,
                     CAST(NULL AS INTEGER) AS x_id,
@@ -265,20 +264,20 @@ namespace ghidrasql::entities {
                     CASE
                         WHEN c.dst_func_addr IS NOT NULL AND c.dst_func_addr != 0 THEN c.dst_func_addr
                         ELSE c.dst_addr
-                    END AS obj_ea,
+                    END AS obj_addr,
                     CAST(NULL AS INTEGER) AS num_value,
                     CAST(NULL AS TEXT) AS str_value,
                     COALESCE(df.name, dn.name, '') AS var_name
                 FROM call_edges c
-                LEFT JOIN funcs df ON df.address = c.dst_func_addr
-                LEFT JOIN names dn ON dn.address = c.dst_addr
+                LEFT JOIN funcs df ON df.addr = c.dst_func_addr
+                LEFT JOIN names dn ON dn.addr = c.dst_addr
             ),
             loop_nodes AS (
                 SELECT
                     l.func_addr,
                     100000 + ROW_NUMBER() OVER (
                         PARTITION BY l.func_addr
-                        ORDER BY l.header_ea, l.start_ea
+                        ORDER BY l.header_addr, l.start_addr
                     ) AS item_id,
                     0 AS is_expr,
                     0 AS op,
@@ -287,14 +286,14 @@ namespace ghidrasql::entities {
                         WHEN 'do' THEN 'cit_do'
                         ELSE 'cit_while'
                     END AS op_name,
-                    l.header_ea AS ea,
+                    l.header_addr AS addr,
                     CAST(NULL AS INTEGER) AS parent_id,
                     1 AS depth,
                     CAST(NULL AS INTEGER) AS x_id,
                     CAST(NULL AS INTEGER) AS y_id,
                     CAST(NULL AS INTEGER) AS z_id,
                     CAST(NULL AS INTEGER) AS var_idx,
-                    CAST(NULL AS INTEGER) AS obj_ea,
+                    CAST(NULL AS INTEGER) AS obj_addr,
                     CAST(NULL AS INTEGER) AS num_value,
                     CAST(NULL AS TEXT) AS str_value,
                     CAST(NULL AS TEXT) AS var_name
@@ -305,19 +304,19 @@ namespace ghidrasql::entities {
                     b.func_addr,
                     200000 + ROW_NUMBER() OVER (
                         PARTITION BY b.func_addr
-                        ORDER BY b.start_ea
+                        ORDER BY b.start_addr
                     ) AS item_id,
                     0 AS is_expr,
                     0 AS op,
                     'cit_if' AS op_name,
-                    b.start_ea AS ea,
+                    b.start_addr AS addr,
                     CAST(NULL AS INTEGER) AS parent_id,
                     1 AS depth,
                     CAST(NULL AS INTEGER) AS x_id,
                     CAST(NULL AS INTEGER) AS y_id,
                     CAST(NULL AS INTEGER) AS z_id,
                     CAST(NULL AS INTEGER) AS var_idx,
-                    CAST(NULL AS INTEGER) AS obj_ea,
+                    CAST(NULL AS INTEGER) AS obj_addr,
                     CAST(NULL AS INTEGER) AS num_value,
                     CAST(NULL AS TEXT) AS str_value,
                     CAST(NULL AS TEXT) AS var_name
@@ -326,22 +325,22 @@ namespace ghidrasql::entities {
             ),
             return_nodes AS (
                 SELECT
-                    f.address AS func_addr,
-                    300000 + ROW_NUMBER() OVER (ORDER BY f.address) AS item_id,
+                    f.addr AS func_addr,
+                    300000 + ROW_NUMBER() OVER (ORDER BY f.addr) AS item_id,
                     0 AS is_expr,
                     0 AS op,
                     'cit_return' AS op_name,
                     CASE
-                        WHEN f.end_ea > f.address THEN f.end_ea - 1
-                        ELSE f.address
-                    END AS ea,
+                        WHEN f.end_addr > f.addr THEN f.end_addr - 1
+                        ELSE f.addr
+                    END AS addr,
                     CAST(NULL AS INTEGER) AS parent_id,
                     1 AS depth,
                     CAST(NULL AS INTEGER) AS x_id,
                     CAST(NULL AS INTEGER) AS y_id,
                     CAST(NULL AS INTEGER) AS z_id,
                     CAST(NULL AS INTEGER) AS var_idx,
-                    CAST(NULL AS INTEGER) AS obj_ea,
+                    CAST(NULL AS INTEGER) AS obj_addr,
                     CAST(NULL AS INTEGER) AS num_value,
                     CAST(NULL AS TEXT) AS str_value,
                     CAST(NULL AS TEXT) AS var_name
@@ -390,21 +389,21 @@ namespace ghidrasql::entities {
             SELECT
                 c.func_addr,
                 c.item_id,
-                c.ea,
+                c.addr,
                 c.depth AS call_depth,
-                c.obj_ea AS callee_addr,
+                c.obj_addr AS callee_addr,
                 COALESCE(n.name, f.name, c.var_name, '') AS callee_name,
                 CASE
-                    WHEN c.obj_ea IS NOT NULL AND c.obj_ea != 0 THEN 'cot_obj'
+                    WHEN c.obj_addr IS NOT NULL AND c.obj_addr != 0 THEN 'cot_obj'
                     ELSE 'cot_helper'
                 END AS callee_op,
                 CASE
-                    WHEN c.obj_ea IS NOT NULL AND c.obj_ea != 0 THEN CAST(NULL AS TEXT)
+                    WHEN c.obj_addr IS NOT NULL AND c.obj_addr != 0 THEN CAST(NULL AS TEXT)
                     ELSE c.var_name
                 END AS helper_name
             FROM ctree c
-            LEFT JOIN funcs f ON f.address = c.obj_ea
-            LEFT JOIN names n ON n.address = c.obj_ea
+            LEFT JOIN funcs f ON f.addr = c.obj_addr
+            LEFT JOIN names n ON n.addr = c.obj_addr
             WHERE c.op_name = 'cot_call'
         )");
 
@@ -426,7 +425,7 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS ctree_v_signed_ops AS
             SELECT
                 i.func_addr,
-                i.address AS ea,
+                i.addr AS addr,
                 CASE lower(i.mnemonic)
                     WHEN 'imul' THEN 'cot_mul'
                     WHEN 'idiv' THEN 'cot_div'
@@ -442,7 +441,7 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS ctree_v_comparisons AS
             SELECT
                 i.func_addr,
-                i.address AS ea,
+                i.addr AS addr,
                 'cot_eq' AS op_name,
                 'cot_var' AS lhs_op,
                 'cot_num' AS rhs_op,
@@ -456,7 +455,7 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS ctree_v_assignments AS
             SELECT
                 i.func_addr,
-                i.address AS ea,
+                i.addr AS addr,
                 'cot_asg' AS op_name,
                 'cot_var' AS lhs_op,
                 'cot_var' AS rhs_op
@@ -468,7 +467,7 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS ctree_v_derefs AS
             SELECT
                 i.func_addr,
-                i.address AS ea,
+                i.addr AS addr,
                 'cot_ptr' AS op_name,
                 i.operands AS expr
             FROM instructions i
@@ -480,9 +479,9 @@ namespace ghidrasql::entities {
             SELECT
                 c.func_addr,
                 c.item_id,
-                c.ea,
+                c.addr,
                 c.call_depth,
-                l.header_ea AS loop_id,
+                l.header_addr AS loop_id,
                 CASE lower(COALESCE(l.loop_kind, 'while'))
                     WHEN 'for' THEN 'cit_for'
                     WHEN 'do' THEN 'cit_do'
@@ -494,8 +493,8 @@ namespace ghidrasql::entities {
             FROM ctree_v_calls c
             JOIN loops l
                 ON l.func_addr = c.func_addr
-               AND c.ea >= l.start_ea
-               AND c.ea < l.end_ea
+               AND c.addr >= l.start_addr
+               AND c.addr < l.end_addr
         )");
 
         db.exec(R"(
@@ -504,14 +503,14 @@ namespace ghidrasql::entities {
                 SELECT
                     func_addr,
                     item_id AS if_id,
-                    ea AS if_ea
+                    addr AS if_addr
                 FROM ctree_v_ifs
             ),
             ranked AS (
                 SELECT
                     c.func_addr,
                     c.item_id,
-                    c.ea,
+                    c.addr,
                     c.call_depth,
                     i.if_id,
                     CASE WHEN (c.item_id % 2) = 0 THEN 'then' ELSE 'else' END AS branch,
@@ -520,7 +519,7 @@ namespace ghidrasql::entities {
                     c.helper_name,
                     ROW_NUMBER() OVER (
                         PARTITION BY c.func_addr, c.item_id
-                        ORDER BY abs(c.ea - i.if_ea)
+                        ORDER BY abs(c.addr - i.if_addr)
                     ) AS rn
                 FROM ctree_v_calls c
                 JOIN if_nodes i ON i.func_addr = c.func_addr
@@ -528,7 +527,7 @@ namespace ghidrasql::entities {
             SELECT
                 func_addr,
                 item_id,
-                ea,
+                addr,
                 call_depth,
                 if_id,
                 branch,
@@ -542,28 +541,28 @@ namespace ghidrasql::entities {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS ctree_v_leaf_funcs AS
             SELECT
-                f.address,
+                f.addr,
                 f.name
             FROM funcs f
             LEFT JOIN ctree_v_calls c
-                ON c.func_addr = f.address
+                ON c.func_addr = f.addr
                AND c.callee_addr IS NOT NULL
                AND c.callee_addr != 0
-            GROUP BY f.address, f.name
+            GROUP BY f.addr, f.name
             HAVING COUNT(c.callee_addr) = 0
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS disasm_v_leaf_funcs AS
             SELECT
-                f.address,
+                f.addr,
                 f.name
             FROM funcs f
             LEFT JOIN disasm_calls c
-                ON c.func_addr = f.address
+                ON c.func_addr = f.addr
                AND c.callee_addr IS NOT NULL
                AND c.callee_addr != 0
-            GROUP BY f.address, f.name
+            GROUP BY f.addr, f.name
             HAVING COUNT(c.callee_addr) = 0
         )");
 
@@ -625,11 +624,11 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS callers AS
             SELECT
                 d.callee_addr AS func_addr,
-                d.ea AS caller_addr,
+                d.addr AS caller_addr,
                 COALESCE(f.name, printf('sub_%X', d.func_addr)) AS caller_name,
                 d.func_addr AS caller_func_addr
             FROM disasm_calls d
-            LEFT JOIN funcs f ON f.address = d.func_addr
+            LEFT JOIN funcs f ON f.addr = d.func_addr
             WHERE d.callee_addr IS NOT NULL AND d.callee_addr != 0
         )");
 
@@ -641,7 +640,7 @@ namespace ghidrasql::entities {
                 d.callee_addr,
                 d.callee_name
             FROM disasm_calls d
-            LEFT JOIN funcs f ON f.address = d.func_addr
+            LEFT JOIN funcs f ON f.addr = d.func_addr
             WHERE d.callee_addr IS NOT NULL AND d.callee_addr != 0
         )");
 
@@ -711,12 +710,12 @@ namespace ghidrasql::entities {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS ctree_v_returns AS
             SELECT
-                f.address AS func_addr,
-                400000 + ROW_NUMBER() OVER (ORDER BY f.address) AS item_id,
+                f.addr AS func_addr,
+                400000 + ROW_NUMBER() OVER (ORDER BY f.addr) AS item_id,
                 CASE
-                    WHEN f.end_ea > f.address THEN f.end_ea - 1
-                    ELSE f.address
-                END AS ea,
+                    WHEN f.end_addr > f.addr THEN f.end_addr - 1
+                    ELSE f.addr
+                END AS addr,
                 CASE
                     WHEN f.return_is_void = 1 THEN 'cot_empty'
                     WHEN f.return_is_integral = 1 THEN 'cot_num'
@@ -736,7 +735,7 @@ namespace ghidrasql::entities {
                 0 AS returns_arg,
                 0 AS returns_stk_var,
                 CAST(NULL AS TEXT) AS return_obj,
-                CAST(NULL AS INTEGER) AS return_obj_ea,
+                CAST(NULL AS INTEGER) AS return_obj_addr,
                 0 AS returns_call_result,
                 f.return_type
             FROM funcs f
@@ -752,10 +751,10 @@ namespace ghidrasql::entities {
                     p.param_name AS arg_name,
                     p.param_type AS arg_type
                 FROM function_params p
-                LEFT JOIN funcs f ON f.address = p.func_addr
+                LEFT JOIN funcs f ON f.addr = p.func_addr
                 UNION ALL
                 SELECT
-                    f.address AS type_ordinal,
+                    f.addr AS type_ordinal,
                     f.name AS type_name,
                     -1 AS arg_index,
                     '(return)' AS arg_name,
@@ -851,11 +850,11 @@ namespace ghidrasql::entities {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS string_hotspots AS
             SELECT
-                f.address AS func_addr,
+                f.addr AS func_addr,
                 f.name AS func_name,
                 COALESCE(m.string_ref_count, 0) AS ref_count
             FROM funcs f
-            LEFT JOIN function_metrics m ON m.func_addr = f.address
+            LEFT JOIN function_metrics m ON m.func_addr = f.addr
         )");
 
         db.exec(R"(
@@ -913,12 +912,12 @@ namespace ghidrasql::entities {
                 GROUP BY func_addr
             )
             SELECT
-                f.address AS func_addr,
+                f.addr AS func_addr,
                 f.name AS func_name,
                 COALESCE(p.param_count, 0) AS param_count
             FROM funcs f
-            LEFT JOIN params p ON p.func_addr = f.address
-            ORDER BY f.address
+            LEFT JOIN params p ON p.func_addr = f.addr
+            ORDER BY f.addr
         )");
 
         db.exec(R"(
@@ -1222,7 +1221,7 @@ namespace ghidrasql::entities {
                 SELECT
                     f.name AS name,
                     'function' AS kind,
-                    f.address AS address,
+                    f.addr AS addr,
                     CAST(NULL AS INTEGER) AS ordinal,
                     CAST(NULL AS TEXT) AS parent_name,
                     f.name AS full_name
@@ -1232,7 +1231,7 @@ namespace ghidrasql::entities {
                 SELECT
                     n.name AS name,
                     'label' AS kind,
-                    n.address AS address,
+                    n.addr AS addr,
                     CAST(NULL AS INTEGER) AS ordinal,
                     CAST(NULL AS TEXT) AS parent_name,
                     n.name AS full_name
@@ -1243,7 +1242,7 @@ namespace ghidrasql::entities {
                 SELECT
                     s.name AS name,
                     'segment' AS kind,
-                    s.start_ea AS address,
+                    s.start_addr AS addr,
                     CAST(NULL AS INTEGER) AS ordinal,
                     CAST(NULL AS TEXT) AS parent_name,
                     s.name AS full_name
@@ -1256,7 +1255,7 @@ namespace ghidrasql::entities {
                         WHEN lower(t.kind) IN ('struct', 'union', 'enum') THEN lower(t.kind)
                         ELSE 'type'
                     END AS kind,
-                    CAST(NULL AS INTEGER) AS address,
+                    CAST(NULL AS INTEGER) AS addr,
                     COALESCE(CAST(NULLIF(t.type_id, '') AS INTEGER), 0) AS ordinal,
                     CAST(NULL AS TEXT) AS parent_name,
                     t.name AS full_name
@@ -1266,7 +1265,7 @@ namespace ghidrasql::entities {
                 SELECT
                     tm.member_name AS name,
                     'member' AS kind,
-                    CAST(NULL AS INTEGER) AS address,
+                    CAST(NULL AS INTEGER) AS addr,
                     tm.type_ordinal AS ordinal,
                     tm.type_name AS parent_name,
                     tm.type_name || '.' || tm.member_name AS full_name
@@ -1276,7 +1275,7 @@ namespace ghidrasql::entities {
                 SELECT
                     te.value_name AS name,
                     'enum_member' AS kind,
-                    CAST(NULL AS INTEGER) AS address,
+                    CAST(NULL AS INTEGER) AS addr,
                     te.type_ordinal AS ordinal,
                     te.type_name AS parent_name,
                     te.type_name || '.' || te.value_name AS full_name
@@ -1333,7 +1332,7 @@ namespace ghidrasql::entities {
                 p.storage,
                 p.is_user_named
             FROM function_params p
-            LEFT JOIN funcs f ON f.address = p.func_addr
+            LEFT JOIN funcs f ON f.addr = p.func_addr
             ORDER BY p.func_addr, p.ordinal
         )");
 
@@ -1362,7 +1361,7 @@ namespace ghidrasql::entities {
                 COALESCE(la.local_count, 0) AS local_count,
                 COALESCE(la.local_bytes, 0) AS local_bytes
             FROM function_frames fr
-            LEFT JOIN funcs f ON f.address = fr.func_addr
+            LEFT JOIN funcs f ON f.addr = fr.func_addr
             LEFT JOIN param_agg pa ON pa.func_addr = fr.func_addr
             LEFT JOIN local_agg la ON la.func_addr = fr.func_addr
             ORDER BY fr.func_addr
@@ -1381,7 +1380,7 @@ namespace ghidrasql::entities {
                 s.is_param,
                 fr.frame_size
             FROM stack_vars s
-            LEFT JOIN funcs f ON f.address = s.func_addr
+            LEFT JOIN funcs f ON f.addr = s.func_addr
             LEFT JOIN function_frames fr ON fr.func_addr = s.func_addr
             ORDER BY s.func_addr, s.stack_offset
         )");
@@ -1395,7 +1394,7 @@ namespace ghidrasql::entities {
                 COUNT(*) AS var_count,
                 SUM(CASE WHEN r.is_param = 1 THEN 1 ELSE 0 END) AS param_count
             FROM register_vars r
-            LEFT JOIN funcs f ON f.address = r.func_addr
+            LEFT JOIN funcs f ON f.addr = r.func_addr
             GROUP BY r.func_addr, f.name, r.reg_name
             ORDER BY r.func_addr, r.reg_name
         )");
@@ -1406,14 +1405,14 @@ namespace ghidrasql::entities {
                 c.func_addr,
                 COALESCE(f.name, printf('sub_%X', c.func_addr)) AS func_name,
                 c.chunk_id,
-                c.start_ea,
-                c.end_ea,
-                (c.end_ea - c.start_ea) AS chunk_size,
+                c.start_addr,
+                c.end_addr,
+                (c.end_addr - c.start_addr) AS chunk_size,
                 c.chunk_kind,
                 c.is_primary
             FROM function_chunks c
-            LEFT JOIN funcs f ON f.address = c.func_addr
-            ORDER BY c.func_addr, c.start_ea
+            LEFT JOIN funcs f ON f.addr = c.func_addr
+            ORDER BY c.func_addr, c.start_addr
         )");
 
         db.exec(R"(
@@ -1427,8 +1426,8 @@ namespace ghidrasql::entities {
                 COALESCE(df.name, printf('sub_%X', t.dst_func_addr)) AS dst_func_name,
                 t.tail_kind
             FROM tail_calls t
-            LEFT JOIN funcs sf ON sf.address = t.src_func_addr
-            LEFT JOIN funcs df ON df.address = t.dst_func_addr
+            LEFT JOIN funcs sf ON sf.addr = t.src_func_addr
+            LEFT JOIN funcs df ON df.addr = t.dst_func_addr
             ORDER BY t.src_func_addr, t.call_site
         )");
 
@@ -1478,15 +1477,15 @@ namespace ghidrasql::entities {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS relocation_map AS
             SELECT
-                r.address,
+                r.addr,
                 r.target_addr,
                 r.reloc_type,
                 r.width,
                 r.symbol_name,
                 COALESCE(n.name, r.symbol_name, printf('sub_%X', r.target_addr)) AS target_name
             FROM relocations r
-            LEFT JOIN names n ON n.address = r.target_addr
-            ORDER BY r.address
+            LEFT JOIN names n ON n.addr = r.target_addr
+            ORDER BY r.addr
         )");
 
         db.exec(R"(
@@ -1498,7 +1497,7 @@ namespace ghidrasql::entities {
                 MIN(c.value) AS min_value,
                 MAX(c.value) AS max_value
             FROM constants c
-            LEFT JOIN funcs f ON f.address = c.func_addr
+            LEFT JOIN funcs f ON f.addr = c.func_addr
             GROUP BY c.func_addr, f.name
             ORDER BY constant_count DESC, c.func_addr
         )");
@@ -1520,7 +1519,7 @@ namespace ghidrasql::entities {
             SELECT
                 doc_id,
                 domain,
-                address,
+                addr,
                 func_addr,
                 LENGTH(text) AS text_len,
                 substr(text, 1, 120) AS preview
@@ -1546,7 +1545,7 @@ namespace ghidrasql::entities {
                 doc_id,
                 term,
                 domain,
-                address,
+                addr,
                 func_addr,
                 hit_count,
                 rank
@@ -1556,8 +1555,8 @@ namespace ghidrasql::entities {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS xref_paths AS
             SELECT
-                xi.from_ea,
-                xi.to_ea,
+                xi.from_addr,
+                xi.to_addr,
                 xi.kind,
                 xi.src_func_addr,
                 COALESCE(sf.name, printf('sub_%X', xi.src_func_addr)) AS src_func_name,
@@ -1566,8 +1565,8 @@ namespace ghidrasql::entities {
                 xi.is_code,
                 xi.is_data
             FROM xref_index xi
-            LEFT JOIN funcs sf ON sf.address = xi.src_func_addr
-            LEFT JOIN funcs df ON df.address = xi.dst_func_addr
+            LEFT JOIN funcs sf ON sf.addr = xi.src_func_addr
+            LEFT JOIN funcs df ON df.addr = xi.dst_func_addr
         )");
 
         db.exec(R"(
@@ -1585,12 +1584,12 @@ namespace ghidrasql::entities {
             SELECT
                 c.func_addr,
                 COALESCE(f.name, printf('sub_%X', c.func_addr)) AS func_name,
-                c.src_start_ea,
-                c.dst_start_ea,
-                c.edge_kind
+                c.from_addr,
+                c.to_addr,
+                c.edge_type
             FROM cfg_edges c
-            LEFT JOIN funcs f ON f.address = c.func_addr
-            ORDER BY c.func_addr, c.src_start_ea, c.dst_start_ea
+            LEFT JOIN funcs f ON f.addr = c.func_addr
+            ORDER BY c.func_addr, c.from_addr, c.to_addr
         )");
 
         db.exec(R"(
@@ -1602,7 +1601,7 @@ namespace ghidrasql::entities {
                 MAX(l.depth) AS max_depth,
                 COALESCE(SUM(l.block_count), 0) AS total_loop_blocks
             FROM loops l
-            LEFT JOIN funcs f ON f.address = l.func_addr
+            LEFT JOIN funcs f ON f.addr = l.func_addr
             GROUP BY l.func_addr, f.name
             ORDER BY loop_count DESC, l.func_addr
         )");
@@ -1616,7 +1615,7 @@ namespace ghidrasql::entities {
                 COALESCE(MAX(s.case_count), 0) AS max_cases,
                 COALESCE(AVG(s.case_count), 0.0) AS avg_cases
             FROM switch_tables s
-            LEFT JOIN funcs f ON f.address = s.func_addr
+            LEFT JOIN funcs f ON f.addr = s.func_addr
             GROUP BY s.func_addr, f.name
             ORDER BY switch_sites DESC, s.func_addr
         )");
@@ -1626,17 +1625,19 @@ namespace ghidrasql::entities {
             SELECT
                 d.func_addr,
                 COALESCE(f.name, printf('sub_%X', d.func_addr)) AS func_name,
-                d.node_ea,
-                COALESCE(nn.name, printf('loc_%X', d.node_ea)) AS node_name,
-                d.idom_ea,
-                COALESCE(inm.name, printf('loc_%X', d.idom_ea)) AS idom_name,
+                d.node_addr,
+                COALESCE(nn.name, printf('loc_%X', d.node_addr)) AS node_name,
+                d.idom_addr,
+                CASE WHEN d.idom_addr IS NULL THEN NULL
+                     ELSE COALESCE(inm.name, printf('loc_%X', d.idom_addr))
+                END AS idom_name,
                 d.depth,
                 d.is_entry
             FROM dominators d
-            LEFT JOIN funcs f ON f.address = d.func_addr
-            LEFT JOIN names nn ON nn.address = d.node_ea
-            LEFT JOIN names inm ON inm.address = d.idom_ea
-            ORDER BY d.func_addr, d.depth, d.node_ea
+            LEFT JOIN funcs f ON f.addr = d.func_addr
+            LEFT JOIN names nn ON nn.addr = d.node_addr
+            LEFT JOIN names inm ON inm.addr = d.idom_addr
+            ORDER BY d.func_addr, d.depth, d.node_addr
         )");
 
         db.exec(R"(
@@ -1644,17 +1645,19 @@ namespace ghidrasql::entities {
             SELECT
                 pd.func_addr,
                 COALESCE(f.name, printf('sub_%X', pd.func_addr)) AS func_name,
-                pd.node_ea,
-                COALESCE(nn.name, printf('loc_%X', pd.node_ea)) AS node_name,
-                pd.ipdom_ea,
-                COALESCE(pinm.name, printf('loc_%X', pd.ipdom_ea)) AS ipdom_name,
+                pd.node_addr,
+                COALESCE(nn.name, printf('loc_%X', pd.node_addr)) AS node_name,
+                pd.ipdom_addr,
+                CASE WHEN pd.ipdom_addr IS NULL THEN NULL
+                     ELSE COALESCE(pinm.name, printf('loc_%X', pd.ipdom_addr))
+                END AS ipdom_name,
                 pd.depth,
                 pd.is_exit
             FROM post_dominators pd
-            LEFT JOIN funcs f ON f.address = pd.func_addr
-            LEFT JOIN names nn ON nn.address = pd.node_ea
-            LEFT JOIN names pinm ON pinm.address = pd.ipdom_ea
-            ORDER BY pd.func_addr, pd.depth, pd.node_ea
+            LEFT JOIN funcs f ON f.addr = pd.func_addr
+            LEFT JOIN names nn ON nn.addr = pd.node_addr
+            LEFT JOIN names pinm ON pinm.addr = pd.ipdom_addr
+            ORDER BY pd.func_addr, pd.depth, pd.node_addr
         )");
 
         db.exec(R"(
@@ -1674,6 +1677,86 @@ namespace ghidrasql::entities {
                 s.hotness_score,
                 DENSE_RANK() OVER (ORDER BY s.hotness_score DESC, s.func_addr) AS hot_rank
             FROM function_metrics_scored s
+        )");
+
+        // ------------------------------------------------------------------
+        // Cross-tool low-IR (ir_ops family). ghidrasql's native leg is the
+        // P-code anchor (pcode_ops.op is already the canonical P-code
+        // vocabulary), so ir_ops is a canonical projection over it: `op`
+        // canonical + `native_op` provenance (== op here) + is_ssa. The ir_v_*
+        // semantic views are the portable, engine-agnostic surface -- the same
+        // view names/columns are meant to hold on every family tool, each
+        // computed over its own IR. Always scope by func_addr.
+        // ------------------------------------------------------------------
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_ops AS
+            SELECT
+                func_addr,
+                seq,
+                addr,
+                op,              -- canonical P-code mnemonic
+                op AS native_op, -- P-code anchor: native == canonical
+                is_ssa,          -- maturity-dependent (high=1, raw=0)
+                maturity,        -- passthrough filter: high | raw
+                stage            -- passthrough filter: ssa (high) | raw
+            FROM pcode_ops
+        )");
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_v_calls AS
+            SELECT func_addr, seq, addr, op
+            FROM pcode_ops
+            WHERE op IN ('CALL', 'CALLIND', 'CALLOTHER')
+        )");
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_v_mem_writes AS
+            SELECT func_addr, seq, addr, op
+            FROM pcode_ops
+            WHERE op = 'STORE'
+        )");
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_v_mem_reads AS
+            SELECT func_addr, seq, addr, op
+            FROM pcode_ops
+            WHERE op = 'LOAD'
+        )");
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_v_branches AS
+            SELECT func_addr, seq, addr, op
+            FROM pcode_ops
+            WHERE op IN ('BRANCH', 'CBRANCH', 'BRANCHIND', 'RETURN')
+        )");
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_v_arith AS
+            SELECT func_addr, seq, addr, op
+            FROM pcode_ops
+            WHERE op IN (
+                'INT_ADD','INT_SUB','INT_MULT','INT_DIV','INT_SDIV','INT_REM','INT_SREM',
+                'INT_2COMP','INT_NEGATE','INT_AND','INT_OR','INT_XOR','INT_LEFT','INT_RIGHT','INT_SRIGHT',
+                'FLOAT_ADD','FLOAT_SUB','FLOAT_MULT','FLOAT_DIV','FLOAT_NEG'
+            )
+        )");
+
+        // ir_operands -- the 5-kind value operand rows (varnodes), projected from
+        // pcode_varnodes. Join ir_ops on func_addr + op_seq = seq. The canonical kind
+        // (reg/imm/mem/result/var) arrives already-modeled from the GetPcode RPC.
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_operands AS
+            SELECT func_addr, op_seq, operand_index, role,
+                   NULLIF(kind, '') AS kind, space AS text, offset AS value, size
+            FROM pcode_varnodes
+        )");
+
+        // ir_maturities -- the P-code maturity ladder (raw, high). is_default is the rung
+        // used when a query does not constrain maturity (high). is_ssa=1 only for high.
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS ir_maturities AS
+            SELECT 'raw'  AS maturity, 'raw' AS stage, 0 AS ordinal, 0 AS is_default, 0 AS is_ssa
+            UNION ALL SELECT 'high', 'ssa', 1, 1, 1
         )");
     }
 

@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include "internal/entities_detail.hpp"
 
@@ -70,7 +69,126 @@ std::vector<model::DecompLvarRow> merge_decomp_lvar_rows(
     return primary;
 }
 
+std::unordered_map<std::int64_t, std::string> read_function_name_map(
+    const std::shared_ptr<Source>& source)
+{
+    std::vector<model::FunctionRow> functions;
+    if (!source->read_functions(functions)) {
+        return {};
+    }
+    std::unordered_map<std::int64_t, std::string> names;
+    names.reserve(functions.size());
+    for (const auto& fn : functions) {
+        names.emplace(fn.address, fn.name);
+    }
+    return names;
+}
+
+std::string read_function_name_for(
+    const std::shared_ptr<Source>& source,
+    std::int64_t func_addr)
+{
+    if (auto fn = read_function_row_for(source, func_addr); fn.has_value()) {
+        return fn->name;
+    }
+    return {};
+}
+
+void stamp_decomp_lvar_rows(
+    std::vector<model::DecompLvarRow>& rows,
+    std::int64_t func_addr,
+    const std::string& func_name)
+{
+    for (auto& row : rows) {
+        if (row.func_addr == 0) {
+            row.func_addr = func_addr;
+        }
+        if (row.func_addr == func_addr && row.func_name.empty()) {
+            row.func_name = func_name;
+        }
+    }
+}
+
+void stamp_decomp_lvar_rows(
+    const std::shared_ptr<Source>& source,
+    std::vector<model::DecompLvarRow>& rows)
+{
+    const auto names = read_function_name_map(source);
+    for (auto& row : rows) {
+        if (!row.func_name.empty()) {
+            continue;
+        }
+        if (auto it = names.find(row.func_addr); it != names.end()) {
+            row.func_name = it->second;
+        }
+    }
+}
+
+// Fill in func_name for pseudocode rows a Source returned via read_pseudocode()
+// but left unnamed (the cache/full-table path). Without this, `SELECT func_name
+// FROM pseudocode` — and a func_addr-filtered read that lands on the cache rather
+// than the single-function bypass — can come back with an empty func_name even
+// though the func_addr is present. Mirrors stamp_decomp_lvar_rows above.
+void stamp_pseudocode_rows(
+    const std::shared_ptr<Source>& source,
+    std::vector<model::PseudocodeRow>& rows)
+{
+    bool any_unnamed = false;
+    for (const auto& row : rows) {
+        if (row.func_name.empty()) { any_unnamed = true; break; }
+    }
+    if (!any_unnamed) {
+        return;
+    }
+    const auto names = read_function_name_map(source);
+    for (auto& row : rows) {
+        if (!row.func_name.empty()) {
+            continue;
+        }
+        if (auto it = names.find(row.func_addr); it != names.end()) {
+            row.func_name = it->second;
+        }
+    }
+}
+
 }  // namespace
+
+bool parse_language_id(const std::string& language_id,
+                       std::string& processor,
+                       std::string& endian,
+                       int& bits) {
+    processor.clear();
+    endian.clear();
+    bits = 0;
+    // Ghidra language_id format: "processor:endian:size:variant"
+    // e.g. "x86:LE:64:default", "ARM:LE:32:v8".
+    const std::size_t first = language_id.find(':');
+    if (first == std::string::npos) {
+        return false;
+    }
+    const std::size_t second = language_id.find(':', first + 1);
+    if (second == std::string::npos) {
+        return false;
+    }
+    const std::size_t third = language_id.find(':', second + 1);
+    const std::string bits_str = (third != std::string::npos)
+                                     ? language_id.substr(second + 1, third - second - 1)
+                                     : language_id.substr(second + 1);
+    int parsed = 0;
+    if (bits_str == "64") {
+        parsed = 64;
+    } else if (bits_str == "32") {
+        parsed = 32;
+    } else if (bits_str == "16") {
+        parsed = 16;
+    } else {
+        return false;
+    }
+    processor = language_id.substr(0, first);
+    endian = language_id.substr(first + 1, second - first - 1);
+    bits = parsed;
+    return true;
+}
 
 std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
     std::vector<model::ProjectFileRow> project_files;
@@ -87,6 +205,7 @@ std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
     std::vector<model::BlockRow> blocks;
     std::vector<model::CfgEdgeRow> cfg_edges;
     std::vector<model::InstructionRow> instructions;
+    std::vector<model::InstructionOperandRow> instruction_operands;
     std::vector<model::CommentRow> comments;
     std::vector<model::DataItemRow> data_items;
     std::vector<model::FunctionParamRow> function_params;
@@ -119,6 +238,7 @@ std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
     source->read_cfg_edges(cfg_edges);
     source->read_function_params(function_params);
     source->read_instructions(instructions);
+    source->read_instruction_operands(instruction_operands);
     source->read_comments(comments);
     source->read_data_items(data_items);
     source->read_switch_tables(switch_tables);
@@ -144,10 +264,11 @@ std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
         {"funcs", funcs.size()},
         {"segments", segments.size()},
         {"memory_blocks", memory_blocks.size()},
-        {"memory_bytes", 0},
+        {"bytes", 0},
+        {"byte_search", 0},
         {"names", names.size()},
         {"imports", imports.size()},
-        {"exports", exports.size()},
+        {"entries", exports.size()},
         {"strings", strings.size()},
         {"xrefs", xrefs.size()},
         {"call_edges", call_edges.size()},
@@ -159,10 +280,13 @@ std::string build_row_counts_json(const std::shared_ptr<Source>& source) {
         {"dominators", dominators.size()},
         {"post_dominators", post_dominators.size()},
         {"instructions", instructions.size()},
+        {"instruction_operands", instruction_operands.size()},
         {"comments", comments.size()},
         {"data_items", data_items.size()},
         {"function_locals", 0},
         {"stack_vars", 0},
+        {"pcode_ops", 0},
+        {"pcode_varnodes", 0},
         {"register_vars", 0},
         {"function_chunks", 0},
         {"tail_calls", 0},
@@ -319,20 +443,6 @@ std::string parse_return_type_from_prototype(const std::string& prototype) {
     return out.empty() ? std::string("void") : out;
 }
 
-std::int64_t parse_param_count_from_prototype(const std::string& prototype) {
-    const std::string proto = trim_copy(prototype);
-    const size_t l = proto.find('(');
-    const size_t r = proto.rfind(')');
-    if (l == std::string::npos || r == std::string::npos || r <= l + 1) {
-        return 0;
-    }
-    const std::string inside = trim_copy(proto.substr(l + 1, r - l - 1));
-    if (inside.empty() || inside == "void") {
-        return 0;
-    }
-    return static_cast<std::int64_t>(split_csv_params(inside).size());
-}
-
 std::string function_return_type(const model::FunctionRow& row) {
     if (!row.signature.empty()) {
         return parse_return_type_from_prototype(row.signature);
@@ -341,10 +451,11 @@ std::string function_return_type(const model::FunctionRow& row) {
 }
 
 std::int64_t function_arg_count(const model::FunctionRow& row) {
-    if (!row.signature.empty()) {
-        return parse_param_count_from_prototype(row.signature);
-    }
-    return 0;
+    // Ghidra's authoritative Function.getParameterCount() (excludes the varargs
+    // "..."). The old prototype-string split over-counted every variadic function
+    // (it counted the "..." token) and returned 0 for an empty/undefined
+    // prototype; param_count agrees with signatures.param_count.
+    return row.param_count;
 }
 
 std::string function_calling_convention(const model::FunctionRow& row) {
@@ -553,13 +664,22 @@ std::string memory_ascii_from_value(int value) {
 }
 
 void normalize_memory_byte_row(model::MemoryByteRow& row) {
-    row.value &= 0xFF;
     if (row.item_addr == 0) {
         row.item_addr = row.address;
     }
     if (row.item_offset < 0) {
         row.item_offset = 0;
     }
+    if (row.is_initialized == 0) {
+        // Uninitialized byte: value is unknown (surfaced as SQL NULL), so it has
+        // no printable/ascii projection. Keep value at 0 internally as a
+        // placeholder; the table getter reports NULL based on is_initialized.
+        row.value = 0;
+        row.is_printable = 0;
+        row.ascii.clear();
+        return;
+    }
+    row.value &= 0xFF;
     row.is_printable = ((row.value >= 0x20 && row.value <= 0x7E) ? 1 : 0);
     row.ascii = memory_ascii_from_value(row.value);
 }
@@ -608,6 +728,7 @@ size_t telemetry_scaled(size_t base_rows, double ratio, size_t floor_rows) {
 std::vector<model::PseudocodeRow> derive_pseudocode_rows(const std::shared_ptr<Source>& source) {
     std::vector<model::PseudocodeRow> source_rows;
     if (source->read_pseudocode(source_rows) && !source_rows.empty()) {
+        stamp_pseudocode_rows(source, source_rows);
         return source_rows;
     }
 
@@ -630,6 +751,7 @@ std::vector<model::PseudocodeRow> derive_pseudocode_rows(const std::shared_ptr<S
 std::vector<model::DecompLvarRow> derive_decomp_lvar_rows(const std::shared_ptr<Source>& source) {
     std::vector<model::DecompLvarRow> source_rows;
     if (source->read_decomp_lvars(source_rows) && !source_rows.empty()) {
+        stamp_decomp_lvar_rows(source, source_rows);
         return source_rows;
     }
 
@@ -721,21 +843,27 @@ std::vector<model::PseudocodeRow> derive_pseudocode_row_for(
 std::vector<model::DecompLvarRow> derive_decomp_lvar_rows_for(
     const std::shared_ptr<Source>& source, std::int64_t func_addr)
 {
+    const auto stamp_for_function = [&](std::vector<model::DecompLvarRow> rows, const std::string& known_name = {}) {
+        const std::string func_name = known_name.empty() ? read_function_name_for(source, func_addr) : known_name;
+        stamp_decomp_lvar_rows(rows, func_addr, func_name);
+        return rows;
+    };
+
     if (source->has_authoritative_decompile_detail()) {
         if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
-            return detail->locals;
+            return stamp_for_function(std::move(detail->locals), detail->func_name);
         }
         return {};
     }
 
     const auto source_rows = read_source_decomp_lvar_rows_for(source, func_addr);
     if (!source_rows.empty()) {
-        return source_rows;
+        return stamp_for_function(source_rows);
     }
 
     if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
         if (!detail->locals.empty()) {
-            return detail->locals;
+            return stamp_for_function(std::move(detail->locals), detail->func_name);
         }
     }
     return {};
@@ -1284,92 +1412,550 @@ std::vector<model::CfgEdgeRow> derive_cfg_edge_rows(const std::shared_ptr<Source
     return out;
 }
 
-std::vector<model::MemoryByteRow> derive_memory_byte_rows(const std::shared_ptr<Source>& source) {
-    std::vector<model::InstructionRow> instructions;
-    source->read_instructions(instructions);
-    std::vector<model::StringRow> strings;
-    source->read_strings(strings);
-    std::vector<model::SegmentRow> segments;
-    source->read_segments(segments);
-    std::vector<model::FunctionRow> functions;
-    source->read_functions(functions);
+// ---------------------------------------------------------------------------
+// memory_bytes — streaming windowed core
+//
+// The retired derive_memory_byte_rows materialized EVERY mapped byte (one
+// ~150-byte row per byte, with a reserve() summing all block spans), so any
+// statement touching memory_bytes paid whole-image cost and a large
+// uninitialized block (e.g. a 512 MB .bss) drove a multi-GB reserve into
+// std::bad_alloc. The generator below derives only the requested window:
+//   * coverage  = memory blocks plus item spans (instructions / strings /
+//     data items) that fall outside every block;
+//   * values    = paged read_bytes (32 KiB pages) with per-item fallbacks
+//     (instruction hex bytes, string content) when the source cannot serve
+//     raw bytes; uninitialized blocks are never read (Bug-8 host contract)
+//     and surface NULL-value rows from metadata alone;
+//   * attribution = the covering item, priority instruction > string > data
+//     > raw (initialized, no covering item) > uninitialized. Values never
+//     come from the item listing, so live instruction bytes (whose
+//     InstructionRow.bytes is empty) classify as 'instruction' with correct
+//     read_bytes-backed values;
+//   * order     = ascending (or descending) signed addr, O(page) memory,
+//     early termination for free under LIMIT.
+// ---------------------------------------------------------------------------
 
-    const auto segment_ranges = build_segment_ranges(segments);
-    const auto function_ranges = build_function_ranges(functions);
+namespace {
 
-    std::vector<model::MemoryByteRow> out;
-    std::unordered_set<std::int64_t> seen_addr;
-    auto push_byte = [&](std::int64_t address,
-                         int value,
-                         std::int64_t func_addr,
-                         const std::string& source_kind,
-                         std::int64_t item_addr,
-                         std::int64_t item_offset) {
-        if (seen_addr.find(address) != seen_addr.end()) {
-            return;
+constexpr std::int64_t kMemoryBytePage = 32 * 1024;  // bytes per host ReadBytes
+
+// Unsigned distance between two signed-ordered addresses (lo <= hi). Modular
+// arithmetic keeps this exact even across the sign seam.
+inline std::uint64_t addr_distance(std::int64_t lo, std::int64_t hi) {
+    return static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo);
+}
+
+inline std::int64_t addr_add(std::int64_t base, std::uint64_t delta) {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(base) + delta);
+}
+
+// Attribution priority (lower value wins).
+enum class MemItemKind : int { kInstruction = 0, kString = 1, kData = 2 };
+
+inline const char* mem_item_kind_name(MemItemKind kind) {
+    switch (kind) {
+        case MemItemKind::kInstruction: return "instruction";
+        case MemItemKind::kString: return "string";
+        case MemItemKind::kData: return "data";
+    }
+    return "data";
+}
+
+struct MemAttributionItem {
+    std::int64_t start = 0;
+    std::int64_t end_incl = 0;
+    MemItemKind kind = MemItemKind::kData;
+    // Value fallback for [start, start + fallback.size()): instruction hex
+    // bytes / string content. Empty for data items (read_bytes only).
+    std::vector<std::uint8_t> fallback;
+};
+
+struct MemRegion {
+    enum Kind { kBlockInit, kBlockUninit, kItemOnly };
+    std::int64_t start = 0;
+    std::int64_t end_incl = 0;
+    Kind kind = kItemOnly;
+};
+
+// Inclusive span end with overflow clamp (span >= 1 assumed). Computed in
+// unsigned arithmetic so the overflow itself is well-defined.
+inline std::int64_t span_end_incl(std::int64_t start, std::int64_t span) {
+    std::int64_t end = static_cast<std::int64_t>(
+        static_cast<std::uint64_t>(start) + static_cast<std::uint64_t>(span - 1));
+    if (end < start) {
+        end = std::numeric_limits<std::int64_t>::max();
+    }
+    return end;
+}
+
+class MemoryBytesGenerator final : public xsql::Generator<model::MemoryByteRow> {
+public:
+    MemoryBytesGenerator(std::shared_ptr<Source> source,
+                         std::int64_t lo_addr,
+                         std::int64_t hi_addr,
+                         bool descending)
+        : source_(std::move(source)),
+          window_lo_(lo_addr),
+          window_hi_(hi_addr),
+          descending_(descending) {}
+
+    bool next() override {
+        if (!initialized_) {
+            initialized_ = true;
+            init();
         }
-        seen_addr.insert(address);
-        model::MemoryByteRow row;
-        row.address = address;
-        row.value = value;
-        row.segment_name = segment_name_for_address(segment_ranges, address);
-        row.func_addr = func_addr;
-        row.source_kind = source_kind;
-        row.item_addr = item_addr;
-        row.item_offset = item_offset;
-        normalize_memory_byte_row(row);
-        out.push_back(std::move(row));
-    };
-
-    for (const auto& insn : instructions) {
-        const std::string hex = trim_copy(insn.bytes);
-        if (hex.empty()) {
-            continue;
+        if (!chunk_.empty() && pos_ + 1 < chunk_.size()) {
+            ++pos_;
+            return true;
         }
-        std::int64_t byte_index = 0;
-        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-            const int hi = hex_nibble(hex[i]);
-            const int lo = hex_nibble(hex[i + 1]);
-            if (hi < 0 || lo < 0) {
+        if (!load_next_chunk()) {
+            return false;
+        }
+        pos_ = 0;
+        return true;
+    }
+
+    const model::MemoryByteRow& current() const override { return chunk_[pos_]; }
+
+    std::int64_t rowid() const override { return chunk_[pos_].address; }
+
+private:
+    void init() {
+        if (window_hi_ < window_lo_) {
+            return;  // empty window; regions_ stays empty
+        }
+
+        // Bounded metadata (O(#blocks + #segments + #functions), never bytes).
+        std::vector<model::MemoryBlockRow> blocks;
+        source_->read_memory_blocks(blocks);
+        std::vector<model::SegmentRow> segments;
+        source_->read_segments(segments);
+        segment_ranges_ = build_segment_ranges(segments);
+        std::vector<model::FunctionRow> functions;
+        source_->read_functions(functions);
+        function_ranges_ = build_function_ranges(functions);
+
+        // Window-scoped attribution items: a bounded window never triggers a
+        // full item read (the *_in_range readers page only the window).
+        std::vector<model::InstructionRow> instructions;
+        source_->read_instructions_in_range(window_lo_, window_hi_, instructions);
+        std::vector<model::StringRow> strings;
+        source_->read_strings_in_range(window_lo_, window_hi_, strings);
+        std::vector<model::DataItemRow> data_items;
+        source_->read_data_items_in_range(window_lo_, window_hi_, data_items);
+
+        build_items(instructions, strings, data_items);
+        build_regions(blocks);
+        region_idx_ = 0;
+        cursor_valid_ = false;
+    }
+
+    void build_items(const std::vector<model::InstructionRow>& instructions,
+                     const std::vector<model::StringRow>& strings,
+                     const std::vector<model::DataItemRow>& data_items) {
+        items_.reserve(instructions.size() + strings.size() + data_items.size());
+
+        for (const auto& insn : instructions) {
+            MemAttributionItem item;
+            item.start = insn.address;
+            item.kind = MemItemKind::kInstruction;
+            item.end_incl = span_end_incl(insn.address, instruction_byte_span(insn));
+            // Fallback = the decodable hex prefix (offline sources; live
+            // sources carry no hex and rely on read_bytes for values).
+            const std::string hex = trim_copy(insn.bytes);
+            for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+                const int hi = hex_nibble(hex[i]);
+                const int lo = hex_nibble(hex[i + 1]);
+                if (hi < 0 || lo < 0) {
+                    break;
+                }
+                item.fallback.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
+            }
+            items_.push_back(std::move(item));
+        }
+
+        for (const auto& s : strings) {
+            MemAttributionItem item;
+            item.start = s.address;
+            item.kind = MemItemKind::kString;
+            const std::int64_t span = string_byte_span(s);
+            item.end_incl = span_end_incl(s.address, span);
+            // Fallback = decoded content, clamped to the span, plus the single
+            // NUL pad the legacy derivation emitted when content ran short of
+            // the declared length. Raw read_bytes values still win when the
+            // source can serve them (content is UTF-8-transcoded on the host,
+            // so a patched non-ASCII byte only round-trips via raw bytes).
+            const std::size_t clamp =
+                std::min<std::size_t>(s.content.size(), static_cast<std::size_t>(span));
+            item.fallback.reserve(clamp + 1);
+            for (std::size_t i = 0; i < clamp; ++i) {
+                item.fallback.push_back(static_cast<std::uint8_t>(
+                    static_cast<unsigned char>(s.content[i])));
+            }
+            if (item.fallback.size() < static_cast<std::size_t>(span)) {
+                item.fallback.push_back(0);  // string NUL pad
+            }
+            items_.push_back(std::move(item));
+        }
+
+        for (const auto& di : data_items) {
+            if (di.size <= 0) {
+                continue;  // sizeless items claim no bytes
+            }
+            MemAttributionItem item;
+            item.start = di.address;
+            item.kind = MemItemKind::kData;
+            item.end_incl = span_end_incl(di.address, data_item_byte_span(di));
+            items_.push_back(std::move(item));
+        }
+
+        std::sort(items_.begin(), items_.end(),
+                  [](const MemAttributionItem& a, const MemAttributionItem& b) {
+                      if (a.start != b.start) return a.start < b.start;
+                      return static_cast<int>(a.kind) < static_cast<int>(b.kind);
+                  });
+        prefix_max_end_.resize(items_.size());
+        std::int64_t running = std::numeric_limits<std::int64_t>::min();
+        for (std::size_t i = 0; i < items_.size(); ++i) {
+            running = std::max(running, items_[i].end_incl);
+            prefix_max_end_[i] = running;
+        }
+    }
+
+    void build_regions(std::vector<model::MemoryBlockRow> blocks) {
+        // Block spans clipped to the window, sorted, overlap-clamped.
+        std::sort(blocks.begin(), blocks.end(),
+                  [](const model::MemoryBlockRow& a, const model::MemoryBlockRow& b) {
+                      return a.start_ea < b.start_ea;
+                  });
+        std::vector<MemRegion> block_regions;
+        block_regions.reserve(blocks.size());
+        for (const auto& blk : blocks) {
+            if (blk.end_ea <= blk.start_ea) {
+                continue;  // empty / wrapped span
+            }
+            std::int64_t s = std::max(blk.start_ea, window_lo_);
+            const std::int64_t e = std::min(blk.end_ea - 1, window_hi_);
+            if (e < s) {
+                continue;
+            }
+            if (!block_regions.empty() && s <= block_regions.back().end_incl) {
+                if (block_regions.back().end_incl ==
+                    std::numeric_limits<std::int64_t>::max()) {
+                    continue;
+                }
+                s = block_regions.back().end_incl + 1;
+                if (e < s) {
+                    continue;
+                }
+            }
+            block_regions.push_back(MemRegion{
+                s, e, blk.is_initialized != 0 ? MemRegion::kBlockInit : MemRegion::kBlockUninit});
+        }
+
+        // Merged item coverage clipped to the window (items outside every
+        // block still surface — e.g. instruction hex bytes of a source whose
+        // blocks don't cover its listing, or a source with no blocks at all).
+        std::vector<std::pair<std::int64_t, std::int64_t>> item_spans;
+        for (const auto& item : items_) {
+            const std::int64_t s = std::max(item.start, window_lo_);
+            const std::int64_t e = std::min(item.end_incl, window_hi_);
+            if (e < s) {
+                continue;
+            }
+            if (!item_spans.empty() &&
+                (item_spans.back().second == std::numeric_limits<std::int64_t>::max() ||
+                 s <= item_spans.back().second + 1)) {
+                item_spans.back().second = std::max(item_spans.back().second, e);
+            } else {
+                item_spans.emplace_back(s, e);
+            }
+        }
+
+        // Item coverage minus block coverage → item-only regions.
+        std::vector<MemRegion> item_only;
+        std::size_t bi = 0;
+        for (const auto& span : item_spans) {
+            std::int64_t cur = span.first;
+            for (;;) {
+                while (bi < block_regions.size() && block_regions[bi].end_incl < cur) {
+                    ++bi;
+                }
+                if (bi == block_regions.size() || block_regions[bi].start > span.second) {
+                    item_only.push_back(MemRegion{cur, span.second, MemRegion::kItemOnly});
+                    break;
+                }
+                const MemRegion& b = block_regions[bi];
+                if (b.start > cur) {
+                    item_only.push_back(MemRegion{cur, b.start - 1, MemRegion::kItemOnly});
+                }
+                if (b.end_incl >= span.second) {
+                    break;  // remainder of this span is block-covered
+                }
+                cur = b.end_incl + 1;
+            }
+        }
+
+        regions_ = std::move(block_regions);
+        regions_.insert(regions_.end(), item_only.begin(), item_only.end());
+        std::sort(regions_.begin(), regions_.end(),
+                  [](const MemRegion& a, const MemRegion& b) { return a.start < b.start; });
+    }
+
+    // Produce the next [lo, hi_incl] page-sized address range to derive, in
+    // window order. Returns false when every region is exhausted.
+    bool advance_cursor_range(std::int64_t& lo, std::int64_t& hi_incl, MemRegion::Kind& kind) {
+        if (region_idx_ >= regions_.size()) {
+            return false;
+        }
+        const MemRegion& rg =
+            regions_[descending_ ? regions_.size() - 1 - region_idx_ : region_idx_];
+        if (!cursor_valid_) {
+            cursor_ = descending_ ? rg.end_incl : rg.start;
+            cursor_valid_ = true;
+        }
+        kind = rg.kind;
+        if (!descending_) {
+            const std::uint64_t dist = addr_distance(cursor_, rg.end_incl);
+            const std::uint64_t step =
+                std::min<std::uint64_t>(dist, static_cast<std::uint64_t>(kMemoryBytePage) - 1);
+            lo = cursor_;
+            hi_incl = addr_add(cursor_, step);
+            if (hi_incl == rg.end_incl) {
+                ++region_idx_;
+                cursor_valid_ = false;
+            } else {
+                cursor_ = addr_add(hi_incl, 1);
+            }
+        } else {
+            const std::uint64_t dist = addr_distance(rg.start, cursor_);
+            const std::uint64_t step =
+                std::min<std::uint64_t>(dist, static_cast<std::uint64_t>(kMemoryBytePage) - 1);
+            hi_incl = cursor_;
+            lo = static_cast<std::int64_t>(static_cast<std::uint64_t>(cursor_) - step);
+            if (lo == rg.start) {
+                ++region_idx_;
+                cursor_valid_ = false;
+            } else {
+                cursor_ = static_cast<std::int64_t>(static_cast<std::uint64_t>(lo) - 1);
+            }
+        }
+        return true;
+    }
+
+    bool load_next_chunk() {
+        chunk_.clear();
+        std::int64_t lo = 0;
+        std::int64_t hi_incl = 0;
+        MemRegion::Kind kind = MemRegion::kItemOnly;
+        while (chunk_.empty()) {
+            if (!advance_cursor_range(lo, hi_incl, kind)) {
+                return false;
+            }
+            build_chunk(lo, hi_incl, kind);
+        }
+        return true;
+    }
+
+    // Items whose span intersects [lo, hi_incl], in ascending start order.
+    std::vector<const MemAttributionItem*> items_intersecting(std::int64_t lo,
+                                                              std::int64_t hi_incl) const {
+        std::vector<const MemAttributionItem*> out;
+        auto it = std::upper_bound(
+            items_.begin(), items_.end(), hi_incl,
+            [](std::int64_t v, const MemAttributionItem& item) { return v < item.start; });
+        for (auto idx = static_cast<std::size_t>(it - items_.begin()); idx-- > 0;) {
+            if (prefix_max_end_[idx] < lo) {
+                break;  // nothing earlier can reach into the chunk
+            }
+            if (items_[idx].end_incl >= lo) {
+                out.push_back(&items_[idx]);
+            }
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+
+    void build_chunk(std::int64_t lo, std::int64_t hi_incl, MemRegion::Kind kind) {
+        const std::size_t len = static_cast<std::size_t>(addr_distance(lo, hi_incl)) + 1;
+        const auto active = items_intersecting(lo, hi_incl);
+
+        // Byte values: one paged read for the chunk; uninitialized blocks are
+        // never read (the host errors on uninitialized memory by contract).
+        std::vector<std::uint8_t> values(len, 0);
+        std::vector<std::uint8_t> have(len, 0);
+        if (kind != MemRegion::kBlockUninit) {
+            std::vector<std::uint8_t> buf;
+            if (source_->read_bytes(lo, static_cast<std::int64_t>(len), buf) && !buf.empty()) {
+                const std::size_t got = std::min(buf.size(), len);
+                std::copy_n(buf.begin(), got, values.begin());
+                std::fill_n(have.begin(), got, std::uint8_t{1});
+            }
+            // Whole-chunk read failed or came up short: retry per string/data
+            // item sub-span (the legacy derivation read each item's own span,
+            // and some sources serve item spans they won't serve arbitrary
+            // ranges for). Instructions keep their hex fallback instead.
+            for (const auto* item : active) {
+                if (item->kind == MemItemKind::kInstruction) {
+                    continue;
+                }
+                const std::int64_t sub_lo = std::max(item->start, lo);
+                const std::int64_t sub_hi = std::min(item->end_incl, hi_incl);
+                if (sub_hi < sub_lo) {
+                    continue;
+                }
+                const std::size_t off = static_cast<std::size_t>(addr_distance(lo, sub_lo));
+                const std::size_t sub_len =
+                    static_cast<std::size_t>(addr_distance(sub_lo, sub_hi)) + 1;
+                bool missing = false;
+                for (std::size_t i = 0; i < sub_len; ++i) {
+                    if (!have[off + i]) {
+                        missing = true;
+                        break;
+                    }
+                }
+                if (!missing) {
+                    continue;
+                }
+                std::vector<std::uint8_t> buf2;
+                if (source_->read_bytes(sub_lo, static_cast<std::int64_t>(sub_len), buf2) &&
+                    !buf2.empty()) {
+                    const std::size_t got = std::min(buf2.size(), sub_len);
+                    for (std::size_t i = 0; i < got; ++i) {
+                        values[off + i] = buf2[i];
+                        have[off + i] = 1;
+                    }
+                }
+            }
+        }
+
+        chunk_.reserve(len);
+        for (std::size_t i = 0; i < len; ++i) {
+            const std::int64_t addr = addr_add(lo, i);
+
+            // Winning covering item: lowest kind (instruction > string > data),
+            // then earliest start (`active` is start-ascending).
+            const MemAttributionItem* item = nullptr;
+            for (const auto* candidate : active) {
+                if (candidate->start > addr || candidate->end_incl < addr) {
+                    continue;
+                }
+                if (item == nullptr ||
+                    static_cast<int>(candidate->kind) < static_cast<int>(item->kind)) {
+                    item = candidate;
+                }
+            }
+
+            model::MemoryByteRow row;
+            row.address = addr;
+            if (kind == MemRegion::kBlockUninit) {
+                // Mapped but uninitialized: value unknown (SQL NULL), still
+                // classified by any covering item (a data item over .bss keeps
+                // source_kind='data').
+                row.is_initialized = 0;
+                row.value = 0;
+            } else {
+                int value = -1;
+                if (have[i]) {
+                    value = static_cast<int>(values[i]);
+                } else if (item != nullptr) {
+                    const std::uint64_t offset = addr_distance(item->start, addr);
+                    if (offset < item->fallback.size()) {
+                        value = static_cast<int>(item->fallback[static_cast<std::size_t>(offset)]);
+                    }
+                }
+                if (value < 0) {
+                    continue;  // no obtainable value → byte not surfaced (legacy behavior)
+                }
+                row.is_initialized = 1;
+                row.value = value;
+            }
+
+            if (item != nullptr) {
+                row.source_kind = mem_item_kind_name(item->kind);
+                row.item_addr = item->start;
+                row.item_offset = static_cast<std::int64_t>(addr_distance(item->start, addr));
+            } else if (kind == MemRegion::kBlockInit) {
+                row.source_kind = "raw";
+                row.item_addr = addr;
+                row.item_offset = 0;
+            } else if (kind == MemRegion::kBlockUninit) {
+                row.source_kind = "uninitialized";
+                row.item_addr = addr;
+                row.item_offset = 0;
+            } else {
+                continue;  // item-only coverage always has an item; defensive
+            }
+
+            row.func_addr = function_for_address(function_ranges_, addr);
+            row.segment_name = segment_name_for_address(segment_ranges_, addr);
+            normalize_memory_byte_row(row);
+            chunk_.push_back(std::move(row));
+        }
+        if (descending_) {
+            std::reverse(chunk_.begin(), chunk_.end());
+        }
+    }
+
+    std::shared_ptr<Source> source_;
+    std::int64_t window_lo_ = 0;
+    std::int64_t window_hi_ = 0;
+    bool descending_ = false;
+
+    bool initialized_ = false;
+    std::vector<SegmentRange> segment_ranges_;
+    std::vector<FunctionRange> function_ranges_;
+    std::vector<MemAttributionItem> items_;
+    std::vector<std::int64_t> prefix_max_end_;
+    std::vector<MemRegion> regions_;
+
+    std::size_t region_idx_ = 0;
+    std::int64_t cursor_ = 0;
+    bool cursor_valid_ = false;
+
+    std::vector<model::MemoryByteRow> chunk_;
+    std::size_t pos_ = 0;
+};
+
+}  // namespace
+
+std::unique_ptr<xsql::Generator<model::MemoryByteRow>> make_memory_bytes_generator(
+    std::shared_ptr<Source> source,
+    std::int64_t lo_addr,
+    std::int64_t hi_addr,
+    bool descending) {
+    return std::make_unique<MemoryBytesGenerator>(std::move(source), lo_addr, hi_addr, descending);
+}
+
+bool lookup_memory_byte_row(
+    const std::shared_ptr<Source>& source, std::int64_t addr, model::MemoryByteRow& out) {
+    MemoryBytesGenerator gen(source, addr, addr, /*descending=*/false);
+    if (!gen.next()) {
+        return false;
+    }
+    out = gen.current();
+    return true;
+}
+
+std::size_t estimate_memory_byte_rows(const std::shared_ptr<Source>& source) {
+    std::vector<model::MemoryBlockRow> blocks;
+    if (source->read_memory_blocks(blocks) && !blocks.empty()) {
+        std::uint64_t total = 0;
+        for (const auto& blk : blocks) {
+            if (blk.end_ea > blk.start_ea) {
+                total += static_cast<std::uint64_t>(blk.end_ea - blk.start_ea);
+            }
+            if (total > (std::uint64_t{1} << 40)) {
+                total = std::uint64_t{1} << 40;  // cap the planner cost hint
                 break;
             }
-            push_byte(
-                insn.address + byte_index,
-                (hi << 4) | lo,
-                0,
-                "instruction",
-                insn.address,
-                byte_index);
-            ++byte_index;
+        }
+        if (total > 0) {
+            return static_cast<std::size_t>(total);
         }
     }
-
-    for (const auto& s : strings) {
-        std::int64_t idx = 0;
-        for (unsigned char ch : s.content) {
-            push_byte(
-                s.address + idx,
-                static_cast<int>(ch),
-                function_for_address(function_ranges, s.address + idx),
-                "string",
-                s.address,
-                idx);
-            ++idx;
-        }
-        if (s.length > 0 && idx < s.length) {
-            push_byte(
-                s.address + idx,
-                0,
-                function_for_address(function_ranges, s.address + idx),
-                "string",
-                s.address,
-                idx);
-        }
-    }
-    std::sort(out.begin(), out.end(), [](const model::MemoryByteRow& a, const model::MemoryByteRow& b) {
-        return a.address < b.address;
-    });
-    return out;
+    std::vector<model::InstructionRow> rows;
+    return source->read_instructions(rows) && !rows.empty() ? rows.size() * 4 : std::size_t(1000);
 }
 
 std::vector<model::FunctionLocalRow> derive_function_local_rows(const std::shared_ptr<Source>& source) {
@@ -1408,7 +1994,13 @@ std::vector<model::FunctionLocalRow> derive_function_local_rows_for(
     return out;
 }
 
-std::vector<model::StackVarRow> derive_stack_var_rows(const std::shared_ptr<Source>& source) {
+namespace {
+
+// Decompiler-backed fallback for stack_vars: filter derived locals to stack
+// storage and guess is_param from the arg-like naming convention. Only used when
+// the Source has no decompiler-free listing-layer stack-variable read.
+std::vector<model::StackVarRow> derive_stack_var_rows_fallback(
+        const std::shared_ptr<Source>& source) {
     const auto locals = derive_function_local_rows(source);
     std::vector<model::StackVarRow> out;
     out.reserve(locals.size());
@@ -1434,6 +2026,94 @@ std::vector<model::StackVarRow> derive_stack_var_rows(const std::shared_ptr<Sour
         out.push_back(std::move(row));
     }
     return out;
+}
+
+}  // namespace
+
+std::vector<model::StackVarRow> derive_stack_var_rows(const std::shared_ptr<Source>& source) {
+    // Prefer the decompiler-free listing-layer read (real stack_offset/size/
+    // is_param straight from the StackFrame). Fall back to local derivation.
+    std::vector<model::StackVarRow> rows;
+    if (source->read_stack_vars(rows)) {
+        return rows;
+    }
+    return derive_stack_var_rows_fallback(source);
+}
+
+std::vector<model::StackVarRow> derive_stack_var_rows_for(
+        const std::shared_ptr<Source>& source, std::int64_t func_addr) {
+    std::vector<model::StackVarRow> rows;
+    if (source->read_stack_vars_in_range(func_addr, func_addr, rows)) {
+        return rows;
+    }
+    auto all = derive_stack_var_rows_fallback(source);
+    std::vector<model::StackVarRow> out;
+    for (auto& r : all) {
+        if (r.func_addr == func_addr) {
+            out.push_back(std::move(r));
+        }
+    }
+    return out;
+}
+
+bool derive_pcode_op_rows_for(
+        const std::shared_ptr<Source>& source, std::int64_t func_addr,
+        model::PcodeMaturity maturity, std::vector<model::PcodeOpRow>& out) {
+    // One GetPcode RPC for the single function at the requested rung — the filtered
+    // (WHERE func_addr=X) path. Ops arrive in intra-function order.
+    out.clear();
+    return source->read_pcode_at(func_addr, maturity, out);
+}
+
+bool derive_pcode_op_rows(
+        const std::shared_ptr<Source>& source, model::PcodeMaturity maturity,
+        std::vector<model::PcodeOpRow>& out) {
+    // Unfiltered whole-program scan: one GetPcode per function at the requested rung.
+    // P-code is inherently per-function (no bulk RPC).
+    out.clear();
+    std::vector<model::FunctionRow> fns;
+    if (!source->read_functions(fns)) {
+        return false;
+    }
+    for (const auto& f : fns) {
+        std::vector<model::PcodeOpRow> rows;
+        if (!source->read_pcode_at(f.address, maturity, rows)) {
+            out.clear();
+            return false;
+        }
+        for (auto& r : rows) {
+            out.push_back(std::move(r));
+        }
+    }
+    return true;
+}
+
+bool derive_pcode_varnode_rows_for(
+        const std::shared_ptr<Source>& source, std::int64_t func_addr,
+        model::PcodeMaturity maturity, std::vector<model::PcodeVarnodeRow>& out) {
+    out.clear();
+    return source->read_pcode_varnodes_at(func_addr, maturity, out);
+}
+
+bool derive_pcode_varnode_rows(
+        const std::shared_ptr<Source>& source, model::PcodeMaturity maturity,
+        std::vector<model::PcodeVarnodeRow>& out) {
+    out.clear();
+    std::vector<model::FunctionRow> fns;
+    if (!source->read_functions(fns)) {
+        return false;
+    }
+    for (const auto& f : fns) {
+        std::vector<model::PcodeVarnodeRow> rows;
+        if (!source->read_pcode_varnodes_at(f.address, maturity, rows)) {
+            out.clear();
+            return false;
+        }
+        for (auto& r : rows) {
+            out.push_back(std::move(r));
+        }
+    }
+    return true;
 }
 
 std::vector<model::RegisterVarRow> derive_register_var_rows(const std::shared_ptr<Source>& source) {
@@ -1881,7 +2561,16 @@ std::vector<model::EquateRow> derive_equate_rows(const std::shared_ptr<Source>& 
     return out;
 }
 
-std::vector<model::FunctionFrameRow> derive_function_frame_rows(const std::shared_ptr<Source>& source) {
+namespace {
+
+// Decompiler-backed fallback for function_frames, used only when the Source has
+// no decompiler-free StackFrame read. Unlike the historical behavior it does NOT
+// fabricate saved_reg_size=16 / stack_base_reg="rbp" / has_frame_pointer=1 — those
+// are genuinely unknown from param/local derivation, so they are stamped UNKNOWN
+// (saved_reg_size_known=false, has_frame_pointer=-1, empty stack_base_reg) and
+// surface as SQL NULL.
+std::vector<model::FunctionFrameRow> derive_function_frame_rows_fallback(
+        const std::shared_ptr<Source>& source) {
     std::vector<model::FunctionRow> functions;
     source->read_functions(functions);
 
@@ -1904,11 +2593,44 @@ std::vector<model::FunctionFrameRow> derive_function_frame_rows(const std::share
         row.func_addr = fn.address;
         row.arg_size = arg_sizes[fn.address];
         row.local_size = local_sizes[fn.address];
-        row.saved_reg_size = 16;
-        row.frame_size = row.arg_size + row.local_size + row.saved_reg_size;
-        row.stack_base_reg = "rbp";
-        row.has_frame_pointer = 1;
+        // Genuinely unknown from param/local derivation — do not fabricate.
+        row.saved_reg_size = 0;
+        row.saved_reg_size_known = false;
+        row.frame_size = row.arg_size + row.local_size;
+        row.stack_base_reg.clear();
+        row.has_frame_pointer = -1;
         out.push_back(std::move(row));
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<model::FunctionFrameRow> derive_function_frame_rows(const std::shared_ptr<Source>& source) {
+    // Prefer the decompiler-free listing-layer StackFrame read when the source
+    // provides one (honest frame_size/local_size/arg_size + SP register; leaves
+    // saved_reg_size/has_frame_pointer as NULL). Fall back to param/local
+    // derivation otherwise.
+    std::vector<model::FunctionFrameRow> rows;
+    if (source->read_stack_frames(rows)) {
+        return rows;
+    }
+    return derive_function_frame_rows_fallback(source);
+}
+
+std::vector<model::FunctionFrameRow> derive_function_frame_rows_for(
+        const std::shared_ptr<Source>& source, std::int64_t func_addr) {
+    std::vector<model::FunctionFrameRow> rows;
+    if (source->read_stack_frames_in_range(func_addr, func_addr, rows)) {
+        return rows;
+    }
+    // Fallback path has no cheap per-function form — derive all, then filter.
+    auto all = derive_function_frame_rows_fallback(source);
+    std::vector<model::FunctionFrameRow> out;
+    for (auto& r : all) {
+        if (r.func_addr == func_addr) {
+            out.push_back(std::move(r));
+        }
     }
     return out;
 }

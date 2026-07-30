@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -35,12 +34,21 @@ struct FunctionRange {
 };
 
 std::string build_row_counts_json(const std::shared_ptr<Source>& source);
+
+// Parse a Ghidra language_id ("processor:endian:size:variant", e.g.
+// "x86:LE:64:default" or "ARM:LE:32:v8") into its components. Returns false
+// (leaving the outputs empty/0) when the id has fewer than three fields or a
+// non-numeric size field. `endian` is returned as spelled in the id (LE/BE).
+bool parse_language_id(const std::string& language_id,
+                       std::string& processor,
+                       std::string& endian,
+                       int& bits);
+
 std::string trim_copy(const std::string& input);
 std::vector<std::string> split_csv_params(const std::string& params);
 std::string infer_param_name(const std::string& param_decl, size_t idx);
 std::string lower_copy(std::string text);
 std::string parse_return_type_from_prototype(const std::string& prototype);
-std::int64_t parse_param_count_from_prototype(const std::string& prototype);
 std::string function_return_type(const model::FunctionRow& row);
 std::int64_t function_arg_count(const model::FunctionRow& row);
 std::string function_calling_convention(const model::FunctionRow& row);
@@ -89,11 +97,48 @@ std::vector<model::DataItemRow> derive_data_item_rows(const std::shared_ptr<Sour
 std::vector<model::FunctionParamRow> derive_function_param_rows(const std::shared_ptr<Source>& source);
 std::vector<model::BlockRow> derive_block_rows(const std::shared_ptr<Source>& source);
 std::vector<model::CfgEdgeRow> derive_cfg_edge_rows(const std::shared_ptr<Source>& source);
-std::vector<model::MemoryByteRow> derive_memory_byte_rows(const std::shared_ptr<Source>& source);
+// Streaming windowed memory_bytes core (replaces the retired whole-image
+// derive_memory_byte_rows). Yields every mapped byte whose address lies in the
+// INCLUSIVE signed window [lo_addr, hi_addr], in ascending (or descending)
+// addr order, in O(page) memory: coverage is derived from memory blocks plus
+// item spans (instructions / strings / data items) outside any block, values
+// come from paged read_bytes with per-item fallbacks (instruction hex bytes,
+// string content), attribution is classified by the covering item with
+// priority instruction > string > data > raw > uninitialized.
+std::unique_ptr<xsql::Generator<model::MemoryByteRow>> make_memory_bytes_generator(
+    std::shared_ptr<Source> source,
+    std::int64_t lo_addr,
+    std::int64_t hi_addr,
+    bool descending);
+
+// Resolve the memory_bytes row at exactly `addr` (the generator table's
+// row_lookup / UPDATE path). Returns false when no mapped byte exists there.
+bool lookup_memory_byte_row(
+    const std::shared_ptr<Source>& source,
+    std::int64_t addr,
+    model::MemoryByteRow& out);
+
+// Cheap full-scan row estimate for the bytes table: the summed mapped block
+// spans (fallback: instruction-count heuristic when the source has no blocks).
+std::size_t estimate_memory_byte_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionLocalRow> derive_function_local_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionLocalRow> derive_function_local_rows_for(
     const std::shared_ptr<Source>& source, std::int64_t func_addr);
 std::vector<model::StackVarRow> derive_stack_var_rows(const std::shared_ptr<Source>& source);
+std::vector<model::StackVarRow> derive_stack_var_rows_for(
+    const std::shared_ptr<Source>& source, std::int64_t func_addr);
+bool derive_pcode_op_rows(
+    const std::shared_ptr<Source>& source, model::PcodeMaturity maturity,
+    std::vector<model::PcodeOpRow>& out);
+bool derive_pcode_op_rows_for(
+    const std::shared_ptr<Source>& source, std::int64_t func_addr,
+    model::PcodeMaturity maturity, std::vector<model::PcodeOpRow>& out);
+bool derive_pcode_varnode_rows(
+    const std::shared_ptr<Source>& source, model::PcodeMaturity maturity,
+    std::vector<model::PcodeVarnodeRow>& out);
+bool derive_pcode_varnode_rows_for(
+    const std::shared_ptr<Source>& source, std::int64_t func_addr,
+    model::PcodeMaturity maturity, std::vector<model::PcodeVarnodeRow>& out);
 std::vector<model::RegisterVarRow> derive_register_var_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionChunkRow> derive_function_chunk_rows(const std::shared_ptr<Source>& source);
 std::vector<model::TailCallRow> derive_tail_call_rows(const std::shared_ptr<Source>& source);
@@ -107,6 +152,8 @@ std::vector<model::RelocationRow> derive_relocation_rows(const std::shared_ptr<S
 std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Source>& source);
 std::vector<model::EquateRow> derive_equate_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionFrameRow> derive_function_frame_rows(const std::shared_ptr<Source>& source);
+std::vector<model::FunctionFrameRow> derive_function_frame_rows_for(
+    const std::shared_ptr<Source>& source, std::int64_t func_addr);
 std::vector<model::LoopRow> derive_loop_rows(const std::shared_ptr<Source>& source);
 std::vector<model::SwitchTableRow> derive_switch_table_rows(const std::shared_ptr<Source>& source);
 std::vector<model::DominatorRow> derive_dominator_rows(const std::shared_ptr<Source>& source);

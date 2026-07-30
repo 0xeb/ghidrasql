@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include <ghidrasql/source.hpp>
 
@@ -12,10 +11,15 @@
 #include <cstdlib>
 #include <cstdint>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 
 #ifdef GHIDRASQL_HAS_LIBGHIDRA
 #include <libghidra/http.hpp>
@@ -28,12 +32,25 @@ namespace ghidrasql {
 class LibGhidraSource final : public Source {
 public:
     static constexpr std::uint64_t kAllAddressesMin = 0;
-    // Use INT64_MAX, not UINT64_MAX: the LibGhidraHost decodes the protobuf uint64 range
-    // end into a signed Java long, so UINT64_MAX arrives as -1 and trips a getMaxAddress()
-    // fallback that empties range-filtered tables for programs with EXTERNAL/low-offset
-    // spaces. A large positive sentinel stays positive on the host. See ghidrasql #2/#3/#6.
-    static constexpr std::uint64_t kAllAddressesMax =
-        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    static constexpr std::uint64_t kAllAddressesMax = std::numeric_limits<std::uint64_t>::max();
+
+    // read_function_at memo ceiling: ~1M entries (~100 MB worst case) before a
+    // full reset; see the memo note in read_function_at.
+    static constexpr std::size_t kFunctionAtMemoCap = 1'000'000;
+
+    // Full-table decompilation (ListDecompilations) is the single most expensive
+    // RPC: every row is a live decompile of one function. A large page means one
+    // HTTP request decompiles that many functions server-side and can exceed the
+    // client read timeout mid-request -> connection_failed (httplib Read/error 2).
+    // This bit a whole class of decompiler-backed surfaces (function_frame_layout,
+    // stack_var_layout, pseudocode, decomp tokens/lvars): a bounded query like
+    // `SELECT * FROM function_frame_layout LIMIT 5` still triggers a full cache
+    // build, and the full build must stay within the timeout. Keeping each page
+    // small bounds every single HTTP round-trip and resets the read-timeout window
+    // per page, so the full scan completes as many bounded requests instead of one
+    // giant one. (SQLite LIMIT is applied after the vtable cache is built, so it
+    // cannot shrink this work; the fix is bounding the per-request cost.)
+    static constexpr int kDecompilationPageSize = 16;
 
     explicit LibGhidraSource(LibGhidraSourceOptions options)
         : options_(std::move(options)),
@@ -102,14 +119,37 @@ public:
         out = {};
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
+        // Correlated probes (e.g. `... NOT EXISTS (SELECT 1 FROM funcs f WHERE
+        // f.addr = i.func_addr)`) call this once per outer row, so N probes over
+        // K distinct addresses must cost K RPCs, not N. Misses are memoized too
+        // (an orphan check probes mostly-missing addresses). The memo clears on
+        // every local mutation and whenever the freshness token observes a new
+        // program identity or modification number — the same staleness window
+        // the engine's own row caches already live with.
+        if (auto memo = function_at_memo_.find(address); memo != function_at_memo_.end()) {
+            trace_rpc_locked("GetFunction(memo-hit)");
+            last_error_.clear();
+            if (!memo->second.has_value()) return false;
+            out = *memo->second;
+            return true;
+        }
         trace_rpc_locked("GetFunction");
         auto got = client_.GetFunction(to_u64(address));
         if (!ok_or_record_error_locked(got, "GetFunction")) return false;
+        // The memo lives until the next mutation/program switch, so a long
+        // read-only session probing per-byte addresses (memory_bytes joins)
+        // would otherwise grow it without bound. Resetting at the cap keeps
+        // the worst case at "one extra RPC per re-probed address".
+        if (function_at_memo_.size() >= kFunctionAtMemoCap) {
+            function_at_memo_.clear();
+        }
         if (!got.value->function.has_value()) {
+            function_at_memo_.emplace(address, std::nullopt);
             last_error_.clear();
             return false;
         }
         out = map_function(*got.value->function);
+        function_at_memo_.emplace(address, out);
         last_error_.clear();
         return true;
     }
@@ -128,7 +168,11 @@ public:
             for (const auto& row : rows) {
                 model::SegmentRow mapped;
                 mapped.start_ea = to_i64(row.start_address);
-                mapped.end_ea = to_i64(row.end_address);
+                // The wire end_address is INCLUSIVE (Ghidra maxAddress); the
+                // ghidrasql model is EXCLUSIVE [start, end). Derive it from the
+                // host's exact size so a block ending at the top of the address
+                // space wraps naturally instead of overflowing on +1.
+                mapped.end_ea = to_i64(row.start_address + row.size);
                 mapped.name = row.name;
                 mapped.segment_class = row.is_execute ? "CODE" : "DATA";
                 mapped.perm = (row.is_read ? 4 : 0) | (row.is_write ? 2 : 0) | (row.is_execute ? 1 : 0);
@@ -153,7 +197,9 @@ public:
             for (const auto& row : rows) {
                 model::MemoryBlockRow mapped;
                 mapped.start_ea = to_i64(row.start_address);
-                mapped.end_ea = to_i64(row.end_address);
+                // Wire end_address is INCLUSIVE; the model is EXCLUSIVE (see
+                // read_segments). end_ea - start_ea must equal size.
+                mapped.end_ea = to_i64(row.start_address + row.size);
                 mapped.name = row.name;
                 mapped.block_class = row.is_execute ? "CODE" : "DATA";
                 mapped.perm = (row.is_read ? 4 : 0) | (row.is_write ? 2 : 0) | (row.is_execute ? 1 : 0);
@@ -162,6 +208,7 @@ public:
                 mapped.is_read = row.is_read ? 1 : 0;
                 mapped.is_write = row.is_write ? 1 : 0;
                 mapped.is_exec = row.is_execute ? 1 : 0;
+                mapped.is_initialized = row.is_initialized ? 1 : 0;
                 dest.push_back(std::move(mapped));
             }
             return true;
@@ -182,7 +229,20 @@ public:
             model::ImportRow row;
             row.address = sym.address;
             row.name = sym.name;
-            row.module = sym.namespace_name.empty() ? "external" : sym.namespace_name;
+            std::string module = sym.namespace_name.empty() ? "external" : sym.namespace_name;
+            // Canonical import module names carry no file extension (idasql/bnsql
+            // report "KERNEL32"), but Ghidra's ExternalLibrary keeps the real
+            // filename ("KERNEL32.DLL"). Strip a trailing case-insensitive ".dll"
+            // so ghidra matches the canonical schema. libghidra stays faithful to
+            // Ghidra's raw name; the canonical normalization lives in this SQL layer.
+            if (module.size() > 4) {
+                const char* t = module.c_str() + module.size() - 4;
+                if (t[0] == '.' && (t[1] == 'd' || t[1] == 'D') &&
+                    (t[2] == 'l' || t[2] == 'L') && (t[3] == 'l' || t[3] == 'L')) {
+                    module.resize(module.size() - 4);
+                }
+            }
+            row.module = std::move(module);
             out.push_back(std::move(row));
         }
         return true;
@@ -194,17 +254,78 @@ public:
         if (!read_symbols(symbols)) {
             return false;
         }
+
+        // Canonical `entries` means Ghidra external entry points/exports plus
+        // the loader entry point. "Primary" only means the preferred symbol at
+        // an address and must not admit every ordinary function/data label.
+        std::unordered_set<std::int64_t> seen;
         out.reserve(symbols.size());
-        for (const auto& sym : symbols) {
-            if (sym.is_external || !sym.is_primary) {
-                continue;
+        auto append_symbol = [&](const model::SymbolRow& sym) {
+            if (sym.is_external || !seen.insert(sym.address).second) {
+                return;
             }
             model::ExportRow row;
             row.address = sym.address;
             row.name = sym.name;
-            row.module = sym.namespace_name.empty() ? "" : sym.namespace_name;
+            row.module = sym.namespace_name;
             out.push_back(std::move(row));
+        };
+        std::unordered_map<std::int64_t, const model::SymbolRow*> entry_symbols;
+        for (const auto& sym : symbols) {
+            if (!sym.is_external_entry_point || sym.is_external) {
+                continue;
+            }
+            auto [it, inserted] = entry_symbols.emplace(sym.address, &sym);
+            if (!inserted && sym.is_primary && !it->second->is_primary) {
+                it->second = &sym;
+            }
         }
+        for (const auto& [address, sym] : entry_symbols) {
+            (void)address;
+            append_symbol(*sym);
+        }
+
+        model::ProgramInfoRow info;
+        if (!read_program_info(info)) {
+            out.clear();
+            return false;
+        }
+        if (info.has_entry_point != 0 &&
+            seen.find(info.entry_point) == seen.end()) {
+            const model::SymbolRow* best = nullptr;
+            for (const auto& sym : symbols) {
+                if (sym.address != info.entry_point || sym.is_external) {
+                    continue;
+                }
+                if (best == nullptr || sym.is_primary) {
+                    best = &sym;
+                }
+                if (sym.is_primary) {
+                    break;
+                }
+            }
+            if (best != nullptr) {
+                append_symbol(*best);
+            } else {
+                model::ExportRow row;
+                row.address = info.entry_point;
+                model::FunctionRow fn;
+                if (read_function_at(info.entry_point, fn)) {
+                    row.name = fn.name;
+                    row.module = fn.namespace_name;
+                } else if (!xsql::get_vtab_error().empty()) {
+                    out.clear();
+                    return false;
+                }
+                seen.insert(row.address);
+                out.push_back(std::move(row));
+            }
+        }
+
+        std::sort(out.begin(), out.end(),
+                  [](const model::ExportRow& lhs, const model::ExportRow& rhs) {
+                      return lhs.address < rhs.address;
+                  });
         return true;
     }
 
@@ -244,20 +365,91 @@ public:
         });
     }
 
-    bool read_call_edges(std::vector<model::CallEdgeRow>& out) const override {
+    bool read_strings_in_range(
+            std::int64_t start_address,
+            std::int64_t end_address,
+            std::vector<model::StringRow>& out) const override {
         out.clear();
-        std::vector<model::FunctionRow> functions;
-        std::vector<model::XrefRow> xrefs;
-        if (!read_functions(functions) || !read_xrefs(xrefs)) {
+        if (end_address < start_address) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            const auto signed_start = to_i64(win.first);
+            const auto signed_end = to_i64(win.second);
+            // The host lists strings by START address, so widen the low RPC
+            // bound so a string that begins just below the window but covers
+            // into it is still listed (kItemLowSlackBytes documents the
+            // heuristic bound); the span-intersection filter clamps the result.
+            const std::uint64_t lo = widen_low(win.first, kItemLowSlackBytes);
+            std::vector<model::StringRow> page;
+            const bool ok = paginate_locked(2048, page, [&](int ps, int off, auto& dest, std::size_t& count) {
+                auto listed = client_.ListDefinedStrings(lo, win.second, ps, off);
+                if (!ok_or_record_error_locked(listed, "ListDefinedStrings")) return false;
+                const auto& rows = listed.value->strings;
+                count = rows.size();
+                for (const auto& row : rows) {
+                    auto mapped = map_string(row);
+                    if (byte_span_intersects_range(
+                            mapped.address, string_byte_span(mapped),
+                            signed_start, signed_end)) {
+                        dest.push_back(std::move(mapped));
+                    }
+                }
+                return true;
+            });
+            if (!ok) return false;
+            out.insert(out.end(),
+                       std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
+        }
+        last_error_.clear();
+        return true;
+    }
+
+    bool read_bytes(std::int64_t address, std::int64_t length,
+                    std::vector<std::uint8_t>& out) const override {
+        out.clear();
+        if (length <= 0) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        if (static_cast<std::uint64_t>(length) >
+            std::numeric_limits<std::uint32_t>::max()) {
+            last_error_ =
+                "ReadBytes length exceeds the uint32 RPC limit: " +
+                std::to_string(length);
+            xsql::set_vtab_error(last_error_);
             return false;
         }
+        auto got = client_.ReadBytes(to_u64(address), static_cast<std::uint32_t>(length));
+        if (!got.ok()) {
+            // The host errors on unmapped/uninitialized memory BY CONTRACT, and
+            // callers legitimately read across ranges that may include such
+            // bytes (memory_bytes derivation, hexdump). "There are no bytes
+            // here" is a clean false, not a query-poisoning error; only
+            // unexpected failures are recorded. The host distinguishes a truly
+            // unmapped address ("unmapped_address") from a mapped-but-
+            // uninitialized block such as .bss ("uninitialized_memory"); both
+            // mean "no readable bytes here" for these range readers.
+            if (got.status.code == "unmapped_address" ||
+                got.status.code == "uninitialized_memory" ||
+                got.status.code == "not_loaded") {
+                return false;
+            }
+            (void)ok_or_record_error_locked(got, "ReadBytes");
+            return false;
+        }
+        out = got.value->data;
+        return true;
+    }
 
-        // Sort functions by address for binary search
+    // Sort `functions` by address in place and return an ea → owning-function
+    // resolver backed by binary search. The returned lambda references
+    // `functions`, so the vector must outlive it.
+    static auto make_owner_resolver(std::vector<model::FunctionRow>& functions) {
         std::sort(functions.begin(), functions.end(), [](const auto& a, const auto& b) {
             return a.address < b.address;
         });
-
-        auto find_owner = [&](std::int64_t ea) -> std::int64_t {
+        return [&functions](std::int64_t ea) -> std::int64_t {
             // Find first function with address > ea
             auto it = std::upper_bound(functions.begin(), functions.end(), ea,
                 [](std::int64_t addr, const model::FunctionRow& fn) { return addr < fn.address; });
@@ -271,6 +463,17 @@ public:
             }
             return 0;
         };
+    }
+
+    bool read_call_edges(std::vector<model::CallEdgeRow>& out) const override {
+        out.clear();
+        std::vector<model::FunctionRow> functions;
+        std::vector<model::XrefRow> xrefs;
+        if (!read_functions(functions) || !read_xrefs(xrefs)) {
+            return false;
+        }
+
+        auto find_owner = make_owner_resolver(functions);
         auto is_call_like = [](const std::string& kind) {
             std::string lowered = kind;
             std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
@@ -317,11 +520,12 @@ public:
             return std::string{};
         };
 
+        // Dedup on (src, dst), preserving first-encounter output order.
+        std::map<std::pair<std::int64_t, std::int64_t>, std::size_t> seen;
         for (const auto& edge : edges) {
-            auto existing = std::find_if(out.begin(), out.end(), [&](const model::FunctionCallRow& row) {
-                return row.src_func_addr == edge.src_func_addr && row.dst_func_addr == edge.dst_func_addr;
-            });
-            if (existing == out.end()) {
+            auto [it, inserted] =
+                seen.try_emplace({edge.src_func_addr, edge.dst_func_addr}, out.size());
+            if (inserted) {
                 model::FunctionCallRow row;
                 row.src_func_addr = edge.src_func_addr;
                 row.src_func_name = func_name(edge.src_func_addr);
@@ -330,7 +534,7 @@ public:
                 row.edge_count = 1;
                 out.push_back(std::move(row));
             } else {
-                existing->edge_count += 1;
+                out[it->second].edge_count += 1;
             }
         }
         return true;
@@ -350,7 +554,9 @@ public:
                 model::BlockRow mapped;
                 mapped.func_addr = to_i64(row.function_entry);
                 mapped.start_ea = to_i64(row.start_address);
-                mapped.end_ea = to_i64(row.end_address);
+                // Wire end_address is INCLUSIVE (basic-block maxAddress); the
+                // model is EXCLUSIVE, so blocks.size = end_ea - start_ea.
+                mapped.end_ea = to_i64(row.end_address + 1);
                 mapped.in_degree = static_cast<int>(row.in_degree);
                 mapped.out_degree = static_cast<int>(row.out_degree);
                 dest.push_back(std::move(mapped));
@@ -473,6 +679,125 @@ public:
         });
     }
 
+    // ---- Decompiler-free stack frames + stack variables ----
+    // Both are served by the single ListFunctionFrames RPC (listing-layer
+    // StackFrame; never touches the decompiler). read_stack_vars flattens the
+    // embedded StackVariableRecord list.
+
+    bool read_stack_frames_range_locked(
+            std::uint64_t lo, std::uint64_t hi,
+            std::vector<model::FunctionFrameRow>& out) const {
+        out.clear();
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(256, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListFunctionFrames(lo, hi, ps, off);
+            if (!ok_or_record_error_locked(listed, "ListFunctionFrames")) return false;
+            const auto& rows = listed.value->frames;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                if (row.function_entry < lo || row.function_entry > hi) {
+                    continue;
+                }
+                model::FunctionFrameRow mapped;
+                mapped.func_addr = to_i64(row.function_entry);
+                mapped.frame_size = row.frame_size;
+                mapped.arg_size = row.parameter_size;
+                mapped.local_size = row.local_size;
+                // The listing-layer StackFrame does not expose a saved-register
+                // size; leave it unknown (SQL NULL) rather than fabricate it.
+                mapped.saved_reg_size = 0;
+                mapped.saved_reg_size_known = false;
+                mapped.stack_base_reg = row.stack_pointer_register;
+                // StackFrame carries no frame-pointer flag; report unknown.
+                mapped.has_frame_pointer = -1;
+                dest.push_back(std::move(mapped));
+            }
+            return true;
+        });
+    }
+
+    bool read_stack_vars_range_locked(
+            std::uint64_t lo, std::uint64_t hi,
+            std::vector<model::StackVarRow>& out) const {
+        out.clear();
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(256, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListFunctionFrames(lo, hi, ps, off);
+            if (!ok_or_record_error_locked(listed, "ListFunctionFrames")) return false;
+            const auto& frames = listed.value->frames;
+            count = frames.size();
+            for (const auto& frame : frames) {
+                if (frame.function_entry < lo || frame.function_entry > hi) {
+                    continue;
+                }
+                const std::int64_t func_addr = to_i64(frame.function_entry);
+                for (const auto& var : frame.stack_variables) {
+                    model::StackVarRow mapped;
+                    mapped.func_addr = func_addr;
+                    mapped.var_id = var.var_id;
+                    mapped.name = var.name;
+                    mapped.var_type = var.data_type;
+                    mapped.stack_offset = var.stack_offset;
+                    mapped.size = static_cast<std::int64_t>(var.size);
+                    mapped.is_param = var.is_parameter ? 1 : 0;
+                    dest.push_back(std::move(mapped));
+                }
+            }
+            return true;
+        });
+    }
+
+    bool read_stack_frames(std::vector<model::FunctionFrameRow>& out) const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return read_stack_frames_range_locked(kAllAddressesMin, kAllAddressesMax, out);
+    }
+
+    bool read_stack_frames_in_range(
+            std::int64_t start_address,
+            std::int64_t end_address,
+            std::vector<model::FunctionFrameRow>& out) const override {
+        out.clear();
+        if (end_address < start_address) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        // Split a window crossing the sign seam (start < 0 <= end, e.g. an
+        // unconstrained `addr <= X`) into the upper- and lower-half unsigned
+        // ranges the host RPCs expect; a bare cast would yield lo > hi and
+        // silently return nothing (see rpc_windows).
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            std::vector<model::FunctionFrameRow> page;
+            if (!read_stack_frames_range_locked(win.first, win.second, page)) return false;
+            out.insert(out.end(),
+                       std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
+        }
+        return true;
+    }
+
+    bool read_stack_vars(std::vector<model::StackVarRow>& out) const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return read_stack_vars_range_locked(kAllAddressesMin, kAllAddressesMax, out);
+    }
+
+    bool read_stack_vars_in_range(
+            std::int64_t start_address,
+            std::int64_t end_address,
+            std::vector<model::StackVarRow>& out) const override {
+        out.clear();
+        if (end_address < start_address) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        // See read_stack_frames_in_range: route through rpc_windows so a
+        // sign-seam-crossing range is not collapsed to an empty lo > hi RPC.
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            std::vector<model::StackVarRow> page;
+            if (!read_stack_vars_range_locked(win.first, win.second, page)) return false;
+            out.insert(out.end(),
+                       std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
+        }
+        return true;
+    }
+
     bool read_data_items(std::vector<model::DataItemRow>& out) const override {
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
@@ -509,11 +834,51 @@ public:
         });
     }
 
+    bool read_data_items_in_range(
+            std::int64_t start_address,
+            std::int64_t end_address,
+            std::vector<model::DataItemRow>& out) const override {
+        out.clear();
+        if (end_address < start_address) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            const auto signed_start = to_i64(win.first);
+            const auto signed_end = to_i64(win.second);
+            // Widen the low RPC bound so an item that starts just below the
+            // window but covers into it is still listed (see kItemLowSlackBytes
+            // for the heuristic's limits); span-intersection filters the rest.
+            const std::uint64_t lo = widen_low(win.first, kItemLowSlackBytes);
+            std::vector<model::DataItemRow> page;
+            const bool ok = paginate_locked(2048, page, [&](int ps, int off, auto& dest, std::size_t& count) {
+                auto listed = client_.ListDataItems(lo, win.second, ps, off);
+                if (!ok_or_record_error_locked(listed, "ListDataItems")) return false;
+                const auto& rows = listed.value->data_items;
+                count = rows.size();
+                for (const auto& row : rows) {
+                    auto mapped = map_data_item(row);
+                    if (byte_span_intersects_range(
+                            mapped.address, data_item_byte_span(mapped),
+                            signed_start, signed_end)) {
+                        dest.push_back(std::move(mapped));
+                    }
+                }
+                return true;
+            });
+            if (!ok) return false;
+            out.insert(out.end(),
+                       std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
+        }
+        last_error_.clear();
+        return true;
+    }
+
     bool read_decomp_lvars(std::vector<model::DecompLvarRow>& out) const override {
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(128, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+        return paginate_locked(kDecompilationPageSize, out, [&](int ps, int off, auto& dest, std::size_t& count) {
             auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, 30000);
             if (!ok_or_record_error_locked(listed, "ListDecompilations")) return false;
             const auto& rows = listed.value->decompilations;
@@ -534,16 +899,7 @@ public:
             return false;
         }
 
-        auto find_owner = [&](std::int64_t ea) -> std::int64_t {
-            for (const auto& fn : functions) {
-                const std::int64_t fn_end =
-                    fn.end_ea > fn.address ? fn.end_ea : (fn.address + std::max<std::int64_t>(fn.size, 1));
-                if (ea >= fn.address && ea < fn_end) {
-                    return fn.address;
-                }
-            }
-            return 0;
-        };
+        auto find_owner = make_owner_resolver(functions);
 
         out.reserve(comments.size());
         for (const auto& comment : comments) {
@@ -561,7 +917,7 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(128, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+        return paginate_locked(kDecompilationPageSize, out, [&](int ps, int off, auto& dest, std::size_t& count) {
             auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, 30000);
             if (!ok_or_record_error_locked(listed, "ListDecompilations")) return false;
             const auto& rows = listed.value->decompilations;
@@ -594,6 +950,25 @@ public:
 
     bool read_perf_benchmarks(std::vector<model::PerfBenchmarkRow>& out) const override {
         out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        auto listed = client_.ListPerfBenchmarks();
+        if (!ok_or_record_error_locked(listed, "ListPerfBenchmarks")) return false;
+        out.reserve(listed.value->records.size());
+        for (const auto& rec : listed.value->records) {
+            model::PerfBenchmarkRow row;
+            row.bench_id = rec.bench_id;
+            row.query_family = rec.query_family;
+            row.dataset_profile = rec.dataset_profile;
+            row.cold_ms_p50 = rec.cold_ms_p50;
+            row.cold_ms_p95 = rec.cold_ms_p95;
+            row.warm_ms_p50 = rec.warm_ms_p50;
+            row.warm_ms_p95 = rec.warm_ms_p95;
+            row.throughput_qps = rec.throughput_qps;
+            row.regression_pct = rec.regression_pct;
+            row.status = rec.status;
+            out.push_back(std::move(row));
+        }
         return true;
     }
 
@@ -795,7 +1170,7 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(256, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+        return paginate_locked(kDecompilationPageSize, out, [&](int ps, int off, auto& dest, std::size_t& count) {
             auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, 30000);
             if (!ok_or_record_error_locked(listed, "ListDecompilations")) return false;
             const auto& rows = listed.value->decompilations;
@@ -812,6 +1187,107 @@ public:
             }
             return true;
         });
+    }
+
+    // Per-function P-code via the DecompilerService/GetPcode RPC — the Ghidra leg of the
+    // cross-tool low-IR. maturity selects High (refined SSA) or Raw (per-instruction, non-SSA).
+    // One GetPcode per function (filter by func_addr). is_ssa/maturity/stage from the RETURNED rung.
+    bool read_pcode_at(std::int64_t address, model::PcodeMaturity maturity,
+                       std::vector<model::PcodeOpRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        trace_rpc_locked("GetPcode");
+        auto req_mat = maturity == model::PcodeMaturity::Raw
+                           ? libghidra::client::PcodeMaturity::Raw
+                           : libghidra::client::PcodeMaturity::High;
+        auto got = client_.GetPcode(to_u64(address), req_mat, 30000);
+        if (!ok_or_record_error_locked(got, "GetPcode")) return false;
+        if (!got.value->pcode.has_value()) {
+            last_error_.clear();
+            return true;
+        }
+        const auto& rec = *got.value->pcode;
+        if (!rec.completed) {
+            last_error_ = rec.error_message.empty()
+                ? "GetPcode returned an incomplete result"
+                : "GetPcode incomplete: " + rec.error_message;
+            xsql::set_vtab_error(last_error_);
+            out.clear();
+            return false;
+        }
+        const bool raw = rec.maturity == libghidra::client::PcodeMaturity::Raw;
+        out.reserve(rec.ops.size());
+        for (const auto& op : rec.ops) {
+            model::PcodeOpRow r;
+            r.func_addr = address;
+            r.seq = static_cast<int>(op.seq);
+            r.addr = static_cast<std::int64_t>(op.addr);
+            r.has_addr = op.has_address ? 1 : 0;
+            r.op = op.op;
+            r.has_output = op.has_output ? 1 : 0;
+            r.output_kind = op.has_output ? op.output.kind : "";
+            r.output_size = op.has_output ? static_cast<int>(op.output.size) : 0;
+            r.input_count = static_cast<int>(op.inputs.size());
+            r.is_ssa = raw ? 0 : 1;
+            r.maturity = raw ? "raw" : "high";
+            r.stage = raw ? "raw" : "ssa";
+            out.push_back(std::move(r));
+        }
+        last_error_.clear();
+        return true;
+    }
+
+    // Per-function P-code value operands (varnodes) via the same GetPcode RPC — output +
+    // inputs of every op, projected to the 5-kind model (kind arrives already-modeled).
+    bool read_pcode_varnodes_at(std::int64_t address, model::PcodeMaturity maturity,
+                                std::vector<model::PcodeVarnodeRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        trace_rpc_locked("GetPcode");
+        auto req_mat = maturity == model::PcodeMaturity::Raw
+                           ? libghidra::client::PcodeMaturity::Raw
+                           : libghidra::client::PcodeMaturity::High;
+        auto got = client_.GetPcode(to_u64(address), req_mat, 30000);
+        if (!ok_or_record_error_locked(got, "GetPcode")) return false;
+        if (!got.value->pcode.has_value()) {
+            last_error_.clear();
+            return true;
+        }
+        const auto& rec = *got.value->pcode;
+        if (!rec.completed) {
+            last_error_ = rec.error_message.empty()
+                ? "GetPcode returned an incomplete result"
+                : "GetPcode incomplete: " + rec.error_message;
+            xsql::set_vtab_error(last_error_);
+            out.clear();
+            return false;
+        }
+        const bool raw = rec.maturity == libghidra::client::PcodeMaturity::Raw;
+        const char* mat_name = raw ? "raw" : "high";
+        const char* stage_name = raw ? "raw" : "ssa";
+        auto emit = [&](int op_seq, int& idx, const char* role, const auto& vn) {
+            model::PcodeVarnodeRow r;
+            r.func_addr = address;
+            r.op_seq = op_seq;
+            r.operand_index = idx++;
+            r.role = role;
+            r.kind = vn.kind;
+            r.space = vn.space;
+            r.offset = static_cast<std::int64_t>(vn.offset);
+            r.size = static_cast<int>(vn.size);
+            r.maturity = mat_name;
+            r.stage = stage_name;
+            out.push_back(std::move(r));
+        };
+        for (const auto& op : rec.ops) {
+            int idx = 0;
+            if (op.has_output) emit(static_cast<int>(op.seq), idx, "out", op.output);
+            for (const auto& in : op.inputs) emit(static_cast<int>(op.seq), idx, "in", in);
+        }
+        last_error_.clear();
+        return true;
     }
 
     bool read_instructions(std::vector<model::InstructionRow>& out) const override {
@@ -831,6 +1307,86 @@ public:
         });
     }
 
+    // func_addr is left 0 here; the table layer range-maps `address` into the
+    // function set (like instructions). An operand sits at its instruction's
+    // start address, so no byte-span low-slack widening is needed for the range.
+    bool read_instruction_operands(std::vector<model::InstructionOperandRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(4096, out, [&](int ps, int off, auto& dest, std::size_t& count) {
+            auto listed = client_.ListInstructionOperands(kAllAddressesMin, kAllAddressesMax, ps, off);
+            if (!ok_or_record_error_locked(listed, "ListInstructionOperands")) return false;
+            const auto& rows = listed.value->operands;
+            count = rows.size();
+            dest.reserve(dest.size() + count);
+            for (const auto& row : rows) {
+                model::InstructionOperandRow mapped;
+                mapped.address = to_i64(row.address);
+                mapped.operand_index = static_cast<int>(row.operand_index);
+                mapped.text = row.text;
+                mapped.type_name = row.type_name;
+                mapped.ref_type = row.ref_type;
+                dest.push_back(std::move(mapped));
+            }
+            return true;
+        });
+    }
+
+    bool read_instruction_operands_in_range(
+            std::int64_t start_address,
+            std::int64_t end_address,
+            std::vector<model::InstructionOperandRow>& out) const override {
+        out.clear();
+        if (end_address < start_address) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        // The host uses an all-zero range as "all addresses", so [0, 0] must
+        // be clamped client-side. rpc_windows also preserves signed SQL address
+        // ordering across the uint64 sign seam.
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            std::vector<model::InstructionOperandRow> page;
+            const bool ok = paginate_locked(
+                4096, page,
+                [&](int ps, int off, auto& dest, std::size_t& count) {
+                    auto listed = client_.ListInstructionOperands(
+                        win.first, win.second, ps, off);
+                    if (!ok_or_record_error_locked(
+                            listed, "ListInstructionOperands")) {
+                        return false;
+                    }
+                    const auto& rows = listed.value->operands;
+                    count = rows.size();
+                    dest.reserve(dest.size() + count);
+                    for (const auto& row : rows) {
+                        const auto row_address = to_i64(row.address);
+                        if (row.address < win.first ||
+                            row.address > win.second ||
+                            row_address < start_address ||
+                            row_address > end_address) {
+                            continue;
+                        }
+                        model::InstructionOperandRow mapped;
+                        mapped.address = row_address;
+                        mapped.operand_index =
+                            static_cast<int>(row.operand_index);
+                        mapped.text = row.text;
+                        mapped.type_name = row.type_name;
+                        mapped.ref_type = row.ref_type;
+                        dest.push_back(std::move(mapped));
+                    }
+                    return true;
+                });
+            if (!ok) return false;
+            out.insert(
+                out.end(),
+                std::make_move_iterator(page.begin()),
+                std::make_move_iterator(page.end()));
+        }
+        last_error_.clear();
+        return true;
+    }
+
     bool read_instruction_at(std::int64_t address, model::InstructionRow& out) const override {
         out = {};
         std::lock_guard<std::mutex> lock(mu_);
@@ -842,6 +1398,47 @@ public:
             return false;
         }
         out = map_instruction(*got.value->instruction);
+        last_error_.clear();
+        return true;
+    }
+
+    bool read_instructions_in_range(
+            std::int64_t start_address,
+            std::int64_t end_address,
+            std::vector<model::InstructionRow>& out) const override {
+        out.clear();
+        if (end_address < start_address) return true;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            const auto signed_start = to_i64(win.first);
+            const auto signed_end = to_i64(win.second);
+            // The host lists instructions by START address; an instruction can
+            // begin up to (max ISA length - 1) bytes below the window and still
+            // cover into it, so widen the low RPC bound by 16 (x86 max is 15)
+            // and let the span-intersection filter clamp the result.
+            const std::uint64_t lo = widen_low(win.first, kInstructionLowSlackBytes);
+            std::vector<model::InstructionRow> page;
+            const bool ok = paginate_locked(4096, page, [&](int ps, int off, auto& dest, std::size_t& count) {
+                auto listed = client_.ListInstructions(lo, win.second, ps, off);
+                if (!ok_or_record_error_locked(listed, "ListInstructions")) return false;
+                const auto& rows = listed.value->instructions;
+                count = rows.size();
+                for (const auto& row : rows) {
+                    auto mapped = map_instruction(row);
+                    if (byte_span_intersects_range(
+                            mapped.address, instruction_byte_span(mapped),
+                            signed_start, signed_end)) {
+                        dest.push_back(std::move(mapped));
+                    }
+                }
+                return true;
+            });
+            if (!ok) return false;
+            out.insert(out.end(),
+                       std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
+        }
         last_error_.clear();
         return true;
     }
@@ -896,20 +1493,31 @@ public:
         if (!ensure_session_open_locked()) {
             return false;
         }
-        return paginate_locked(4096, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.GetComments(to_u64(start_address), to_u64(end_address), ps, off);
-            if (!ok_or_record_error_locked(listed, "GetComments")) return false;
-            const auto& rows = listed.value->comments;
-            count = rows.size();
-            dest.reserve(dest.size() + count);
-            for (const auto& row : rows) {
-                const auto row_address = to_i64(row.address);
-                if (row_address >= start_address && row_address <= end_address) {
-                    dest.push_back(map_comment(row));
+        // Split a sign-seam-crossing window into upper/lower unsigned ranges so
+        // the GetComments RPC is not handed lo > hi (which returns nothing); the
+        // per-window post-filter also neutralizes the host's 0/0 "all" sentinel.
+        for (const auto& win : rpc_windows(start_address, end_address)) {
+            std::vector<model::CommentRow> page;
+            const bool ok = paginate_locked(4096, page, [&](int ps, int off, auto& dest, std::size_t& count) {
+                auto listed = client_.GetComments(win.first, win.second, ps, off);
+                if (!ok_or_record_error_locked(listed, "GetComments")) return false;
+                const auto& rows = listed.value->comments;
+                count = rows.size();
+                dest.reserve(dest.size() + count);
+                for (const auto& row : rows) {
+                    if (row.address >= win.first &&
+                        row.address <= win.second) {
+                        dest.push_back(map_comment(row));
+                    }
                 }
-            }
-            return true;
-        });
+                return true;
+            });
+            if (!ok) return false;
+            out.insert(out.end(),
+                       std::make_move_iterator(page.begin()),
+                       std::make_move_iterator(page.end()));
+        }
+        return true;
     }
 
     bool read_breakpoints(std::vector<model::BreakpointRow>& out) const override {
@@ -1078,7 +1686,15 @@ public:
                 mapped.to_ea = to_i64(row.to_address);
                 mapped.kind = row.ref_type;
                 mapped.is_code = row.is_flow ? 1 : 0;
-                mapped.is_data = row.is_memory ? 1 : 0;
+                // Ghidra partitions every RefType into exactly two final families:
+                // DataRefType (isData()==true) and FlowType (isFlow()==true); RefType is
+                // abstract, so isData() == !isFlow() for every reference. is_code already
+                // carries isFlow(), so is_data is simply its complement. (Do NOT derive it
+                // from is_memory == Reference.isMemoryReference(): that is address-space
+                // dependent — a stack/register DATA ref has isData()==true but
+                // isMemoryReference()==false, so `is_memory && !is_flow` wrongly drops it
+                // from BOTH is_data and is_code.)
+                mapped.is_data = row.is_flow ? 0 : 1;
                 dest.push_back(std::move(mapped));
             }
             return true;
@@ -1101,32 +1717,30 @@ public:
         out.is_headless = status.value->host_mode == "headless" ? 1 : 0;
         out.revision = to_i64(status.value->modification_number);
 
+        std::string current_program_path;
         auto rev = client_.GetRevision();
         if (rev.ok()) {
             out.revision = to_i64(rev.value->modification_number);
+            current_program_path = rev.value->program_path;
         }
 
-        // The host knows the active program's path via the revision even when the client
-        // never issued an explicit OpenProgram (e.g. headless --binary, where the host binds
-        // the imported program as the active program). Use it so db_info reports the real
-        // program instead of the "active-program" placeholder.
-        std::string active_path = rev.ok() ? rev.value->program_path : std::string();
-        if (active_path.empty()) {
-            active_path = options_.program_path;
-        }
-
-        if (!opened_program_.has_value() && !active_path.empty()) {
-            // Best-effort open to populate language/compiler/image-base metadata. Non-fatal:
-            // analysis queries already run against the active program regardless of this.
-            libghidra::client::OpenProgramRequest req;
-            req.project_path = options_.project_path;
-            req.project_name = options_.project_name;
-            req.program_path = active_path;
-            req.read_only = options_.read_only;
-            auto opened = client_.OpenProgram(req);
-            if (opened.ok()) {
-                opened_program_ = *opened.value;
-                opened_project_ = true;
+        // Host-managed / bare-connect / attached-GUI mode never issued a
+        // path-bearing OpenProgram (should_open_program_locked() is false, so
+        // ensure_session_open_locked() is a no-op), leaving opened_program_ empty.
+        // Without this, the program metadata below falls through to zero/blank
+        // defaults (image_base=0x0, has_entry_point=false, empty language_id/
+        // compiler_spec, and the language-derived processor/bits/endianness get
+        // dropped with it). A blank OpenProgramRequest is a metadata-only
+        // "describe current program" on the host (no open/close/analyze side
+        // effects) — the same recovery refresh_program_metadata_locked() uses.
+        // Cache it so repeat reads skip the RPC; a host-side switch re-describes
+        // via the freshness token. On failure leave the cache empty and fall
+        // through to the honest generic fallback below.
+        if (!opened_program_.has_value()) {
+            libghidra::client::OpenProgramRequest describe_req;  // all fields blank/default
+            auto described = client_.OpenProgram(describe_req);
+            if (described.ok() && !described.value->program_name.empty()) {
+                opened_program_ = *described.value;
             }
         }
 
@@ -1137,12 +1751,52 @@ public:
             out.image_base = to_i64(opened_program_->image_base);
             out.md5 = opened_program_->md5;
             out.sha256 = opened_program_->sha256;
+            out.executable_format = opened_program_->executable_format;
+            out.entry_point = to_i64(opened_program_->entry_point);
+            out.has_entry_point = opened_program_->has_entry_point;
         } else {
-            out.program_name = active_path.empty() ? "active-program" : active_path;
+            // The launch path names a *previous* program once a switch has been
+            // observed — degrade to the generic name rather than a stale path.
+            out.program_name = (options_.program_path.empty() || program_identity_switched_)
+                ? "active-program"
+                : options_.program_path;
         }
-        out.program_path = active_path.empty() ? out.program_name : active_path;
+        if (!current_program_path.empty()) {
+            out.program_path = current_program_path;
+        } else if (!program_identity_switched_ && !options_.program_path.empty()) {
+            out.program_path = options_.program_path;
+        } else {
+            // After a host-side switch the launch option names the *previous*
+            // program; the refreshed program name is the only current source.
+            out.program_path = out.program_name;
+        }
         last_error_.clear();
         return true;
+    }
+
+    // Identity fields only: modification_number / file_version move on saves
+    // and edits, not on program switches, so they stay out of the key.
+    static std::string program_identity_key(const libghidra::client::RevisionResponse& rev) {
+        return std::to_string(rev.program_id) + '\x1f' + rev.program_path + '\x1f' + rev.file_id;
+    }
+
+    // Re-describe the currently open program after the host switched programs.
+    // A blank OpenProgramRequest is a metadata-only "describe current program"
+    // on the host (no open/close/analyze side effects), so this never flips the
+    // host back to the originally configured program.
+    void refresh_program_metadata_locked() const {
+        if (!opened_program_.has_value()) {
+            return;  // nothing cached to go stale (host-managed program mode)
+        }
+        libghidra::client::OpenProgramRequest req;  // all fields blank/default
+        auto described = client_.OpenProgram(req);
+        if (described.ok() && !described.value->program_name.empty()) {
+            opened_program_ = *described.value;
+        } else {
+            // Never keep stale metadata: degrade to the generic fallback until
+            // the next successful describe.
+            opened_program_.reset();
+        }
     }
 
     bool read_freshness_token(SourceFreshnessToken& out) const override {
@@ -1155,13 +1809,34 @@ public:
         if (!ok_or_record_error_locked(rev, "GetRevision")) {
             return false;
         }
+        // Program identity changed since the last check (host-side program
+        // switch): cached program metadata (name, language, hashes, image base,
+        // bitness) describes the previous program — refresh it before anyone
+        // reads it. Row-level caches are invalidated separately by the engine
+        // when this token changes.
+        const std::string identity = program_identity_key(*rev.value);
+        if (!last_program_identity_.empty() && identity != last_program_identity_) {
+            program_identity_switched_ = true;
+            refresh_program_metadata_locked();
+        }
+        // A new identity OR a new modification number means host-side state
+        // moved: drop the per-revision read memos.
+        if (identity != last_program_identity_ ||
+            rev.value->modification_number != last_modification_seen_) {
+            trace_rpc_locked("(freshness memo clear)");
+            function_at_memo_.clear();
+        }
+        last_modification_seen_ = rev.value->modification_number;
+        last_program_identity_ = identity;
         out.program_id = std::to_string(rev.value->program_id);
         out.modification_number = to_i64(rev.value->modification_number);
         out.program_path = rev.value->program_path;
         out.file_id = rev.value->file_id;
         out.file_version = rev.value->file_version;
         out.file_last_modified_time = rev.value->file_last_modified_time;
-        if (out.program_path.empty()) {
+        if (out.program_path.empty() && !program_identity_switched_) {
+            // Launch-option fallback is valid only while the originally opened
+            // program is still current (see program_identity_switched_).
             out.program_path = options_.program_path;
         }
         last_error_.clear();
@@ -1435,6 +2110,80 @@ public:
             return false;
         }
         invalidate_decompile_cache_locked();
+        maybe_auto_save_locked();
+        return true;
+    }
+
+    bool create_memory_block(std::int64_t start_address, std::int64_t end_address,
+                             const std::string& name, int perm, bool initialized) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        if (end_address <= start_address) {
+            last_error_ = "create_memory_block: end_address must be > start_address";
+            return false;
+        }
+        trace_rpc_locked("CreateMemoryBlock");
+        libghidra::client::CreateMemoryBlockSpec spec;
+        spec.name = name;
+        spec.start_address = to_u64(start_address);
+        spec.size = static_cast<std::uint64_t>(end_address - start_address);
+        spec.is_read = (perm & 4) != 0;
+        spec.is_write = (perm & 2) != 0;
+        spec.is_execute = (perm & 1) != 0;
+        spec.initialized = initialized;
+        spec.overlay = false;
+        auto res = client_.CreateMemoryBlock(spec);
+        if (!ok_or_record_error_locked(res, "CreateMemoryBlock")) {
+            return false;
+        }
+        if (!res.value->created) {
+            if (last_error_.empty()) {
+                last_error_ = "CreateMemoryBlock rejected";
+            }
+            return false;
+        }
+        maybe_auto_save_locked();
+        return true;
+    }
+
+    bool remove_memory_block(std::int64_t address) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        trace_rpc_locked("RemoveMemoryBlock");
+        auto res = client_.RemoveMemoryBlock(to_u64(address));
+        if (!ok_or_record_error_locked(res, "RemoveMemoryBlock")) {
+            return false;
+        }
+        if (!res.value->removed) {
+            if (last_error_.empty()) {
+                last_error_ = "RemoveMemoryBlock rejected";
+            }
+            return false;
+        }
+        maybe_auto_save_locked();
+        return true;
+    }
+
+    bool move_memory_block(std::int64_t address, std::int64_t new_start_address) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        trace_rpc_locked("MoveMemoryBlock");
+        auto res = client_.MoveMemoryBlock(to_u64(address), to_u64(new_start_address));
+        if (!ok_or_record_error_locked(res, "MoveMemoryBlock")) {
+            return false;
+        }
+        if (!res.value->moved) {
+            if (last_error_.empty()) {
+                last_error_ = "MoveMemoryBlock rejected";
+            }
+            return false;
+        }
         maybe_auto_save_locked();
         return true;
     }
@@ -1732,6 +2481,41 @@ public:
         }
         auto deleted = client_.DeleteBookmark(to_u64(address), type, category);
         if (!ok_or_record_error_locked(deleted, "DeleteBookmark") || !deleted.value->deleted) {
+            return false;
+        }
+        maybe_auto_save_locked();
+        return true;
+    }
+
+    // -- Perf benchmarks ------------------------------------------------------
+
+    bool add_perf_benchmark(const model::PerfBenchmarkRow& row) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto added = client_.AddPerfBenchmark(to_perf_record(row));
+        if (!ok_or_record_error_locked(added, "AddPerfBenchmark") || !added.value->added) {
+            return false;
+        }
+        maybe_auto_save_locked();
+        return true;
+    }
+
+    // One host-side transaction per DELETE. The old list/clear/re-add
+    // read-modify-write could permanently lose every surviving row if a
+    // re-add failed mid-flight — never fall back to it.
+    bool delete_perf_benchmark(const std::string& bench_id) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto deleted = client_.DeletePerfBenchmark(bench_id);
+        if (!ok_or_record_error_locked(deleted, "DeletePerfBenchmark")) {
+            return false;
+        }
+        if (!deleted.value->deleted) {
+            last_error_ = "perf benchmark not found: '" + bench_id + "'";
             return false;
         }
         maybe_auto_save_locked();
@@ -2253,6 +3037,7 @@ private:
             mapped.type = local.data_type;
             mapped.storage = local.storage;
             mapped.role = to_decomp_local_role(local.kind);
+            mapped.func_name = detail.func_name;
             detail.locals.push_back(std::move(mapped));
         }
         detail.tokens.reserve(row.tokens.size());
@@ -2274,6 +3059,10 @@ private:
     }
 
     void maybe_auto_save_locked() const {
+        // Every mutation path lands here (even when auto-save is off), so it
+        // doubles as the local-mutation invalidation point for read memos.
+        trace_rpc_locked("(mutation memo clear)");
+        function_at_memo_.clear();
         if (options_.auto_save_interval <= 0) {
             return;
         }
@@ -2368,11 +3157,19 @@ private:
             return true;
         }
         libghidra::client::OpenProgramRequest req;
-        req.project_path = options_.project_path;
-        req.project_name = options_.project_name;
-        req.program_path = options_.program_path;
-        req.analyze = options_.analyze;
-        req.read_only = options_.read_only;
+        if (program_identity_switched_) {
+            // A host-side switch has been observed and the cached describe was
+            // lost (e.g. a failed re-describe). Re-opening the launch-time
+            // program_path here would actively switch the host BACK to the old
+            // program as a side effect of a read — issue the blank metadata-only
+            // describe of whatever is currently active instead.
+        } else {
+            req.project_path = options_.project_path;
+            req.project_name = options_.project_name;
+            req.program_path = options_.program_path;
+            req.analyze = options_.analyze;
+            req.read_only = options_.read_only;
+        }
         auto opened = client_.OpenProgram(req);
         if (!ok_or_record_error_locked(opened, "OpenProgram")) {
             return false;
@@ -2416,15 +3213,69 @@ private:
         return false;
     }
 
-    static std::int64_t to_i64(std::uint64_t value) {
-        if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-            return std::numeric_limits<std::int64_t>::max();
+    // Straddle slack for the *_in_range low RPC bound. The host lists items by
+    // START address with INCLUSIVE u64 bounds, so an item beginning below a
+    // window but covering into it needs the low bound widened:
+    //   * instructions: 16 bytes is a hard bound (longest x86 encoding is 15).
+    //   * strings/data items: sizes are unbounded, so 4096 is a documented
+    //     heuristic — an item LARGER than the slack that starts more than the
+    //     slack below the window is missed and its in-window bytes fall back to
+    //     'raw'/'data-less' attribution (their VALUES stay correct; values come
+    //     from ReadBytes paging, never from the item listing).
+    static constexpr std::uint64_t kInstructionLowSlackBytes = 16;
+    static constexpr std::uint64_t kItemLowSlackBytes = 4096;
+
+    // Split an INCLUSIVE signed-int64 address window into 1-2 inclusive u64 RPC
+    // windows. Model addresses are ordered by SIGNED value (the SQL convention)
+    // while the host RPCs take unsigned bounds, so a window crossing the sign
+    // seam (start < 0 <= end, e.g. an unconstrained scan) must be split into
+    // the upper-half and lower-half unsigned ranges.
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> rpc_windows(
+            std::int64_t start, std::int64_t end) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+        if (end < start) {
+            return out;
         }
+        if (start < 0 && end >= 0) {
+            out.emplace_back(to_u64(start), std::numeric_limits<std::uint64_t>::max());
+            out.emplace_back(std::uint64_t{0}, to_u64(end));
+        } else {
+            out.emplace_back(to_u64(start), to_u64(end));
+        }
+        return out;
+    }
+
+    static std::uint64_t widen_low(std::uint64_t lo, std::uint64_t slack) {
+        return lo >= slack ? lo - slack : 0;
+    }
+
+    // Addresses cross the SQL boundary as the same 64-bit pattern (SQLite has
+    // no unsigned type), matching the idasql/bnsql convention: an address in
+    // the upper half (>= 2^63, e.g. an ARM64 kernel VA) surfaces as a negative
+    // INTEGER but round-trips exactly. Saturating/clamping here would collapse
+    // every high address onto one value and break joins and point lookups.
+    static std::int64_t to_i64(std::uint64_t value) {
         return static_cast<std::int64_t>(value);
     }
 
     static std::uint64_t to_u64(std::int64_t value) {
-        return value < 0 ? 0ULL : static_cast<std::uint64_t>(value);
+        return static_cast<std::uint64_t>(value);
+    }
+
+    static libghidra::client::PerfBenchmarkRecord to_perf_record(
+        const model::PerfBenchmarkRow& row) {
+        libghidra::client::PerfBenchmarkRecord rec;
+        rec.bench_id = row.bench_id;
+        rec.query_family = row.query_family;
+        rec.dataset_profile = row.dataset_profile;
+        rec.cold_ms_p50 = row.cold_ms_p50;
+        rec.cold_ms_p95 = row.cold_ms_p95;
+        rec.warm_ms_p50 = row.warm_ms_p50;
+        rec.warm_ms_p95 = row.warm_ms_p95;
+        rec.throughput_qps = row.throughput_qps;
+        rec.regression_pct = row.regression_pct;
+        rec.status = row.status;
+        return rec;
     }
 
     static std::string to_hex(std::int64_t value) {
@@ -2438,10 +3289,15 @@ private:
         mapped.address = to_i64(row.entry_address);
         mapped.name = row.name;
         mapped.size = to_i64(row.size);
-        mapped.end_ea = row.end_address != 0 ? to_i64(row.end_address) : (mapped.address + mapped.size);
+        // Wire end_address is INCLUSIVE (the function body's maxAddress); the
+        // model is EXCLUSIVE. Prefer end_address + 1 over addr + size: Ghidra
+        // function bodies can be non-contiguous, so size may undercount the
+        // span. The == 0 sentinel means "not provided" (fall back to the span).
+        mapped.end_ea = row.end_address != 0 ? to_i64(row.end_address + 1) : (mapped.address + mapped.size);
         mapped.flags = row.is_thunk ? 1 : 0;
         mapped.namespace_name = row.namespace_name;
         mapped.signature = row.prototype;
+        mapped.param_count = static_cast<std::int64_t>(row.parameter_count);
         return mapped;
     }
 
@@ -2453,6 +3309,7 @@ private:
         mapped.namespace_name = row.namespace_name;
         mapped.is_primary = row.is_primary ? 1 : 0;
         mapped.is_external = row.is_external ? 1 : 0;
+        mapped.is_external_entry_point = row.is_external_entry_point ? 1 : 0;
         return mapped;
     }
 
@@ -2590,6 +3447,17 @@ private:
         if (normalized == "builtin") {
             return "primitive";
         }
+        // Align Ghidra's kind tokens to the short tokens ghidrasql's derived flag
+        // columns test. The Java side emits "POINTER"/"FUNCTION_DEF"; without these
+        // mappings the kind passed through as "pointer"/"function_def", so
+        // types.is_ptr (tests "ptr") and types.is_func (tests "func"/"function")
+        // could never be 1 for a generic pointer builtin or a FunctionDefinition.
+        if (normalized == "pointer") {
+            return "ptr";
+        }
+        if (normalized == "function_def") {
+            return "func";
+        }
         return normalized.empty() ? "other" : normalized;
     }
 
@@ -2648,6 +3516,19 @@ private:
     mutable std::mutex mu_;
     mutable std::string last_error_;
     mutable std::optional<libghidra::client::OpenProgramResponse> opened_program_;
+    // Program identity observed at the last freshness check; a change means the
+    // host switched programs and opened_program_ must be re-described.
+    mutable std::string last_program_identity_;
+    // Latched once any host-side program switch is observed: from then on the
+    // launch-time options_.program_path describes a *previous* program and must
+    // never be used as a fallback (a stale path next to fresh name/hashes).
+    mutable bool program_identity_switched_ = false;
+    // Per-revision memo for read_function_at (nullopt = negative hit). Cleared
+    // on every local mutation (maybe_auto_save_locked) and whenever the
+    // freshness token observes a new identity/modification number.
+    mutable std::unordered_map<std::int64_t, std::optional<model::FunctionRow>>
+        function_at_memo_;
+    mutable std::uint64_t last_modification_seen_ = 0;
     mutable bool opened_project_ = false;
     mutable libghidra::client::HttpClient client_;
     mutable int mutation_count_ = 0;

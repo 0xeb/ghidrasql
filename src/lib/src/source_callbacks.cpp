@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include <ghidrasql/source.hpp>
 
@@ -65,6 +64,25 @@ public:
         return Source::read_strings_at(address, out);
     }
 
+    bool read_strings_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::StringRow>& out) const override
+    {
+        if (callbacks_.read_strings_in_range) {
+            return callbacks_.read_strings_in_range(start_address, end_address, out);
+        }
+        return Source::read_strings_in_range(start_address, end_address, out);
+    }
+
+    bool read_bytes(std::int64_t address, std::int64_t length,
+                    std::vector<std::uint8_t>& out) const override {
+        if (callbacks_.read_bytes) {
+            return callbacks_.read_bytes(address, length, out);
+        }
+        return Source::read_bytes(address, length, out);
+    }
+
     bool read_xrefs(std::vector<model::XrefRow>& out) const override {
         return read_rows(callbacks_.read_xrefs, out);
     }
@@ -92,6 +110,17 @@ public:
         return Source::read_data_items_at(address, out);
     }
 
+    bool read_data_items_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::DataItemRow>& out) const override
+    {
+        if (callbacks_.read_data_items_in_range) {
+            return callbacks_.read_data_items_in_range(start_address, end_address, out);
+        }
+        return Source::read_data_items_in_range(start_address, end_address, out);
+    }
+
     bool read_blocks(std::vector<model::BlockRow>& out) const override {
         return read_rows(callbacks_.read_blocks, out);
     }
@@ -116,6 +145,36 @@ public:
         return read_rows(callbacks_.read_loops, out);
     }
 
+    bool read_stack_frames(std::vector<model::FunctionFrameRow>& out) const override {
+        return read_rows(callbacks_.read_stack_frames, out);
+    }
+
+    bool read_stack_frames_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::FunctionFrameRow>& out) const override
+    {
+        if (callbacks_.read_stack_frames_in_range) {
+            return callbacks_.read_stack_frames_in_range(start_address, end_address, out);
+        }
+        return Source::read_stack_frames_in_range(start_address, end_address, out);
+    }
+
+    bool read_stack_vars(std::vector<model::StackVarRow>& out) const override {
+        return read_rows(callbacks_.read_stack_vars, out);
+    }
+
+    bool read_stack_vars_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::StackVarRow>& out) const override
+    {
+        if (callbacks_.read_stack_vars_in_range) {
+            return callbacks_.read_stack_vars_in_range(start_address, end_address, out);
+        }
+        return Source::read_stack_vars_in_range(start_address, end_address, out);
+    }
+
     bool read_function_params(std::vector<model::FunctionParamRow>& out) const override {
         return read_rows(callbacks_.read_function_params, out);
     }
@@ -129,6 +188,32 @@ public:
             return callbacks_.read_instruction_at(address, out);
         }
         return Source::read_instruction_at(address, out);
+    }
+
+    bool read_instructions_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::InstructionRow>& out) const override
+    {
+        if (callbacks_.read_instructions_in_range) {
+            return callbacks_.read_instructions_in_range(start_address, end_address, out);
+        }
+        return Source::read_instructions_in_range(start_address, end_address, out);
+    }
+
+    bool read_instruction_operands(std::vector<model::InstructionOperandRow>& out) const override {
+        return read_rows(callbacks_.read_instruction_operands, out);
+    }
+
+    bool read_instruction_operands_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::InstructionOperandRow>& out) const override
+    {
+        if (callbacks_.read_instruction_operands_in_range) {
+            return callbacks_.read_instruction_operands_in_range(start_address, end_address, out);
+        }
+        return Source::read_instruction_operands_in_range(start_address, end_address, out);
     }
 
     bool read_comments(std::vector<model::CommentRow>& out) const override {
@@ -403,6 +488,14 @@ public:
         return call_write(callbacks_.delete_bookmark, address, type, category);
     }
 
+    bool add_perf_benchmark(const model::PerfBenchmarkRow& row) override {
+        return call_write(callbacks_.add_perf_benchmark, row);
+    }
+
+    bool delete_perf_benchmark(const std::string& bench_id) override {
+        return call_write(callbacks_.delete_perf_benchmark, bench_id);
+    }
+
     bool rename_type(const std::string& type_id, const std::string& new_name) override {
         return call_write(callbacks_.rename_type, type_id, new_name);
     }
@@ -550,6 +643,19 @@ public:
 
     bool create_symbol(std::int64_t address, const std::string& name) override {
         return call_write(callbacks_.create_symbol, address, name);
+    }
+
+    bool create_memory_block(std::int64_t start_address, std::int64_t end_address,
+                             const std::string& name, int perm, bool initialized) override {
+        return call_write(callbacks_.create_memory_block, start_address, end_address, name, perm, initialized);
+    }
+
+    bool remove_memory_block(std::int64_t address) override {
+        return call_write(callbacks_.remove_memory_block, address);
+    }
+
+    bool move_memory_block(std::int64_t address, std::int64_t new_start_address) override {
+        return call_write(callbacks_.move_memory_block, address, new_start_address);
     }
 
     bool create_data_item(std::int64_t address, const std::string& data_type, const std::string& name) override {

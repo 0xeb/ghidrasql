@@ -1,14 +1,14 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
 #include <xsql/database.hpp>
 #include <xsql/json.hpp>
+#include <xsql/query_script.hpp>
 #include <xsql/thinclient/http_query_server.hpp>
 
 #include <atomic>
@@ -61,6 +61,13 @@ public:
         const std::string& script,
         std::vector<QueryResult>& results,
         std::string& error);
+    // Canonical multi-statement path for HTTP /query and MCP: runs the whole
+    // script under one batch with execute_script()'s read-only/revision/cache-
+    // refresh semantics (no stale reads after a mid-script mutation) while
+    // honoring ScriptOptions and returning the canonical envelope.
+    xsql::ScriptResult run_script(
+        const std::string& script,
+        const xsql::ScriptOptions& options = {});
     std::string scalar(const std::string& sql);
     std::vector<std::string> list_tables();
     std::string schema_for(const std::string& table);
@@ -117,19 +124,22 @@ CommandResult handle_command(
 
 xsql::json query_result_to_json(const QueryResult& result);
 
-// Wraps the per-statement results from QueryEngine::execute_script into the
-// /query HTTP response shape:
+// Canonical script envelope used by every entry point (HTTP /query, CLI -q,
+// MCP query tool). Single statement = array of one entry. See
+// xsql::script_result_to_json() for the on-the-wire JSON shape:
+//   { success, statement_count, results:[
+//       { statement_index, success, columns, rows, row_count, elapsed_ms, error }
+//     ], row_count_total, elapsed_ms_total, first_error_index, parse_error? }
 //
-//   {
-//     "success": ok,
-//     "statement_count": <N>,
-//     "row_count_total": <N>,
-//     "results": [ <query_result_to_json>, ... ],
-//     "error": "<message>"      // present iff ok == false
-//   }
-//
-// The /query endpoint always emits this shape — single-statement bodies still
-// land here with statement_count == 1.
+// Fail-fast is the default; ScriptOptions::continue_on_error executes every
+// statement regardless of earlier failures.
+xsql::ScriptResult run_script(QueryEngine& engine,
+                              const std::string& sql,
+                              const xsql::ScriptOptions& options = {});
+
+// Legacy wrapper around the canonical envelope kept for transitional callers
+// that already hold a vector<QueryResult> from QueryEngine::execute_script.
+// Emits the same xsql::script_result_to_json shape.
 xsql::json script_results_to_json(
     const std::vector<QueryResult>& results,
     bool ok,
@@ -163,12 +173,29 @@ public:
         kForceKilled = 4,
     };
 
-    // Single-statement executor: runs one SQL statement and fills `out`.
-    // The thinclient owns multi-statement orchestration + output formatting.
-    using QueryFn = std::function<void(const std::string& sql,
-                                       xsql::ScriptStatementResult& out)>;
+    // Legacy callback: takes a SQL script and returns a JSON-string envelope.
+    // Owns its own ScriptOptions, so it cannot honor request-supplied
+    // continue_on_error / include_sql. Retained for callers/tests that don't
+    // need server-side option parsing.
+    using QueryFn = std::function<std::string(const std::string&)>;
+    // Preferred callback: receives the raw script plus the options the HTTP
+    // server parsed from the request (continue_on_error / include_sql) and runs
+    // it through the engine's batch path (engine.run_script), returning the
+    // canonical envelope. The server owns option parsing and output formatting.
+    using ScriptFn =
+        std::function<xsql::ScriptResult(const std::string&, const xsql::ScriptOptions&)>;
     using InfoFn = std::function<std::string()>;
     using RefreshFn = std::function<bool()>;
+    using ProjectBodyFn = std::function<std::string(const std::string&)>;
+    using ProjectInfoFn = std::function<std::string()>;
+
+    struct ProjectControlFns {
+        ProjectInfoFn list_programs;
+        ProjectInfoFn active_program;
+        ProjectBodyFn import_program;
+        ProjectBodyFn open_program;
+        ProjectBodyFn close_program;
+    };
 
     HttpServer() = default;
     ~HttpServer();
@@ -178,7 +205,22 @@ public:
     HttpServer(HttpServer&&) = delete;
     HttpServer& operator=(HttpServer&&) = delete;
 
-    int start(QueryFn query_fn, InfoFn info_fn, Options options = {}, RefreshFn refresh_fn = {});
+    // Preferred: the server parses request options and hands the whole script
+    // to script_fn (engine.run_script). Honors continue_on_error / include_sql.
+    int start(
+        ScriptFn script_fn,
+        InfoFn info_fn,
+        Options options = {},
+        RefreshFn refresh_fn = {},
+        ProjectControlFns project_fns = {});
+    // Legacy overload: wires the JSON-string callback directly (no server-side
+    // option parsing). Overload resolution selects this for 1-arg callbacks.
+    int start(
+        QueryFn query_fn,
+        InfoFn info_fn,
+        Options options = {},
+        RefreshFn refresh_fn = {},
+        ProjectControlFns project_fns = {});
     void stop();
     bool is_running() const;
     int port() const;
@@ -190,9 +232,23 @@ public:
     void set_shutdown_phase(ShutdownPhase phase);
 
 private:
+    // Populate the shared server config (tool/help/bind/auth, status_fn, extra
+    // routes) and stash the per-server callbacks. Both start() overloads call
+    // this, then set their own executor, then launch().
+    void configure_common(
+        xsql::thinclient::http_query_server_config& cfg,
+        InfoFn info_fn,
+        Options options,
+        RefreshFn refresh_fn,
+        ProjectControlFns project_fns);
+    // Construct and start the underlying server from a fully-populated config.
+    // Returns the bound port, or 0 on failure.
+    int launch(xsql::thinclient::http_query_server_config cfg);
+
     std::unique_ptr<xsql::thinclient::http_query_server> server_;
     InfoFn info_fn_;
     RefreshFn refresh_fn_;
+    ProjectControlFns project_fns_;
     Options options_;
 
     // Worker state for /health/deep. The wrapper installed by start()

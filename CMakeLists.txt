@@ -1,5 +1,11 @@
-cmake_minimum_required(VERSION 3.20)
-project(ghidrasql VERSION 0.0.2 LANGUAGES C CXX)
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
+cmake_minimum_required(VERSION 3.26)
+project(ghidrasql VERSION 0.0.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +18,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 option(GHIDRASQL_WITH_LIBGHIDRA "Build ghidrasql with libghidra C++ source adapters" ON)
+option(GHIDRASQL_WITH_MCP "Build ghidrasql with MCP server support (fastmcpp)" ON)
 option(GHIDRASQL_STATIC_MSVC_RUNTIME
     "Use the static MSVC runtime for non-Debug builds"
     ${MSVC})
@@ -63,9 +70,11 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
     message(STATUS "ghidrasql: Added libxsql from ghidrasql/external/libxsql")
 else()
     message(STATUS "ghidrasql: Fetching libxsql from GitHub (shallow clone)...")
+    # libxsql is a first-party dep we own — track main so ghidrasql builds
+    # against the latest (only third-party deps like cpp-httplib are pinned).
     FetchContent_Declare(libxsql
         GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        v1.0.10
+        GIT_TAG        main
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libxsql)
@@ -74,6 +83,45 @@ endif()
 if(NOT GHIDRASQL_WITH_LIBGHIDRA)
     message(FATAL_ERROR
         "ghidrasql is API-host-only: GHIDRASQL_WITH_LIBGHIDRA must be ON")
+endif()
+
+# ============================================================================
+# MCP Support (optional)
+# ============================================================================
+if(GHIDRASQL_WITH_MCP)
+    message(STATUS "ghidrasql: Building with MCP support via fastmcpp")
+
+    if(NOT TARGET fastmcpp_core)
+        set(FASTMCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_ENABLE_POST_STREAMING OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_ENABLE_SAMPLING_HTTP_HANDLERS OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_FETCH_CURL OFF CACHE BOOL "" FORCE)
+
+        message(STATUS "ghidrasql: Fetching fastmcpp from GitHub (tracking main)...")
+        # Track the branch tip of fastmcpp — a FIRST-PARTY dependency we own and
+        # maintain — so every libxsql consumer (ghidrasql/idasql/r2sql/bnsql) builds
+        # against the latest fixes. (Only third-party deps like cpp-httplib are
+        # pinned to a fixed tag.) GIT_SHALLOW keeps the clone cheap;
+        # FETCHCONTENT_UPDATES_DISCONNECTED must stay OFF (the default) for the tip
+        # to actually refresh on reconfigure.
+        FetchContent_Declare(fastmcpp
+            GIT_REPOSITORY https://github.com/0xeb/fastmcpp.git
+            GIT_TAG        main
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(fastmcpp)
+    endif()
+
+    if(MSVC AND TARGET fastmcpp_core)
+        target_compile_options(fastmcpp_core PRIVATE /MP)
+    endif()
+
+    # fastmcpp_core is a static library that gets linked into the ghidrasql
+    # CLI / plugin (shared lib on Linux). Enable PIC so the link succeeds.
+    if(TARGET fastmcpp_core)
+        set_property(TARGET fastmcpp_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+    endif()
 endif()
 
 if(GHIDRASQL_WITH_LIBGHIDRA AND NOT TARGET libghidra::client)

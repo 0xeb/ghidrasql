@@ -18,7 +18,7 @@ once the server is up: see `prompts/ghidrasql_agent.md`.
 | CMake ≥ 3.20 | `cmake --version` | major.minor ≥ 3.20 | Install from <https://cmake.org/download/> |
 | C++20 compiler | `cl /?` (Win) or `g++ --version` / `clang++ --version` | any 2022+ MSVC, GCC 12+, or Clang 15+ | Install Visual Studio 2022, or `apt install build-essential` / `xcode-select --install` |
 | Git | `git --version` | any modern | <https://git-scm.com/downloads> |
-| Gradle ≥ 8 | `gradle --version` | major ≥ 8 | <https://gradle.org/install/> (or rely on the wrapper if the libghidra repo provides one) |
+| Gradle ≥ 8.5 | `gradle --version` | ≥ 8.5 | Install from <https://gradle.org/install/> (**winget has no Gradle package** — do not try `winget install gradle`), or use the `gradlew` wrapper bundled in your Ghidra source checkout at `Ghidra/RuntimeScripts/support/gradle`. Gradle 9.x is verified for the distribution-based `installExtension` path documented here; if you instead build the extension inside a Ghidra **source** tree and hit a `:Doclets` project-not-found error under 9.x, drop to Gradle 8.14 for that build. |
 | Python ≥ 3.10 | `python --version` | major.minor ≥ 3.10 | <https://www.python.org/downloads/> |
 
 **Environment note**: if `GHIDRA_INSTALL_DIR` is already set in your
@@ -39,7 +39,10 @@ Download Ghidra 12.1+ from the official release page:
 Pick a release with a published SHA-256. Verify after download:
 
 ```bash
-sha256sum ghidra_*_PUBLIC.zip   # compare to release-page hash
+sha256sum ghidra_*_PUBLIC.zip   # Linux/macOS — compare to release-page hash
+```
+```powershell
+Get-FileHash -Algorithm SHA256 ghidra_*_PUBLIC.zip   # Windows (PowerShell; no sha256sum)
 ```
 
 Extract to a stable location and set `GHIDRA_INSTALL_DIR`:
@@ -98,6 +101,19 @@ If the gate fails: try `gradle clean buildExtension`, then copy the
 produced `.zip` from `dist/` into `$GHIDRA_INSTALL_DIR/Extensions/Ghidra/`.
 Ghidra unpacks it on next launch.
 
+**Troubleshooting `error: cannot find symbol`** (`getMessageType(int)`,
+`getValue(int)`, or a `validateProtobufGencodeVersion` runtime failure):
+the committed generated stubs were overwritten by an incompatible
+`protoc`. Fix:
+1. Run `git status` inside the `libghidra` checkout — if
+   `ghidra-extension/src/main/generated/` is modified, restore it:
+   `git checkout -- ghidra-extension/src/main/generated`
+   (or regenerate correctly with `-PREGEN_PROTO=true` and protoc 29.3;
+   see the libghidra install notes for details).
+2. Delete any stale `protobuf-java-*.jar`s from
+   `$GHIDRA_INSTALL_DIR/Ghidra/Extensions/LibGhidraHost/lib/`.
+3. Re-run `gradle installExtension`.
+
 ---
 
 ## Step 4 — Build ghidrasql
@@ -115,12 +131,6 @@ cmake --build build --config Release
 cd ghidrasql
 cmake -B build -DGHIDRASQL_LIBGHIDRA_DIR=../libghidra/cpp \
       -DCMAKE_BUILD_TYPE=Release
-# Memory-constrained machines: do NOT use a bare `-j`.
-# A bare `-j` runs one compiler per core; each C++ unit
-# here can use ~1.75 GB, so 8x at once needs ~14 GB and OOM-crashes an 8 GB machine. Cap the job count so peak RAM ≈ jobs x 1.75 GB:
-#   - 8 GB RAM  -> -j 2  (~3.5 GB)
-#   - 16 GB RAM -> -j 4  (~7 GB)
-# Rule of thumb: jobs = floor((free_RAM_GB - 2) / 2).
 cmake --build build -j
 ```
 
@@ -202,9 +212,11 @@ until [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/health)"
 done
 ```
 
-**`--max-runtime 0` disables the auto-exit timer.** If you set a
-positive value, the server prints `LIBGHIDRA_HEADLESS_MAX_RUNTIME_REACHED`
-and exits when it elapses.
+**`--http` serve mode defaults to `--max-runtime 0` (no auto-exit timer)** —
+it runs until you stop it (Ctrl-C or `POST /shutdown`), so the `--max-runtime 0`
+above is now redundant but harmless. If you set a positive value, the server
+prints `LIBGHIDRA_HEADLESS_MAX_RUNTIME_REACHED` and exits when it elapses.
+One-shot runs (`-q`/`-f`/`-i`) still default to a 600s safety cap.
 
 ---
 
@@ -213,7 +225,7 @@ and exits when it elapses.
 ```bash
 # Program metadata
 curl -s -X POST http://127.0.0.1:8081/query \
-  --data "SELECT * FROM db_info;"
+  --data "SELECT * FROM binary;"
 
 # Function count
 curl -s -X POST http://127.0.0.1:8081/query \
@@ -221,11 +233,11 @@ curl -s -X POST http://127.0.0.1:8081/query \
 
 # A few function names (sanity check)
 curl -s -X POST http://127.0.0.1:8081/query \
-  --data "SELECT name, printf('0x%X', address) AS addr FROM funcs ORDER BY size DESC LIMIT 5;"
+  --data "SELECT name, printf('0x%X', addr) AS addr FROM funcs ORDER BY size DESC LIMIT 5;"
 ```
 
 **Gate**:
-- `db_info` returns one row with non-empty `language_id` (e.g.
+- `binary` returns one row with non-empty `language_id` (e.g.
   `x86:LE:64:default`) and a numeric `revision`.
 - `funcs` count > 0.
 - The third query returns 5 rows with `name` and `addr`.
@@ -263,6 +275,12 @@ ls /tmp/ghidrasql-bootstrap   # expect: only boot.gpr and boot.rep/
 **Gate**: process list contains neither `java` nor `ghidrasql`, and
 the project directory contains only `<name>.gpr` and `<name>.rep/` —
 no `*.lock` / `*.lock~` files.
+
+> **False-positive note**: the Java process check can match an unrelated
+> Java process — in particular a lingering Gradle build daemon. Verify
+> the PID/command line belongs to the Ghidra host before concluding the
+> shutdown failed. Run `gradle --stop` to terminate a stray Gradle
+> daemon if one is present.
 
 ---
 
@@ -305,3 +323,8 @@ recognizes the symptoms.
   query decompiles every function in the binary and can hang the
   server under load. The skills bundle enforces this rule across
   every analysis recipe.
+- **`--project` must be an absolute path with no leading-dot element.**
+  Ghidra's headless launcher rejects a relative path like `./proj` with
+  *"Path element starting with '.' is not permitted"* (from
+  `NamingUtilities.checkName`). Always pass an absolute directory (the
+  runbook uses `/tmp/ghidrasql-bootstrap`); `mkdir -p` it first.

@@ -49,7 +49,7 @@ For the current alpha, the most reliable path is:
 - [Ghidra](https://ghidra-sre.org/) distribution (12.1+) and JDK 21
 - [libghidra](https://github.com/0xeb/libghidra) -- provides the `LibGhidraHost` extension and C++ SDK
 - C++20 compiler (Visual Studio 2022, GCC 12+, or Clang 15+)
-- CMake 3.20+
+- CMake 3.26+
 - Gradle (for building the Ghidra extension)
 
 ### 1. Clone both repos
@@ -103,10 +103,14 @@ Output: `build/bin/Release/ghidrasql.exe`
 ghidrasql --ghidra /path/to/ghidra_dist \
   --binary target.exe \
   --project ./projects --project-name demo \
-  -q "SELECT name, address, size FROM funcs ORDER BY size DESC LIMIT 10"
+  -q "SELECT name, addr, size FROM funcs ORDER BY size DESC LIMIT 10"
 ```
 
 This imports the binary, runs full Ghidra analysis, executes your query, saves the project, and shuts down. First run takes a few minutes (analysis); subsequent runs with the same `--project` reuse the existing analysis.
+
+> **Input file**: `--binary <path>` accepts a raw binary (`.exe`/`.dll`/firmware/etc.) and runs Ghidra's headless importer on it. You do **not** need to pre-build a Ghidra project — `ghidrasql --binary raw.exe --project ./proj ...` creates the project and imports the program in one shot. To reopen an already-imported program in an existing project, use `--program <name>` instead of `--binary <path>`.
+>
+> **Library loading**: imports **skip loading external system libraries by default** (kernel32, CRT, …) so imports stay fast. Imports referenced by name still resolve; only imports-by-*ordinal* show as ordinals rather than names. Pass **`--load-libraries`** to load and link them (slower, and pulls the libraries into the project).
 
 ## Quick Start Examples
 
@@ -114,7 +118,7 @@ This imports the binary, runs full Ghidra analysis, executes your query, saves t
 # One-shot query (headless: import, analyze, query, shutdown)
 ghidrasql --ghidra /path/to/ghidra_dist \
   --binary target.exe --project ./proj --project-name demo \
-  -q "SELECT name, address FROM funcs LIMIT 10"
+  -q "SELECT name, addr FROM funcs LIMIT 10"
 
 # Interactive REPL
 ghidrasql --ghidra /path/to/ghidra_dist \
@@ -130,23 +134,23 @@ ghidrasql --url http://127.0.0.1:18080 -i
 # Start an HTTP API server for programmatic access
 ghidrasql --ghidra /path/to/ghidra_dist \
   --binary target.exe --project ./proj --project-name demo \
-  --serve --port 8081
+  --http --port 8081
 
 # Then query it: curl -X POST http://localhost:8081/query -d "SELECT * FROM funcs LIMIT 5"
 
-# Output format for terminals/pipes (default is JSON; agents should consume JSON):
-#   curl -X POST "http://localhost:8081/query?format=text" -d "SELECT name,size FROM funcs LIMIT 5"
-#   format=json (default) | text (ASCII table) | csv | tsv
+# Managed HTTP sessions can import/list/open project programs without restart
+curl http://localhost:8081/project/programs
+curl -X POST http://localhost:8081/project/open --json '{"program_path":"/target.exe"}'
 ```
 
 ## Example Queries
 
 ```sql
 -- Functions sorted by size
-SELECT name, address, size FROM funcs ORDER BY size DESC LIMIT 20;
+SELECT name, addr, size FROM funcs ORDER BY size DESC LIMIT 20;
 
 -- Cross-references to an address
-SELECT * FROM xrefs WHERE to_ea = 0x401000;
+SELECT * FROM xrefs WHERE to_addr = 0x401000;
 
 -- String references
 SELECT * FROM string_refs WHERE string_value LIKE '%password%';
@@ -163,13 +167,13 @@ FROM types t JOIN type_members m ON t.name = m.type_name
 WHERE t.kind = 'struct';
 
 -- Memory hexdump
-SELECT * FROM memory_hexdump WHERE address >= 0x401000 LIMIT 16;
+SELECT * FROM memory_hexdump WHERE addr >= 0x401000 LIMIT 16;
 
 -- Rename a function (write-through to Ghidra)
-UPDATE funcs SET name = 'my_main' WHERE address = 0x401000;
+UPDATE funcs SET name = 'my_main' WHERE addr = 0x401000;
 
 -- Rewrite a function signature
-UPDATE funcs SET signature = 'int main(int argc, char** argv)' WHERE address = 0x401000;
+UPDATE funcs SET prototype = 'int main(int argc, char** argv)' WHERE addr = 0x401000;
 
 -- Save changes to the Ghidra project
 SELECT save_database();
@@ -191,18 +195,19 @@ SELECT save_database();
 | `-q, --query <sql>` | Execute query and exit |
 | `-f, --file <path>` | Execute SQL script and exit |
 | `-i, --interactive` | Interactive REPL (default when no action) |
-| `--serve` | Start HTTP API server |
+| `--http`, `--serve` | Start HTTP API server |
 
 ### Program/project
 
 | Flag | Description |
 |------|-------------|
-| `--binary <path>` | Binary to import (headless only) |
-| `--program <name>` | Existing program in project |
+| `--binary <path>` | Raw binary (`.exe`/`.dll`/firmware/etc.) to import via headless analysis; repeatable for multi-binary projects. Imports skip external system libraries by default (see `--load-libraries`) |
+| `--program <name>` | Existing program inside the project — use to reopen what was already imported; for fresh imports use `--binary` |
 | `--project <dir>` | Project directory |
 | `--project-name <name>` | Project name |
 | `--analyze` | Run analysis (default in headless) |
 | `--no-analyze` | Skip analysis |
+| `--load-libraries` | Load/link external system libraries during `--binary` import (ordinal→name resolution). Off by default — slower, and pulls kernel32/CRT into the project |
 | `--readonly` | Read-only session |
 
 ### Server/network
@@ -219,7 +224,7 @@ SELECT save_database();
 |------|-------------|
 | `--shutdown <mode>` | save\|discard\|none (default: save; discard when --readonly) |
 | `--keep-host` | Don't auto-shutdown after query |
-| `--max-runtime <sec>` | Host lifetime bound (default: 600, 0=disable) |
+| `--max-runtime <sec>` | Host lifetime bound (0=disable; default: 0 for `--http` serve mode, 600 for one-shot `-q`/`-f`/`-i`) |
 | `--fresh` | Delete existing project first |
 | `--auto-save <n>` | Save every N mutations (0=disabled) |
 
@@ -239,24 +244,24 @@ SELECT save_database();
 
 ## SQL Surface
 
-57 tables and 77 views covering every aspect of a Ghidra program database.
+65 public tables and 81 views covering every aspect of a Ghidra program database.
 
 ### Tables
 
 | Category | Tables |
 |----------|--------|
 | **Functions** | `funcs`, `function_params`, `function_locals`, `function_frames`, `function_chunks`, `function_metrics`, `stack_vars`, `register_vars`, `tail_calls` |
-| **Code** | `instructions`, `blocks`, `cfg_edges`, `loops`, `switch_tables`, `dominators`, `post_dominators` |
+| **Code** | `instructions`, `instruction_operands`, `blocks`, `cfg_edges`, `loops`, `switch_tables`, `dominators`, `post_dominators` |
 | **References** | `xrefs`, `call_edges`, `function_calls`, `xref_index` |
-| **Symbols** | `names`, `imports`, `exports`, `strings`, `equates`, `constants` |
-| **Memory** | `segments`, `memory_blocks`, `memory_bytes` |
+| **Symbols** | `names`, `imports`, `entries`, `strings`, `equates`, `constants` |
+| **Memory** | `segments`, `memory_blocks`, `bytes`, `byte_search` |
 | **Types** | `types`, `type_members`, `type_enums`, `type_enum_members`, `type_unions`, `type_aliases`, `signatures` |
-| **Decompiler** | `pseudocode`, `decomp_lvars`, `decomp_tokens`, `decomp_comments` |
+| **Decompiler** | `pseudocode`, `decomp_lvars`, `decomp_tokens`, `decomp_comments`, `pcode_ops`, `pcode_varnodes` |
 | **Comments** | `comments` |
 | **Data** | `data_items`, `relocations` |
 | **Search** | `text_index`, `search_index` |
 | **Program** | `program_options`, `analysis_passes`, `transactions`, `project_properties`, `breakpoints` |
-| **Meta** | `sql_capabilities`, `parity_findings`, `perf_benchmarks`, `live_meta`, `db_info` |
+| **Meta** | `sql_capabilities`, `parity_findings`, `perf_benchmarks`, `live_meta`, `binary` |
 
 ### Selected Views
 
@@ -267,7 +272,7 @@ SELECT save_database();
 | **References** | `string_refs`, `string_hotspots`, `xref_paths` |
 | **Memory** | `memory_hexdump`, `memory_layout` |
 | **Types** | `types_v_structs`, `types_v_unions`, `types_v_enums`, `types_v_typedefs`, `type_layout` |
-| **Decompiler** | `decompiler_listing`, `ctree`, `ctree_v_calls`, `ctree_v_loops`, `ctree_v_ifs` |
+| **Decompiler** | `decompiler_listing`, `ctree`, `ctree_v_calls`, `ctree_v_loops`, `ctree_v_ifs`, `ir_ops`, `ir_operands`, `ir_maturities`, `ir_v_*` |
 
 Use `.tables` in the REPL to see the full list, or `SELECT name FROM sqlite_master ORDER BY name`.
 
@@ -276,11 +281,11 @@ Use `.tables` in the REPL to see the full list, or `SELECT name FROM sqlite_mast
 Write-through mutations are supported:
 
 ```sql
-UPDATE funcs SET name = 'new_name' WHERE address = 0x401000;
-UPDATE comments SET comment = 'note' WHERE address = 0x401000;
-DELETE FROM comments WHERE address = 0x401000;
+UPDATE funcs SET name = 'new_name' WHERE addr = 0x401000;
+UPDATE comments SET comment = 'note' WHERE addr = 0x401000;
+DELETE FROM comments WHERE addr = 0x401000;
 UPDATE signatures SET prototype = 'int foo(int a, int b)' WHERE entry_point = 0x401000;
-UPDATE data_items SET data_type = 'int' WHERE address = 0x402000;
+UPDATE data_items SET data_type = 'int' WHERE addr = 0x402000;
 SELECT save_database();
 ```
 
@@ -310,13 +315,18 @@ ghidrasql
                                                     Ghidra JVM
 ```
 
+## Request/response notes
+
+- `POST /query` accepts **raw SQL** in the request body, or a JSON object
+  `{"sql": "...", "continue_on_error": true, "include_sql": true}`. With
+  `Content-Type: application/json` the body must be valid JSON with a string
+  `sql` (a malformed or `sql`-less declared-JSON body returns `400`); a body sent
+  without that content type is treated as raw SQL.
+
 ## Known Limitations
 
-- `POST /query` expects raw SQL in the request body, not JSON.
 - For decompiler-backed locals, treat `local_id` as an opaque canonical identifier from the source;
   do not assume it will look like `local_8` or `param_1`.
-- The main alpha release gate is the headless private suite plus manual live-host smoke, not the older
-  external-host fixture workflow tests.
 
 ### Embedding
 
@@ -375,6 +385,36 @@ instead.
 - **Headless host never ready** -- check that port 18080 isn't in use by another process
 - **Port collision in headless+serve** -- the internal API port (18080) must differ from the ghidrasql HTTP port (default 8081); use `--port` to adjust
 
-## License
+## The xsql family
 
-This project is licensed under the [Mozilla Public License 2.0](LICENSE).
+ghidrasql is part of a family of tools that expose different binary-analysis and
+debug-information platforms through the **same** SQL surface, all built on the
+shared [libxsql](https://github.com/0xeb/libxsql) virtual-table framework. A
+query you learn against one tool largely carries over to the others.
+
+**Reverse-engineering platforms**
+- **[idasql](https://github.com/allthingsida/idasql)** — IDA Pro databases as SQL.
+- **[bnsql](https://github.com/0xeb/bnsql)** — Binary Ninja databases as SQL.
+
+**Debug info & compiler data**
+- **[pdbsql](https://github.com/0xeb/pdbsql)** — Windows PDB symbol files as SQL.
+- **[dwarfsql](https://github.com/0xeb/dwarfsql)** — DWARF debug information as SQL.
+- **[clangsql](https://github.com/0xeb/clangsql)** — Clang AST as SQL.
+
+**Core**
+- **[libxsql](https://github.com/0xeb/libxsql)** — the C++ SQLite virtual-table
+  framework every tool above is built on.
+
+## License and Terms of Use
+
+In short: you may read, build, evaluate, benchmark, package, and use unmodified ghidrasql, including commercially, if you preserve notices and follow the license terms. You may fork or patch it to prepare bug fixes, optimizations, features, tests, or documentation improvements for contribution back within the license's contribution-purpose rules.
+
+You may not maintain a divergent private fork, port, rebrand, clone, API-compatible replacement, competing implementation, or use ghidrasql as AI input to recreate or improve a derivative implementation without prior written permission from Elias Bachaalany. Independent implementations that are not copied from, materially derived from, or substantially informed by ghidrasql in the license's defined sense are not prohibited.
+
+Permission requests: open a GitHub issue at [0xeb/ghidrasql/issues](https://github.com/0xeb/ghidrasql/issues).
+
+If ghidrasql materially informs a distributed project, preserve the human origin: credit ghidrasql and Elias Bachaalany visibly in your README/docs and in About/credits UI when applicable. The license includes an examples/FAQ section for common allowed and permission-required uses. Third-party dependencies (libxsql, libghidra, and their transitive dependencies) remain under their own licenses.
+
+See the full [Human-Origin Source License v1.0](LICENSE).
+
+Releases up to v0.0.2 remain under the MPL-2.0 they shipped with.

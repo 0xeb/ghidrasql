@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -29,6 +28,19 @@ struct ProgramInfoRow {
     std::int64_t image_base = 0;
     int is_headless = 1;
     std::int64_t revision = 0;
+    // Executable container format from the loader (empty when unreported).
+    std::string executable_format;
+    // Entry point; valid only when has_entry_point (0 is a valid address).
+    std::int64_t entry_point = 0;
+    bool has_entry_point = false;
+};
+
+// One `binary` table fact: the canonical key/value/type row shape shared
+// across the tool family (idasql/bnsql/ghidrasql/r2sql).
+struct BinaryFactRow {
+    std::string key;
+    std::string value;
+    std::string type;  // "string", "hex", "bool", "int"
 };
 
 struct ProjectFileRow {
@@ -49,6 +61,9 @@ struct FunctionRow {
     std::int64_t flags = 0;
     std::string namespace_name;
     std::string signature;
+    // Ghidra's authoritative Function.getParameterCount() (excludes the varargs
+    // "..."). funcs.arg_count reads this instead of splitting the prototype string.
+    std::int64_t param_count = 0;
 };
 
 struct SegmentRow {
@@ -71,10 +86,18 @@ struct MemoryBlockRow {
     int is_read = 0;
     int is_write = 0;
     int is_exec = 0;
+    // 1 = the block carries initialized (readable) bytes; 0 = uninitialized
+    // (.bss / freshly created). Drives the memory_bytes derivation: initialized
+    // blocks are read via paged read_bytes, uninitialized ones emit NULL-value
+    // rows from this metadata alone.
+    int is_initialized = 1;
 };
 
 struct MemoryByteRow {
     std::int64_t address = 0;
+    // Byte value 0-255. Meaningful only when is_initialized == 1; for an
+    // uninitialized byte the SQL `value` column reports NULL (the "byte is
+    // unknown" state, distinct from an initialized byte that happens to be 0).
     int value = 0;
     std::string segment_name;
     std::int64_t func_addr = 0;
@@ -83,6 +106,10 @@ struct MemoryByteRow {
     std::int64_t item_offset = 0;
     int is_printable = 0;
     std::string ascii;
+    // 1 = the byte is a mapped, initialized byte with a known value; 0 = the byte
+    // is mapped but uninitialized (e.g. a .bss/created block) — `value` is NULL,
+    // is_printable is 0 and `ascii` is empty. Named like data_items.is_initialized.
+    int is_initialized = 1;
 };
 
 struct SymbolRow {
@@ -92,6 +119,10 @@ struct SymbolRow {
     std::string namespace_name;
     int is_primary = 1;
     int is_external = 0;
+    // Ghidra Symbol.isExternalEntryPoint(): true for program entry/export
+    // symbols. Source metadata for deriving `entries`, not a public `names`
+    // column.
+    int is_external_entry_point = 0;
 };
 
 struct ImportRow {
@@ -153,6 +184,19 @@ struct InstructionRow {
     std::string disasm;
     int size = 0;
     std::string bytes;
+    // Start address of the containing function (canonical `func_addr`), or 0 when
+    // the instruction falls outside any known function body. Derived in C++ by
+    // range-mapping `address` against the function set (see assign_instruction_func_addrs).
+    std::int64_t func_addr = 0;
+};
+
+struct InstructionOperandRow {
+    std::int64_t address = 0;    // instruction address (canonical `addr`)
+    std::int64_t func_addr = 0;  // containing function, derived in C++ by range-mapping `address`
+    int operand_index = 0;       // 0-based operand position
+    std::string text;            // rendered per-operand representation
+    std::string type_name;       // register / immediate / memory / address / ...
+    std::string ref_type;        // RefType (READ / WRITE / READ_WRITE / DATA / ...)
 };
 
 struct CommentRow {
@@ -353,7 +397,14 @@ struct FunctionFrameRow {
     std::int64_t local_size = 0;
     std::int64_t saved_reg_size = 0;
     std::string stack_base_reg;
-    int has_frame_pointer = 0;
+    // Tri-state: 1 = has FP, 0 = no FP, -1 = unknown (surfaced as SQL NULL).
+    int has_frame_pointer = -1;
+    // When false, saved_reg_size is unknown and surfaces as SQL NULL. An empty
+    // stack_base_reg likewise surfaces as NULL. The decompiler-free listing-layer
+    // read (read_stack_frames) fills frame_size/local_size/arg_size honestly but
+    // leaves saved_reg_size unknown; the decompiler fallback also leaves these
+    // unknown rather than fabricating 16/"rbp"/1.
+    bool saved_reg_size_known = false;
 };
 
 struct TextIndexRow {
@@ -450,6 +501,42 @@ struct PseudocodeRow {
     int is_stale = 0;
 };
 
+// One high-P-code (SSA) op — the Ghidra leg of the cross-tool low-level IR. `op` is the
+// raw PcodeOp mnemonic (COPY, INT_ADD, MULTIEQUAL, ...); the canonical op naming happens
+// in the unified ir_ops. Per-function (filter by func_addr).
+// P-code maturity rung (engine-agnostic; the libghidra source maps it to the RPC enum).
+enum class PcodeMaturity { High, Raw };
+
+struct PcodeOpRow {
+    std::int64_t func_addr = 0;
+    int seq = 0;
+    std::int64_t addr = 0;      // source machine address (valid when has_addr != 0)
+    int has_addr = 0;
+    std::string op;
+    int has_output = 0;
+    std::string output_kind;    // canonical operand kind (empty when no output)
+    int output_size = 0;
+    int input_count = 0;
+    int is_ssa = 1;             // 1 for high (SSA) p-code, 0 for raw
+    std::string maturity;       // returned rung: "high" | "raw"
+    std::string stage;          // canonical stage: "ssa" (high) | "raw"
+};
+
+// One row per P-code VALUE operand (varnode) — output + inputs of every op. The
+// canonical `kind` (reg/imm/mem/result/var) arrives already-modeled from the GetPcode RPC.
+struct PcodeVarnodeRow {
+    std::int64_t func_addr = 0;
+    int op_seq = 0;             // owning op's seq (joins pcode_ops.seq)
+    int operand_index = 0;      // varnode order within the op (output first, then inputs)
+    std::string role;           // "out" (output varnode) | "in" (input varnode)
+    std::string kind;           // reg | imm | mem | result | var
+    std::string space;          // address space (register / const / ram / unique / stack)
+    std::int64_t offset = 0;
+    int size = 0;
+    std::string maturity;
+    std::string stage;
+};
+
 struct DecompLvarRow {
     std::int64_t func_addr = 0;
     std::string local_id;
@@ -457,6 +544,7 @@ struct DecompLvarRow {
     std::string type;
     std::string storage;
     std::string role;
+    std::string func_name;
 };
 
 struct DecompTokenRow {
@@ -617,21 +705,49 @@ struct SourceCallbacks {
     std::function<bool(std::vector<model::ExportRow>&)> read_exports;
     std::function<bool(std::vector<model::StringRow>&)> read_strings;
     std::function<bool(std::int64_t, std::vector<model::StringRow>&)> read_strings_at;
+    // Windowed string read: (start_address, end_address, out). end_address is
+    // INCLUSIVE (matching read_comments_in_range); returns every string whose
+    // covered byte span intersects [start_address, end_address]. Optional; when
+    // unset the callback source falls back to the base filter-the-bulk-read
+    // default. Used by the streaming memory_bytes derivation.
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::StringRow>&)> read_strings_in_range;
+    // Raw memory bytes at [address, address+length). Optional; when unset the
+    // callback source falls back to the base (unsupported) behavior. The
+    // memory_bytes derivation uses it to materialize initialized data / filler
+    // bytes and to read string bytes exactly. Must return false for
+    // unmapped/uninitialized ranges (so uninitialized bytes stay NULL-valued).
+    std::function<bool(std::int64_t, std::int64_t, std::vector<std::uint8_t>&)> read_bytes;
     std::function<bool(std::vector<model::XrefRow>&)> read_xrefs;
     std::function<bool(std::vector<model::FunctionCallRow>&)> read_function_calls;
     std::function<bool(std::vector<model::CallEdgeRow>&)> read_call_edges;
     std::function<bool(std::vector<model::MemoryBlockRow>&)> read_memory_blocks;
     std::function<bool(std::vector<model::DataItemRow>&)> read_data_items;
     std::function<bool(std::int64_t, std::vector<model::DataItemRow>&)> read_data_items_at;
+    // Windowed data-item read; end_address INCLUSIVE, span-intersection
+    // semantics (see read_strings_in_range).
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::DataItemRow>&)> read_data_items_in_range;
     std::function<bool(std::vector<model::BlockRow>&)> read_blocks;
     std::function<bool(std::vector<model::CfgEdgeRow>&)> read_cfg_edges;
     std::function<bool(std::vector<model::SwitchTableRow>&)> read_switch_tables;
     std::function<bool(std::vector<model::DominatorRow>&)> read_dominators;
     std::function<bool(std::vector<model::PostDominatorRow>&)> read_post_dominators;
     std::function<bool(std::vector<model::LoopRow>&)> read_loops;
+    // Decompiler-free stack-frame layout from the listing-layer StackFrame.
+    std::function<bool(std::vector<model::FunctionFrameRow>&)> read_stack_frames;
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::FunctionFrameRow>&)>
+        read_stack_frames_in_range;
+    // Decompiler-free stack variables (embedded in each frame's StackFrame).
+    std::function<bool(std::vector<model::StackVarRow>&)> read_stack_vars;
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::StackVarRow>&)>
+        read_stack_vars_in_range;
     std::function<bool(std::vector<model::FunctionParamRow>&)> read_function_params;
     std::function<bool(std::vector<model::InstructionRow>&)> read_instructions;
     std::function<bool(std::int64_t, model::InstructionRow&)> read_instruction_at;
+    // Windowed instruction read; end_address INCLUSIVE, span-intersection
+    // semantics (see read_strings_in_range).
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::InstructionRow>&)> read_instructions_in_range;
+    std::function<bool(std::vector<model::InstructionOperandRow>&)> read_instruction_operands;
+    std::function<bool(std::int64_t, std::int64_t, std::vector<model::InstructionOperandRow>&)> read_instruction_operands_in_range;
     std::function<bool(std::vector<model::CommentRow>&)> read_comments;
     std::function<bool(std::int64_t, std::vector<model::CommentRow>&)> read_comments_at;
     std::function<bool(std::int64_t, std::int64_t, std::vector<model::CommentRow>&)> read_comments_in_range;
@@ -685,6 +801,8 @@ struct SourceCallbacks {
     std::function<bool(std::int64_t, const std::string&, const std::string&, const std::string&)> set_bookmark_category;
     std::function<bool(std::int64_t, const std::string&, const std::string&, const std::string&)> set_bookmark_comment;
     std::function<bool(std::int64_t, const std::string&, const std::string&)> delete_bookmark;
+    std::function<bool(const model::PerfBenchmarkRow&)> add_perf_benchmark;
+    std::function<bool(const std::string&)> delete_perf_benchmark;
     std::function<bool(const std::string&, const std::string&)> create_function_tag;
     std::function<bool(const std::string&)> delete_function_tag;
     std::function<bool(std::int64_t, const std::string&)> tag_function;
@@ -713,6 +831,9 @@ struct SourceCallbacks {
     std::function<bool(std::int64_t, const std::string&)> create_symbol;
     std::function<bool(std::int64_t, const std::string&, const std::string&)> create_data_item;
     std::function<bool(std::int64_t, std::uint8_t)> write_byte;
+    std::function<bool(std::int64_t, std::int64_t, const std::string&, int, bool)> create_memory_block;
+    std::function<bool(std::int64_t)> remove_memory_block;
+    std::function<bool(std::int64_t, std::int64_t)> move_memory_block;
     std::function<bool()> save_database;
     std::function<bool()> discard_changes;
     std::function<bool()> refresh;
@@ -723,6 +844,45 @@ struct SourceCallbacks {
 
 std::shared_ptr<Source> create_libghidra_live_source(const LibGhidraSourceOptions& options);
 std::shared_ptr<Source> create_callback_live_source(SourceCallbacks callbacks);
+
+// Map a single address to the start address of its containing function, using
+// Ghidra getFunctionContaining semantics: the function `f` with the greatest
+// `f.address <= addr` whose body still covers `addr` (`addr < f.address + size`,
+// where the body end is `end_ea` when present, else `address + size`). Returns 0
+// when no known function contains the address. `funcs` need not be sorted.
+std::int64_t containing_func_addr(
+    const std::vector<model::FunctionRow>& funcs, std::int64_t addr);
+
+// Populate `func_addr` on every instruction by range-mapping its address against
+// `funcs`. Sorts an internal copy once (O(n log n + m log n)); the input vectors
+// are otherwise untouched. Instructions outside any function get func_addr = 0.
+void assign_instruction_func_addrs(
+    const std::vector<model::FunctionRow>& funcs,
+    std::vector<model::InstructionRow>& instructions);
+
+// Same range-mapping for operand rows (each operand sits at its instruction's addr).
+void assign_operand_func_addrs(
+    const std::vector<model::FunctionRow>& funcs,
+    std::vector<model::InstructionOperandRow>& operands);
+
+// Byte spans used by the *_in_range readers (and the memory_bytes derivation)
+// to decide whether an item's covered bytes intersect an address window.
+// Always >= 1 (an item covers at least its own start address).
+//   instruction: max(size, decoded-hex byte count)
+//   string:      length when > 0, else the decoded content size
+//   data item:   size when > 0
+std::int64_t instruction_byte_span(const model::InstructionRow& row);
+std::int64_t string_byte_span(const model::StringRow& row);
+std::int64_t data_item_byte_span(const model::DataItemRow& row);
+
+// True when the `span` bytes starting at `item_start` intersect the INCLUSIVE
+// signed-int64 address window [start_address, end_address]. The item's end is
+// clamped on signed overflow (an absurd span never wraps past INT64_MAX).
+bool byte_span_intersects_range(
+    std::int64_t item_start,
+    std::int64_t span,
+    std::int64_t start_address,
+    std::int64_t end_address);
 
 class Source {
 public:
@@ -742,21 +902,68 @@ public:
     virtual bool read_exports(std::vector<model::ExportRow>& out) const;
     virtual bool read_strings(std::vector<model::StringRow>& out) const;
     virtual bool read_strings_at(std::int64_t address, std::vector<model::StringRow>& out) const;
+    // Windowed string read. end_address is INCLUSIVE (the read_comments_in_range
+    // convention) and the result contains every string whose covered byte span
+    // (string_byte_span) INTERSECTS [start_address, end_address] — not just
+    // strings that START inside it, so a window landing mid-string still sees
+    // its covering item. Default falls back to filtering the bulk read, so
+    // fixture/callback sources keep working unchanged.
+    virtual bool read_strings_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::StringRow>& out) const;
+    // Raw memory bytes at [address, address+length). Used by the memory_bytes
+    // derivation so string bytes reflect the ACTUAL memory (survives a byte
+    // patch to a non-ASCII value) instead of the UTF-8-transcoded string
+    // content. Default returns false (unsupported) so derivations fall back.
+    virtual bool read_bytes(std::int64_t address, std::int64_t length,
+                            std::vector<std::uint8_t>& out) const;
     virtual bool read_xrefs(std::vector<model::XrefRow>& out) const;
     virtual bool read_function_calls(std::vector<model::FunctionCallRow>& out) const;
     virtual bool read_call_edges(std::vector<model::CallEdgeRow>& out) const;
     virtual bool read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const;
     virtual bool read_data_items(std::vector<model::DataItemRow>& out) const;
     virtual bool read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const;
+    // Windowed data-item read; end_address INCLUSIVE, span-intersection
+    // semantics (see read_strings_in_range).
+    virtual bool read_data_items_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::DataItemRow>& out) const;
     virtual bool read_blocks(std::vector<model::BlockRow>& out) const;
     virtual bool read_cfg_edges(std::vector<model::CfgEdgeRow>& out) const;
     virtual bool read_switch_tables(std::vector<model::SwitchTableRow>& out) const;
     virtual bool read_dominators(std::vector<model::DominatorRow>& out) const;
     virtual bool read_post_dominators(std::vector<model::PostDominatorRow>& out) const;
     virtual bool read_loops(std::vector<model::LoopRow>& out) const;
+    // Decompiler-free stack-frame layout (listing-layer StackFrame). Defaults to
+    // false so sources without a StackFrame path fall back to derivation.
+    virtual bool read_stack_frames(std::vector<model::FunctionFrameRow>& out) const;
+    virtual bool read_stack_frames_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::FunctionFrameRow>& out) const;
+    // Decompiler-free stack variables (embedded in each frame's StackFrame).
+    virtual bool read_stack_vars(std::vector<model::StackVarRow>& out) const;
+    virtual bool read_stack_vars_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::StackVarRow>& out) const;
     virtual bool read_function_params(std::vector<model::FunctionParamRow>& out) const;
     virtual bool read_instructions(std::vector<model::InstructionRow>& out) const;
     virtual bool read_instruction_at(std::int64_t address, model::InstructionRow& out) const;
+    // Windowed instruction read; end_address INCLUSIVE, span-intersection
+    // semantics (see read_strings_in_range).
+    virtual bool read_instructions_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::InstructionRow>& out) const;
+    virtual bool read_instruction_operands(std::vector<model::InstructionOperandRow>& out) const;
+    // Windowed operand read; end_address INCLUSIVE (see read_instructions_in_range).
+    virtual bool read_instruction_operands_in_range(
+        std::int64_t start_address,
+        std::int64_t end_address,
+        std::vector<model::InstructionOperandRow>& out) const;
     virtual bool read_comments(std::vector<model::CommentRow>& out) const;
     virtual bool read_comments_at(std::int64_t address, std::vector<model::CommentRow>& out) const;
     virtual bool read_comments_in_range(
@@ -780,6 +987,13 @@ public:
     virtual bool read_freshness_token(SourceFreshnessToken& out) const;
     virtual bool read_program_revision(std::int64_t& out) const;
     virtual bool read_pseudocode(std::vector<model::PseudocodeRow>& out) const;
+    // Per-function P-code at the requested maturity (High=refined SSA, Raw=per-instruction).
+    // Default returns false (no P-code surface).
+    virtual bool read_pcode_at(std::int64_t address, model::PcodeMaturity maturity,
+                               std::vector<model::PcodeOpRow>& out) const;
+    // Per-function P-code value operands (varnodes) at the requested maturity.
+    virtual bool read_pcode_varnodes_at(std::int64_t address, model::PcodeMaturity maturity,
+                                        std::vector<model::PcodeVarnodeRow>& out) const;
     virtual bool read_decomp_lvars(std::vector<model::DecompLvarRow>& out) const;
     virtual bool read_decomp_comments(std::vector<model::DecompCommentRow>& out) const;
     virtual bool read_decomp_tokens(std::vector<model::DecompTokenRow>& out) const;
@@ -851,6 +1065,8 @@ public:
         std::int64_t address,
         const std::string& type,
         const std::string& category);
+    virtual bool add_perf_benchmark(const model::PerfBenchmarkRow& row);
+    virtual bool delete_perf_benchmark(const std::string& bench_id);
     virtual bool create_function_tag(
         const std::string& name,
         const std::string& comment);
@@ -930,6 +1146,11 @@ public:
     virtual bool create_symbol(std::int64_t address, const std::string& name);
     virtual bool create_data_item(std::int64_t address, const std::string& data_type, const std::string& name);
     virtual bool write_byte(std::int64_t address, std::uint8_t value);
+    // Writable memory map (segments / memory_blocks). perm bits: R=4, W=2, X=1.
+    virtual bool create_memory_block(std::int64_t start_address, std::int64_t end_address,
+                                     const std::string& name, int perm, bool initialized);
+    virtual bool remove_memory_block(std::int64_t address);
+    virtual bool move_memory_block(std::int64_t address, std::int64_t new_start_address);
     virtual bool save_database();
     virtual bool discard_changes();
     virtual bool refresh();

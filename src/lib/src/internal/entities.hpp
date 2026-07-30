@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -12,6 +11,10 @@
 #include <string>
 
 #include <xsql/database.hpp>
+
+namespace xsql::runtime {
+class RuntimeSettingsCore;
+}
 
 namespace ghidrasql {
 class Source;
@@ -22,7 +25,12 @@ std::int64_t stable_type_ordinal(const std::string& type_id);
 
 class TableRegistry {
 public:
-    explicit TableRegistry(std::shared_ptr<Source> source);
+    // `settings` backs the writable `runtime_settings` table (a live view over
+    // the runtime controls). May be null (tests that only exercise data tables);
+    // the table then reports the shared-core defaults and rejects writes.
+    explicit TableRegistry(
+        std::shared_ptr<Source> source,
+        std::shared_ptr<xsql::runtime::RuntimeSettingsCore> settings = nullptr);
     ~TableRegistry();
 
     TableRegistry(const TableRegistry&) = delete;

@@ -1,3 +1,9 @@
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
 add_library(ghidrasql STATIC
     src/commands.cpp
     src/database.cpp
@@ -9,6 +15,7 @@ add_library(ghidrasql STATIC
     src/source.cpp
     src/source_libghidra.cpp
     src/source_callbacks.cpp
+    src/true_believers.cpp   # vendored hidden-table decoder
 )
 add_library(ghidrasql::ghidrasql ALIAS ghidrasql)
 

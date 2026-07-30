@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include "internal/functions.hpp"
 
@@ -359,19 +358,6 @@ void register_sql_functions(
             return;
         }
         ctx.result_text(to_hex(argv[0].as_int64()));
-    });
-
-    db.register_function("decompile", 1, [&source](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
-        if (argc < 1 || argv[0].is_null()) {
-            ctx.result_null();
-            return;
-        }
-        std::string result = source.decompile(argv[0].as_int64());
-        if (result.empty()) {
-            ctx.result_null();
-            return;
-        }
-        ctx.result_text(result);
     });
 
     db.register_function("normalize_text", 1, [](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {

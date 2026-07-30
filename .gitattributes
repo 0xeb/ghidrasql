@@ -1,6 +1,10 @@
 # Normalize all text to LF in repo and on checkout.
 * text=auto eol=lf
 
+# AGENTS.md is private agent guidance and must not ship in release archives.
+AGENTS.md export-ignore
+**/AGENTS.md export-ignore
+
 # Force LF for source files.
 *.cpp text eol=lf
 *.hpp text eol=lf
