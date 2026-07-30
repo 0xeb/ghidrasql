@@ -45,7 +45,6 @@ jobs:
           repository: 0xeb/libghidra
           path: libghidra
           fetch-depth: 1
-          token: ${{ secrets.LIBGHIDRA_REPO_TOKEN }}
 
       - name: Configure
         run: >
