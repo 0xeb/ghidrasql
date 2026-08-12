@@ -6,9 +6,35 @@
 
 SQL interface for Ghidra program databases. Query functions, cross-references, types, decompilation output, and more using standard SQL.
 
-## Install with an AI agent (recommended)
+## Prebuilt seed — no toolchain, no compiling (fastest)
 
-The fastest way to get `ghidrasql` running end-to-end is to point an AI coding
+One archive with the Linux CLI and the `LibGhidraHost` Ghidra extension already built by
+CI. Nothing here needs a compiler, CMake, or Gradle. The URL always points at the newest
+release:
+
+```bash
+curl -L --retry 5 --fail -o ghidrasql-seed.zip \
+  https://github.com/0xeb/ghidrasql/releases/latest/download/ghidrasql-seed-linux-x86_64.zip
+unzip -q ghidrasql-seed.zip && cd ghidrasql-seed-linux-x86_64
+
+./scripts/bootstrap-runtime.sh        # one-time: fetch + verify Ghidra and a JDK
+./scripts/run-headless.sh /bin/ls     # import, analyze, serve SQL on :8081
+./scripts/query.sh 'SELECT COUNT(*) AS n FROM funcs;'
+```
+
+The CLI and extension ship prebuilt; the bootstrap downloads only Ghidra and a Temurin
+JDK, both pinned and SHA-256 verified. Every release is built and self-tested by CI —
+it must analyze a real binary and answer a query before it is published. Linux x86-64
+today; use the source install below on other platforms.
+
+Handing this to an agent? Give it
+[`seed/chatgpt-work-install-prompt.md`](seed/chatgpt-work-install-prompt.md) — a runbook
+with a verification gate at every step, and the known pitfalls written down.
+
+## Install with an AI agent (from source)
+
+If you need a platform with no prebuilt seed, the fastest way to get `ghidrasql`
+running end-to-end is to point an AI coding
 agent (Claude Code, Cursor, Codex, Aider, etc.) at the bundled installer
 prompt:
 

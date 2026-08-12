@@ -834,6 +834,9 @@ struct SourceCallbacks {
     std::function<bool(std::int64_t, std::int64_t, const std::string&, int, bool)> create_memory_block;
     std::function<bool(std::int64_t)> remove_memory_block;
     std::function<bool(std::int64_t, std::int64_t)> move_memory_block;
+    std::function<bool(std::int64_t, const std::optional<std::string>&, const std::optional<int>&,
+                       const std::optional<std::int64_t>&)>
+        set_memory_block_attributes;
     std::function<bool()> save_database;
     std::function<bool()> discard_changes;
     std::function<bool()> refresh;
@@ -1151,6 +1154,13 @@ public:
                                      const std::string& name, int perm, bool initialized);
     virtual bool remove_memory_block(std::int64_t address);
     virtual bool move_memory_block(std::int64_t address, std::int64_t new_start_address);
+    // Mutate an existing block. Each optional left unset is untouched, so UPDATE of one
+    // column cannot clobber the others. end_address is EXCLUSIVE here (the ghidrasql
+    // model); the libghidra source converts to Ghidra's inclusive end at the wire.
+    virtual bool set_memory_block_attributes(std::int64_t address,
+                                             const std::optional<std::string>& name,
+                                             const std::optional<int>& perm,
+                                             const std::optional<std::int64_t>& end_address);
     virtual bool save_database();
     virtual bool discard_changes();
     virtual bool refresh();

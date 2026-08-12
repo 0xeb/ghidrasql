@@ -14,7 +14,7 @@
  * arguments. The response is the canonical xsql script envelope serialised as
  * the tool's text content.
  *
- * Modelled on idasql/src/common/mcp_server.hpp but simpler — ghidrasql has no
+ * Simpler than the equivalent wrapper in other family tools: ghidrasql has no
  * single-threaded host requirement so the callback is called directly from the
  * MCP server thread. Thread-safety is the caller's responsibility (e.g. by
  * locking around the supplied callback).

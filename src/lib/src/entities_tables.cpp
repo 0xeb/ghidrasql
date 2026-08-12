@@ -752,10 +752,51 @@ inline xsql::CachedTableDef<model::SegmentRow> define_segments(const std::shared
                 row.end_ea = new_start + size;
                 return true;
             })
-        .column_int64("end_addr", [](const model::SegmentRow& r) { return r.end_ea; })
-        .column_text("name", [](const model::SegmentRow& r) { return r.name; })
+        // end_addr / name / perm all route through the one SetMemoryBlockAttributes RPC,
+        // each sending only its own field so an UPDATE of one cannot reset the others.
+        .column_int64_rw("end_addr",
+            [](const model::SegmentRow& r) { return r.end_ea; },
+            [source](model::SegmentRow& row, std::int64_t new_end) -> bool {
+                if (new_end == row.end_ea) {
+                    return true;
+                }
+                if (!source->set_memory_block_attributes(row.start_ea, std::nullopt, std::nullopt,
+                                                         new_end)) {
+                    report_write_error(source, "UPDATE segments.end_addr (resize) failed");
+                    return false;
+                }
+                row.end_ea = new_end;
+                return true;
+            })
+        .column_text_rw("name",
+            [](const model::SegmentRow& r) { return r.name; },
+            [source](model::SegmentRow& row, const std::string& new_name) -> bool {
+                if (new_name == row.name) {
+                    return true;
+                }
+                if (!source->set_memory_block_attributes(row.start_ea, new_name, std::nullopt,
+                                                         std::nullopt)) {
+                    report_write_error(source, "UPDATE segments.name failed");
+                    return false;
+                }
+                row.name = new_name;
+                return true;
+            })
         .column_text("class", [](const model::SegmentRow& r) { return r.segment_class; })
-        .column_int("perm", [](const model::SegmentRow& r) { return r.perm; })
+        .column_int_rw("perm",
+            [](const model::SegmentRow& r) { return r.perm; },
+            [source](model::SegmentRow& row, int new_perm) -> bool {
+                if (new_perm == row.perm) {
+                    return true;
+                }
+                if (!source->set_memory_block_attributes(row.start_ea, std::nullopt, new_perm,
+                                                         std::nullopt)) {
+                    report_write_error(source, "UPDATE segments.perm failed");
+                    return false;
+                }
+                row.perm = new_perm;
+                return true;
+            })
         .column_int("bitness", [](const model::SegmentRow& r) { return r.bitness; })
         .index_on("start_addr", [](const model::SegmentRow& r) { return r.start_ea; })
         .deletable([source](model::SegmentRow& row) -> bool {

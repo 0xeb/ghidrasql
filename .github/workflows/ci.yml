@@ -56,7 +56,23 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Smoke test CLI
-        run: ${{ matrix.cli_path }} --version
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ matrix.cli_path }}" --version
+          # --version never constructs an HTTP client, so on its own it cannot catch
+          # a cpp-httplib ODR mismatch: two copies of the header-only library, built
+          # with different feature macros, linked into one binary. v0.0.3 shipped
+          # exactly that on Linux/macOS (OpenSSL and zlib are present on those
+          # runners, absent on Windows) and aborted inside pthread_mutex_lock the
+          # first time anything touched the client — while this step stayed green.
+          #
+          # The query below needs no server: SQLite answers `SELECT 1` locally, but
+          # reaching it still constructs the RPC client, which is the part that
+          # crashes. A healthy build prints the result and exits 0.
+          out="$("${{ matrix.cli_path }}" --url http://127.0.0.1:9 -q 'SELECT 1')"
+          echo "$out"
+          grep -q '1' <<<"$out"
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@v4
@@ -64,10 +80,101 @@ jobs:
           name: ${{ matrix.cli_artifact }}
           path: ${{ matrix.cli_path }}
 
+  # Prebuilt seed for agent sessions: everything needed to start querying without a
+  # toolchain. An agent that has to install a JDK, CMake and Gradle and build from
+  # source spends most of its session on setup; this exists to delete that.
+  #
+  # All the assembly logic lives in seed/build-seed.sh so it can be run and debugged
+  # locally on Linux exactly as it runs here. This job only gathers inputs and calls it.
+  seed-linux:
+    name: Build prebuilt seed (Linux x86-64)
+    # Match the Ubuntu 24.04 / glibc 2.39 family these agent VMs run.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout ghidrasql
+        uses: actions/checkout@v4
+
+      - name: Checkout libghidra
+        uses: actions/checkout@v4
+        with:
+          repository: 0xeb/libghidra
+          path: libghidra
+          fetch-depth: 1
+
+      - name: Checkout ghidrasql-skills
+        uses: actions/checkout@v4
+        with:
+          repository: 0xeb/ghidrasql-skills
+          path: ghidrasql-skills
+          fetch-depth: 1
+
+      - name: Read pinned runtime versions
+        run: cat seed/versions.env >> "$GITHUB_ENV"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Download pinned Ghidra
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ghidra"
+          curl -L --retry 5 --fail -sS -o "$RUNNER_TEMP/ghidra.zip" "$GHIDRA_URL"
+          echo "$GHIDRA_SHA256  $RUNNER_TEMP/ghidra.zip" | sha256sum -c
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP/ghidra"
+          echo "GHIDRA_INSTALL_DIR=$RUNNER_TEMP/ghidra/$GHIDRA_DIRNAME" >> "$GITHUB_ENV"
+
+      - name: Build LibGhidraHost extension
+        working-directory: libghidra/ghidra-extension
+        run: gradle buildExtension -PGHIDRA_INSTALL_DIR="$GHIDRA_INSTALL_DIR"
+
+      - name: Build ghidrasql CLI
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DGHIDRASQL_LIBGHIDRA_DIR="$GITHUB_WORKSPACE/libghidra/cpp"
+          cmake --build build --config Release --target ghidrasql-cli
+
+      - name: Assemble seed
+        run: |
+          set -euo pipefail
+          extension="$(ls libghidra/ghidra-extension/dist/*_LibGhidraHost.zip | head -1)"
+          GHIDRASQL_SHA="$GITHUB_SHA" \
+          LIBGHIDRA_SHA="$(git -C libghidra rev-parse HEAD)" \
+          SKILLS_SHA="$(git -C ghidrasql-skills rev-parse HEAD)" \
+          bash seed/build-seed.sh \
+            --cli build/bin/ghidrasql \
+            --extension "$extension" \
+            --skills ghidrasql-skills \
+            --out dist
+
+      # Never publish a seed that has not answered a real query. This is the gate that
+      # would have caught the cpp-httplib ODR defect shipped in v0.0.3, where the binary
+      # ran --version fine and aborted the moment anything touched the client.
+      - name: Self-test the seed
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/seedtest"
+          unzip -q dist/ghidrasql-seed-linux-x86_64.zip -d "$RUNNER_TEMP/seedtest"
+          cd "$RUNNER_TEMP/seedtest/ghidrasql-seed-linux-x86_64"
+          bash scripts/self-test.sh /bin/ls 8099
+
+      - name: Upload seed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidrasql-seed-linux-x86_64
+          path: dist/ghidrasql-seed-linux-x86_64.zip
+          if-no-files-found: error
+
   publish-draft-release:
     name: Publish Draft Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-cli]
+    needs: [build-cli, seed-linux]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -84,6 +191,12 @@ jobs:
         with:
           name: cli-macos
           path: cli-macos
+
+      - name: Download prebuilt seed
+        uses: actions/download-artifact@v4
+        with:
+          name: ghidrasql-seed-linux-x86_64
+          path: release
 
       - name: Download Windows CLI
         uses: actions/download-artifact@v4
@@ -128,3 +241,4 @@ jobs:
             release/ghidrasql-cli-linux-${{ github.ref_name }}.zip
             release/ghidrasql-cli-macos-${{ github.ref_name }}.zip
             release/ghidrasql-cli-windows-${{ github.ref_name }}.zip
+            release/ghidrasql-seed-linux-x86_64.zip

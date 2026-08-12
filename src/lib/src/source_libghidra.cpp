@@ -2188,6 +2188,46 @@ public:
         return true;
     }
 
+    bool set_memory_block_attributes(std::int64_t address, const std::optional<std::string>& name,
+                                     const std::optional<int>& perm,
+                                     const std::optional<std::int64_t>& end_address) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        libghidra::client::SetMemoryBlockAttributesSpec spec;
+        spec.address = to_u64(address);
+        spec.name = name;
+        if (perm.has_value()) {
+            // perm bits R=4, W=2, X=1 -> the three independent host flags.
+            spec.is_read = (*perm & 4) != 0;
+            spec.is_write = (*perm & 2) != 0;
+            spec.is_execute = (*perm & 1) != 0;
+        }
+        if (end_address.has_value()) {
+            // ghidrasql models end as EXCLUSIVE; the host speaks Ghidra's INCLUSIVE end.
+            // Guard the empty range rather than wrapping to 0xffff... on the wire.
+            if (*end_address <= address) {
+                last_error_ = "segments.end_addr must be greater than start_addr";
+                return false;
+            }
+            spec.end_address = to_u64(*end_address - 1);
+        }
+        trace_rpc_locked("SetMemoryBlockAttributes");
+        auto res = client_.SetMemoryBlockAttributes(spec);
+        if (!ok_or_record_error_locked(res, "SetMemoryBlockAttributes")) {
+            return false;
+        }
+        if (!res.value->updated) {
+            if (last_error_.empty()) {
+                last_error_ = "SetMemoryBlockAttributes rejected";
+            }
+            return false;
+        }
+        maybe_auto_save_locked();
+        return true;
+    }
+
     bool rename_function_param(std::int64_t func_addr, std::int64_t ordinal, const std::string& new_name) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) {

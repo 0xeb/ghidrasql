@@ -502,6 +502,11 @@ bool Source::write_byte(std::int64_t, std::uint8_t) { return false; }
 bool Source::create_memory_block(std::int64_t, std::int64_t, const std::string&, int, bool) { return false; }
 bool Source::remove_memory_block(std::int64_t) { return false; }
 bool Source::move_memory_block(std::int64_t, std::int64_t) { return false; }
+bool Source::set_memory_block_attributes(std::int64_t, const std::optional<std::string>&,
+                                         const std::optional<int>&,
+                                         const std::optional<std::int64_t>&) {
+    return false;
+}
 bool Source::save_database() { return false; }
 bool Source::discard_changes() { return false; }
 bool Source::refresh() { return false; }

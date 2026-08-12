@@ -654,6 +654,12 @@ public:
         return call_write(callbacks_.remove_memory_block, address);
     }
 
+    bool set_memory_block_attributes(std::int64_t address, const std::optional<std::string>& name,
+                                     const std::optional<int>& perm,
+                                     const std::optional<std::int64_t>& end_address) override {
+        return call_write(callbacks_.set_memory_block_attributes, address, name, perm, end_address);
+    }
+
     bool move_memory_block(std::int64_t address, std::int64_t new_start_address) override {
         return call_write(callbacks_.move_memory_block, address, new_start_address);
     }

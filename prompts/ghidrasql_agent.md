@@ -794,24 +794,35 @@ WHERE pattern = 'CC CC CC' AND start_addr = 0x401000 AND end_addr = 0x402000;
 ### segments
 Memory segments / blocks. **Writable**: INSERT a region (Ghidra
 createUninitializedBlock), DELETE it (removeBlock), and UPDATE `start_addr`
-(rebase/moveBlock). The richer `memory_blocks` table (and `memory_layout` view)
-expose the same map and are writable the same way.
+(rebase/moveBlock), `end_addr` (resize), `name` (rename) or `perm`
+(permissions). Each column writes independently, so changing one never disturbs
+the others. The richer `memory_blocks` table (and `memory_layout` view) expose
+the same map; resize/rename/perm writes go through `segments`.
 
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
 | `start_addr` | INT64 | UPDATE | Segment start; UPDATE rebases (moves) the block |
-| `end_addr` | INT64 | | Segment end |
-| `name` | TEXT | | Segment / block name |
+| `end_addr` | INT64 | UPDATE | Segment end (exclusive); UPDATE resizes — see the warning below |
+| `name` | TEXT | UPDATE | Segment / block name |
 | `class` | TEXT | | Segment class |
-| `perm` | INT | INSERT | Permissions (R=4, W=2, X=1) |
+| `perm` | INT | INSERT, UPDATE | Permissions (R=4, W=2, X=1) |
 | `bitness` | INT | | Architecture bitness |
 
+> **Shrinking discards data.** Growing appends a block of the same
+> initialized-ness and permissions and joins it on; shrinking splits at the new
+> end and removes the tail, so any bytes past the new `end_addr` are gone. A
+> grow that would collide with the next block is rejected rather than silently
+> clamped.
+
 ```sql
--- Add an SRAM region to a firmware image's memory map, then rebase a region
+-- Add an SRAM region to a firmware image's memory map, then reshape regions
 INSERT INTO segments(start_addr, end_addr, name, perm)
   VALUES (0x20000000, 0x20005000, 'SRAM', 6);
 UPDATE segments SET start_addr = 0x08000000 WHERE name = '.text';  -- rebase
-DELETE FROM segments WHERE name = 'SRAM';
+UPDATE segments SET end_addr   = 0x20008000 WHERE name = 'SRAM';   -- grow
+UPDATE segments SET perm = 5    WHERE name = '.text';              -- r-x
+UPDATE segments SET name = 'SRAM1' WHERE name = 'SRAM';            -- rename
+DELETE FROM segments WHERE name = 'SRAM1';
 ```
 
 ### types
@@ -1472,7 +1483,7 @@ For custom sources that do not expose a freshness token, GhidraSQL keeps the con
 | `comments` | comment, repeatable, source |
 | `data_items` | name, data_type |
 | `bytes` | value |
-| `segments` | start_addr (rebase/move block) |
+| `segments` | start_addr (rebase/move block), end_addr (resize — shrink discards the tail), name (rename), perm |
 | `memory_blocks` | start_addr (rebase/move block) |
 | `types` | name |
 | `type_members` | member_name, member_type, comment |
