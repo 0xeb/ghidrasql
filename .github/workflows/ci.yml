@@ -109,7 +109,11 @@ jobs:
           fetch-depth: 1
 
       - name: Read pinned runtime versions
-        run: cat seed/versions.env >> "$GITHUB_ENV"
+        # $GITHUB_ENV accepts only KEY=VALUE lines and rejects the whole file on
+        # anything else. versions.env is also `source`d as a shell file by
+        # seed/env.sh and seed/build-seed.sh, so it carries comments and blank
+        # lines; pass through just the assignments.
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' seed/versions.env >> "$GITHUB_ENV"
 
       - name: Setup Java
         uses: actions/setup-java@v4
