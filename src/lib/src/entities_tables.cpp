@@ -8,6 +8,7 @@
 
 #include <xsql/runtime_settings.hpp>
 #include <xsql/runtime_settings_table.hpp>
+#include <xsql/interruption.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -60,13 +61,53 @@ inline std::int64_t encode_address_slot_rowid(std::int64_t address, size_t slot)
     return address * kCommentsPerAddress + static_cast<std::int64_t>(slot);
 }
 
-inline bool decode_address_slot_rowid(std::int64_t raw_rowid, std::int64_t& address, size_t& slot) {
-    if (raw_rowid < 0) {
+constexpr bool decode_scaled_address_rowid(
+        std::int64_t raw_rowid,
+        std::int64_t rows_per_address,
+        std::int64_t& address,
+        size_t& slot) {
+    if (rows_per_address <= 0) {
         return false;
     }
-    address = raw_rowid / kCommentsPerAddress;
-    slot = static_cast<size_t>(raw_rowid % kCommentsPerAddress);
+    // C++ integer division truncates toward zero.  Encoded high-half virtual
+    // addresses are negative signed int64 values, so a non-zero slot would
+    // otherwise decode to address+1 with a negative remainder.  Normalize to
+    // Euclidean division so encode(address, slot) round-trips for both user
+    // and canonical high-half addresses.
+    std::int64_t quotient = raw_rowid / rows_per_address;
+    std::int64_t remainder = raw_rowid % rows_per_address;
+    if (remainder < 0) {
+        --quotient;
+        remainder += rows_per_address;
+    }
+    address = quotient;
+    slot = static_cast<size_t>(remainder);
     return true;
+}
+
+constexpr bool scaled_address_rowid_round_trip_examples() {
+    std::int64_t address = 0;
+    size_t slot = 0;
+    if (!decode_scaled_address_rowid(0x1234 * kCommentsPerAddress + 7,
+                                     kCommentsPerAddress, address, slot) ||
+        address != 0x1234 || slot != 7) {
+        return false;
+    }
+    constexpr std::int64_t high_half_address = -0x7ff7500000LL;
+    if (!decode_scaled_address_rowid(
+            high_half_address * kCommentsPerAddress + 3,
+            kCommentsPerAddress, address, slot) ||
+        address != high_half_address || slot != 3) {
+        return false;
+    }
+    return true;
+}
+
+static_assert(scaled_address_rowid_round_trip_examples(),
+              "signed address/slot rowids must round-trip");
+
+inline bool decode_address_slot_rowid(std::int64_t raw_rowid, std::int64_t& address, size_t& slot) {
+    return decode_scaled_address_rowid(raw_rowid, kCommentsPerAddress, address, slot);
 }
 
 inline std::int64_t encode_address_rowid(std::int64_t address, size_t slot) {
@@ -74,12 +115,7 @@ inline std::int64_t encode_address_rowid(std::int64_t address, size_t slot) {
 }
 
 inline bool decode_address_rowid(std::int64_t raw_rowid, std::int64_t& address, size_t& slot) {
-    if (raw_rowid < 0) {
-        return false;
-    }
-    address = raw_rowid / kRowsPerAddress;
-    slot = static_cast<size_t>(raw_rowid % kRowsPerAddress);
-    return true;
+    return decode_scaled_address_rowid(raw_rowid, kRowsPerAddress, address, slot);
 }
 
 template <typename RowData>
@@ -414,6 +450,19 @@ inline void column_string(xsql::FunctionContext& ctx, int col, const model::Stri
     }
 }
 
+inline void column_string_ref(xsql::FunctionContext& ctx, int col,
+                              const model::StringRefRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.string_addr); return;
+        case 1: ctx.result_text(r.string_value); return;
+        case 2: ctx.result_int64(r.string_length); return;
+        case 3: ctx.result_int64(r.ref_addr); return;
+        case 4: ctx.result_int64(r.func_addr); return;
+        case 5: ctx.result_text(r.func_name); return;
+        default: ctx.result_null(); return;
+    }
+}
+
 inline void column_symbol(xsql::FunctionContext& ctx, int col, const model::SymbolRow& r) {
     switch (col) {
         case 0: ctx.result_int64(r.address); return;
@@ -431,6 +480,9 @@ inline std::optional<model::FunctionRow> find_function_row_by_address(
     std::int64_t func_addr) {
     model::FunctionRow row;
     if (!source->read_function_at(func_addr, row)) {
+        return std::nullopt;
+    }
+    if (row.address != func_addr) {
         return std::nullopt;
     }
     return row;
@@ -485,6 +537,36 @@ inline void column_xref(xsql::FunctionContext& ctx, int col, const model::XrefRo
     }
 }
 
+inline void column_xref_index(xsql::FunctionContext& ctx, int col,
+                              const model::XrefIndexRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.from_ea); return;
+        case 1: ctx.result_int64(r.to_ea); return;
+        case 2: ctx.result_int64(r.src_func_addr); return;
+        case 3: ctx.result_int64(r.dst_func_addr); return;
+        case 4: ctx.result_text(r.kind); return;
+        case 5: ctx.result_int(r.is_code); return;
+        case 6: ctx.result_int(r.is_data); return;
+        default: ctx.result_null(); return;
+    }
+}
+
+// Column emitter for the source-bounded call_edges equality-filter paths.
+// Column order MUST match define_call_edges' .column_*() declarations exactly.
+inline void column_call_edge(xsql::FunctionContext& ctx, int col,
+                             const model::CallEdgeRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.src_func_addr); return;
+        case 1: ctx.result_text(r.src_func_name); return;
+        case 2: ctx.result_int64(r.call_site); return;
+        case 3: ctx.result_int64(r.dst_addr); return;
+        case 4: ctx.result_int64(r.dst_func_addr); return;
+        case 5: ctx.result_text(r.dst_func_name); return;
+        case 6: ctx.result_text(r.kind); return;
+        default: ctx.result_null(); return;
+    }
+}
+
 inline void column_instruction(xsql::FunctionContext& ctx, int col, const model::InstructionRow& r) {
     switch (col) {
         case 0: ctx.result_int64(r.address); return;
@@ -494,6 +576,21 @@ inline void column_instruction(xsql::FunctionContext& ctx, int col, const model:
         case 4: ctx.result_int(r.size); return;
         case 5: ctx.result_text(r.bytes); return;
         case 6: ctx.result_int64(r.func_addr); return;
+        default: ctx.result_null(); return;
+    }
+}
+
+// Column emitter for the constants func_addr filter_eq path. Column order MUST
+// match define_constants' .column_*() declarations exactly.
+inline void column_constant(xsql::FunctionContext& ctx, int col,
+                            const model::ConstantRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.address); return;
+        case 1: ctx.result_int64(r.func_addr); return;
+        case 2: ctx.result_int64(r.value); return;
+        case 3: ctx.result_int64(r.width); return;
+        case 4: ctx.result_text(r.repr); return;
+        case 5: ctx.result_text(r.source_kind); return;
         default: ctx.result_null(); return;
     }
 }
@@ -531,6 +628,10 @@ inline void column_pseudocode(xsql::FunctionContext& ctx, int col, const model::
         case 1: ctx.result_text(r.func_name); return;
         case 2: ctx.result_text(r.text); return;
         case 3: ctx.result_int(r.is_stale); return;
+        case 4: ctx.result_text(r.prototype); return;
+        case 5: ctx.result_int(r.completed); return;
+        case 6: ctx.result_int(r.is_fallback); return;
+        case 7: ctx.result_text(r.error_message); return;
         default: ctx.result_null(); return;
     }
 }
@@ -586,6 +687,20 @@ inline void column_function_local(xsql::FunctionContext& ctx, int col, const mod
     }
 }
 
+// Column emitter for the function_params filter_eq path. Column order MUST
+// match define_function_params' .column_*() declarations exactly.
+inline void column_function_param(xsql::FunctionContext& ctx, int col, const model::FunctionParamRow& r) {
+    switch (col) {
+        case 0: ctx.result_int64(r.func_addr); return;
+        case 1: ctx.result_int64(r.ordinal); return;
+        case 2: ctx.result_text(r.param_name); return;
+        case 3: ctx.result_text(r.param_type); return;
+        case 4: ctx.result_text(r.storage); return;
+        case 5: ctx.result_int(r.is_user_named); return;
+        default: ctx.result_null(); return;
+    }
+}
+
 // Column emitter for the function_frames filter_eq path. Column order MUST match
 // define_function_frames' .column_*() declarations exactly. saved_reg_size,
 // stack_base_reg and has_frame_pointer emit SQL NULL when unknown.
@@ -629,10 +744,10 @@ inline void column_stack_var(xsql::FunctionContext& ctx, int col, const model::S
 inline xsql::CachedTableDef<model::FunctionRow> define_funcs(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::FunctionRow>("funcs")
         .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::FunctionRow> rows;
-            return source->read_functions(rows) ? rows.size() : size_t(0);
-        })
+        // Estimates run during SQLite planning. Reading the live table here
+        // performed one complete RPC scan before cache_builder performed the same
+        // scan again. A stable heuristic is cheaper and sufficient for planning.
+        .estimate_rows([]() { return size_t(10000); })
         .cache_builder([source](std::vector<model::FunctionRow>& out) {
             if (!source->read_functions(out)) {
                 out.clear();
@@ -719,6 +834,32 @@ inline xsql::CachedTableDef<model::FunctionRow> define_funcs(const std::shared_p
                     std::move(rows),
                     column_function);
             }, 2.0, 1.0)
+        .index_on("addr", [](const model::FunctionRow& r) { return r.address; })
+        .index_on("end_addr", [](const model::FunctionRow& r) { return r.end_ea; })
+        .constraint_cache_filter(
+            {xsql::required_le("addr", "function start upper bound required"),
+             xsql::required_gt("end_addr", "function end lower bound required")},
+            1.0,
+            1.0)
+        .build();
+}
+
+inline xsql::CachedTableDef<model::FunctionRow> define_leaf_funcs(
+    const std::shared_ptr<Source>& source) {
+    return xsql::cached_table<model::FunctionRow>("leaf_funcs")
+        .no_shared_cache()
+        .estimate_rows([]() { return size_t(2000); })
+        .cache_builder([source](std::vector<model::FunctionRow>& out) {
+            if (!source->read_leaf_functions(out)) {
+                out.clear();
+            }
+        })
+        .column_int64("addr", [](const model::FunctionRow& r) { return r.address; })
+        .column_text("name", [](const model::FunctionRow& r) { return r.name; })
+        .column_int64("size", [](const model::FunctionRow& r) { return r.size; })
+        .column_int64("end_addr", [](const model::FunctionRow& r) { return r.end_ea; })
+        .column_text("namespace", [](const model::FunctionRow& r) { return r.namespace_name; })
+        .column_text("prototype", [](const model::FunctionRow& r) { return r.signature; })
         .index_on("addr", [](const model::FunctionRow& r) { return r.address; })
         .build();
 }
@@ -1708,13 +1849,130 @@ inline xsql::CachedTableDef<model::StringRow> define_strings(const std::shared_p
         .build();
 }
 
+inline std::vector<model::StringRefRow> make_string_ref_rows(
+        const std::vector<model::XrefRow>& refs,
+        const std::vector<model::StringRow>& strings,
+        std::int64_t function_address,
+        const std::string& function_name) {
+    std::unordered_map<std::int64_t, const model::StringRow*> strings_by_addr;
+    strings_by_addr.reserve(strings.size());
+    for (const auto& value : strings) {
+        strings_by_addr.emplace(value.address, &value);
+    }
+
+    std::vector<model::StringRefRow> rows;
+    rows.reserve(refs.size());
+    for (const auto& ref : refs) {
+        if (xsql::vtab_interrupted()) {
+            break;
+        }
+        const auto found = strings_by_addr.find(ref.to_ea);
+        if (found == strings_by_addr.end()) {
+            continue;
+        }
+        const auto& value = *found->second;
+        model::StringRefRow row;
+        row.string_addr = value.address;
+        row.string_value = value.content;
+        row.string_length = value.length;
+        row.ref_addr = ref.from_ea;
+        row.func_addr = function_address;
+        row.func_name = function_name;
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+inline xsql::CachedTableDef<model::StringRefRow> define_string_refs(
+        const std::shared_ptr<Source>& source) {
+    return xsql::cached_table<model::StringRefRow>("string_refs")
+        .no_shared_cache()
+        // A full scan remains available for whole-program reports, but exact
+        // function lookups below avoid materializing unrelated function rows.
+        .estimate_rows([]() { return size_t(10000); })
+        .cache_builder([source](std::vector<model::StringRefRow>& out) {
+            std::vector<model::XrefRow> refs;
+            std::vector<model::StringRow> strings;
+            std::vector<model::FunctionRow> functions;
+            if (!source->read_xrefs(refs) || xsql::vtab_interrupted() ||
+                !source->read_strings(strings) || xsql::vtab_interrupted() ||
+                !source->read_functions(functions)) {
+                out.clear();
+                return;
+            }
+            const auto ranges = build_function_ranges(functions);
+            std::unordered_map<std::int64_t, std::string> names_by_addr;
+            names_by_addr.reserve(functions.size());
+            for (const auto& function : functions) {
+                names_by_addr.emplace(function.address, function.name);
+            }
+            std::unordered_map<std::int64_t, const model::StringRow*> strings_by_addr;
+            strings_by_addr.reserve(strings.size());
+            for (const auto& value : strings) {
+                strings_by_addr.emplace(value.address, &value);
+            }
+            out.reserve(refs.size());
+            for (const auto& ref : refs) {
+                if (xsql::vtab_interrupted()) {
+                    out.clear();
+                    return;
+                }
+                const auto string_it = strings_by_addr.find(ref.to_ea);
+                if (string_it == strings_by_addr.end()) {
+                    continue;
+                }
+                const auto function_address = function_for_address(ranges, ref.from_ea);
+                const auto name_it = names_by_addr.find(function_address);
+                const auto& value = *string_it->second;
+                model::StringRefRow row;
+                row.string_addr = value.address;
+                row.string_value = value.content;
+                row.string_length = value.length;
+                row.ref_addr = ref.from_ea;
+                row.func_addr = function_address;
+                row.func_name = name_it != names_by_addr.end() ? name_it->second : "";
+                out.push_back(std::move(row));
+            }
+        })
+        .column_int64("string_addr", [](const model::StringRefRow& r) { return r.string_addr; })
+        .column_text("string_value", [](const model::StringRefRow& r) { return r.string_value; })
+        .column_int64("string_length", [](const model::StringRefRow& r) { return r.string_length; })
+        .column_int64("ref_addr", [](const model::StringRefRow& r) { return r.ref_addr; })
+        .column_int64("func_addr", [](const model::StringRefRow& r) { return r.func_addr; })
+        .column_text("func_name", [](const model::StringRefRow& r) { return r.func_name; })
+        .filter_eq("func_addr",
+            [source](std::int64_t function_address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::XrefRow> refs;
+                std::vector<model::StringRow> strings;
+                std::vector<model::StringRefRow> rows;
+                if (source->read_xrefs_from_function(function_address, refs) &&
+                    !xsql::vtab_interrupted() && source->read_strings(strings) &&
+                    !xsql::vtab_interrupted()) {
+                    model::FunctionRow function;
+                    std::string function_name;
+                    if (source->read_function_at(function_address, function)) {
+                        function_name = function.name;
+                    }
+                    rows = make_string_ref_rows(
+                        refs, strings, function_address, function_name);
+                }
+                return std::make_unique<OwnedRowIterator<model::StringRefRow>>(
+                    std::move(rows), column_string_ref);
+            },
+            5.0,
+            64.0)
+        .index_on("string_addr", [](const model::StringRefRow& r) { return r.string_addr; })
+        .index_on("ref_addr", [](const model::StringRefRow& r) { return r.ref_addr; })
+        .index_on("func_addr", [](const model::StringRefRow& r) { return r.func_addr; })
+        .build();
+}
+
 inline xsql::CachedTableDef<model::XrefRow> define_xrefs(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::XrefRow>("xrefs")
         .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::XrefRow> rows;
-            return source->read_xrefs(rows) ? rows.size() : size_t(0);
-        })
+        // Never materialize all references merely to estimate the table; the
+        // cache builder below is already the required expensive operation.
+        .estimate_rows([]() { return size_t(100000); })
         .cache_builder([source](std::vector<model::XrefRow>& out) {
             if (!source->read_xrefs(out)) {
                 out.clear();
@@ -1725,6 +1983,24 @@ inline xsql::CachedTableDef<model::XrefRow> define_xrefs(const std::shared_ptr<S
         .column_text("kind", [](const model::XrefRow& r) { return r.kind; })
         .column_int("is_code", [](const model::XrefRow& r) { return r.is_code; })
         .column_int("is_data", [](const model::XrefRow& r) { return r.is_data; })
+        .filter_eq("from_addr",
+            [source](std::int64_t from_addr) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::XrefRow> rows;
+                source->read_xrefs_from(from_addr, rows);
+                return std::make_unique<OwnedRowIterator<model::XrefRow>>(
+                    std::move(rows), column_xref);
+            },
+            2.0,
+            8.0)
+        .filter_eq("to_addr",
+            [source](std::int64_t to_addr) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::XrefRow> rows;
+                source->read_xrefs_to(to_addr, rows);
+                return std::make_unique<OwnedRowIterator<model::XrefRow>>(
+                    std::move(rows), column_xref);
+            },
+            2.0,
+            8.0)
         .filter_eq_text(
             "kind",
             [source](const char* kind) -> std::unique_ptr<xsql::RowIterator> {
@@ -1751,18 +2027,47 @@ inline xsql::CachedTableDef<model::XrefRow> define_xrefs(const std::shared_ptr<S
 inline xsql::CachedTableDef<model::CallEdgeRow> define_call_edges(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::CallEdgeRow>("call_edges")
         .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::XrefRow> rows;
-            return source->read_xrefs(rows) ? rows.size() : size_t(1000);
-        })
+        // Cardinality discovery must not perform the same whole-program xref
+        // traversal that execution may require. A stable conservative estimate
+        // lets exact src_func_addr predicates reach the bounded reader below.
+        .estimate_rows([]() { return size_t(100000); })
         .cache_builder([source](std::vector<model::CallEdgeRow>& out) {
             out = derive_call_edge_rows(source);
         })
         .column_int64("src_func_addr", [](const model::CallEdgeRow& r) { return r.src_func_addr; })
+        .column_text("src_func_name", [](const model::CallEdgeRow& r) { return r.src_func_name; })
         .column_int64("call_site", [](const model::CallEdgeRow& r) { return r.call_site; })
         .column_int64("dst_addr", [](const model::CallEdgeRow& r) { return r.dst_addr; })
         .column_int64("dst_func_addr", [](const model::CallEdgeRow& r) { return r.dst_func_addr; })
+        .column_text("dst_func_name", [](const model::CallEdgeRow& r) { return r.dst_func_name; })
         .column_text("kind", [](const model::CallEdgeRow& r) { return r.kind; })
+        .filter_eq("src_func_addr",
+            [source](std::int64_t function_address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::CallEdgeRow> rows;
+                source->read_call_edges_from(function_address, rows);
+                return std::make_unique<OwnedRowIterator<model::CallEdgeRow>>(
+                    std::move(rows), column_call_edge);
+            },
+            8.0,
+            64.0)
+        .filter_eq("dst_func_addr",
+            [source](std::int64_t function_address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::CallEdgeRow> rows;
+                source->read_call_edges_to(function_address, rows);
+                return std::make_unique<OwnedRowIterator<model::CallEdgeRow>>(
+                    std::move(rows), column_call_edge);
+            },
+            8.0,
+            64.0)
+        .filter_eq("call_site",
+            [source](std::int64_t call_site) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::CallEdgeRow> rows;
+                source->read_call_edges_at(call_site, rows);
+                return std::make_unique<OwnedRowIterator<model::CallEdgeRow>>(
+                    std::move(rows), column_call_edge);
+            },
+            3.0,
+            2.0)
         .index_on("src_func_addr", [](const model::CallEdgeRow& r) { return r.src_func_addr; })
         .index_on("dst_func_addr", [](const model::CallEdgeRow& r) { return r.dst_func_addr; })
         .index_on("call_site", [](const model::CallEdgeRow& r) { return r.call_site; })
@@ -2017,22 +2322,68 @@ inline bool build_instructions_for_func(
     return true;
 }
 
-inline xsql::CachedTableDef<model::InstructionRow> define_instructions(const std::shared_ptr<Source>& source) {
-    return xsql::cached_table<model::InstructionRow>("instructions")
-        .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::InstructionRow> rows;
-            if (source->read_instructions(rows)) {
-                return rows.size();
-            }
-            return size_t(0);
-        })
-        .cache_builder([source](std::vector<model::InstructionRow>& out) {
-            // Canonical `func_addr`: range-map each instruction to its containing
-            // function in C++ (no proto/RPC field). Both Source backends flow
-            // through the shared helper, so the column is populated identically
-            // offline + live and on every query path.
-            build_instructions_with_func_addr(source, out);
+class InstructionGenerator final : public xsql::Generator<model::InstructionRow> {
+    std::vector<model::InstructionRow> rows_;
+    size_t index_ = 0;
+    model::InstructionRow current_;
+
+public:
+    InstructionGenerator(
+        const std::shared_ptr<Source>& source,
+        const std::optional<MemoryBytesWindow>& window)
+    {
+        bool ok = false;
+        if (window) {
+            ok = !window->empty && source->read_instructions_in_range(
+                window->lo, window->hi, rows_);
+        } else {
+            ok = source->read_instructions(rows_);
+        }
+        if (!ok && (!window || !window->empty)) {
+            rows_.clear();
+            report_write_error(source, "instructions: source read failed");
+            return;
+        }
+
+        std::vector<model::FunctionRow> functions;
+        if (!source->read_functions(functions)) {
+            rows_.clear();
+            report_write_error(
+                source, "instructions: failed to read functions for func_addr");
+            return;
+        }
+        assign_instruction_func_addrs(functions, rows_);
+
+        // The source window may include an instruction that overlaps the lower
+        // boundary. SQL constrains instruction START addresses, so remove any
+        // overlap-only row before claiming that the pushed predicate is exact.
+        if (window) {
+            rows_.erase(
+                std::remove_if(rows_.begin(), rows_.end(), [&](const auto& row) {
+                    return row.address < window->lo || row.address > window->hi;
+                }),
+                rows_.end());
+        }
+    }
+
+    bool next() override {
+        if (index_ >= rows_.size()) return false;
+        current_ = std::move(rows_[index_++]);
+        return true;
+    }
+
+    const model::InstructionRow& current() const override { return current_; }
+    std::int64_t rowid() const override { return current_.address; }
+};
+
+inline xsql::GeneratorTableDef<model::InstructionRow> define_instructions(
+        const std::shared_ptr<Source>& source) {
+    return xsql::generator_table<model::InstructionRow>("instructions")
+        // Planning must never enumerate a live program. Execution chooses the
+        // source-pushed addr/func_addr paths below when constrained.
+        .estimate_rows([]() { return size_t(1000000); })
+        .generator([source]() {
+            return std::make_unique<InstructionGenerator>(source, std::nullopt);
         })
         .column_int64("addr", [](const model::InstructionRow& r) { return r.address; })
         .column_text("mnemonic", [](const model::InstructionRow& r) { return r.mnemonic; })
@@ -2093,8 +2444,15 @@ inline xsql::CachedTableDef<model::InstructionRow> define_instructions(const std
                     std::move(rows),
                     column_instruction);
             }, 10.0, 64.0)
-        .index_on("addr", [](const model::InstructionRow& r) { return r.address; })
-        .index_on("func_addr", [](const model::InstructionRow& r) { return r.func_addr; })
+        .constraint_filter(
+            {xsql::optional_ge("addr"), xsql::optional_gt("addr"),
+             xsql::optional_lt("addr"), xsql::optional_le("addr")},
+            [source](const std::vector<xsql::GeneratorConstraintArg>& args)
+                -> std::unique_ptr<xsql::Generator<model::InstructionRow>> {
+                return std::make_unique<InstructionGenerator>(
+                    source, memory_bytes_window_from_args(args));
+            },
+            10.0, 100.0)
         .build();
 }
 
@@ -2221,10 +2579,10 @@ inline void column_comment(xsql::FunctionContext& ctx, int col, const model::Com
 inline xsql::CachedTableDef<model::CommentRow> define_comments(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::CommentRow>("comments")
         .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::CommentRow> rows;
-            return source->read_comments(rows) ? rows.size() : size_t(0);
-        })
+        // A live comment scan walks Ghidra's listing. Doing that during query
+        // planning duplicated the cache-builder scan and made unbounded reads
+        // look hung on large programs. A stable heuristic is sufficient here.
+        .estimate_rows([]() { return size_t(10000); })
         .cache_builder([source](std::vector<model::CommentRow>& out) {
             if (!source->read_comments(out)) {
                 out.clear();
@@ -2337,17 +2695,68 @@ inline xsql::CachedTableDef<model::CommentRow> define_comments(const std::shared
         .build();
 }
 
-inline xsql::CachedTableDef<model::DataItemRow> define_data_items(const std::shared_ptr<Source>& source) {
-    return xsql::cached_table<model::DataItemRow>("data_items")
-        .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::DataItemRow> rows;
-            return source->read_data_items(rows) ? rows.size() : size_t(0);
-        })
-        .cache_builder([source](std::vector<model::DataItemRow>& out) {
-            if (!source->read_data_items(out)) {
-                out = derive_data_item_rows(source);
-            }
+class DataItemGenerator final : public xsql::Generator<model::DataItemRow> {
+    std::vector<std::pair<std::int64_t, model::DataItemRow>> rows_;
+    size_t index_ = 0;
+    model::DataItemRow current_;
+    std::int64_t current_rowid_ = 0;
+
+public:
+    DataItemGenerator(
+        const std::shared_ptr<Source>& source,
+        const std::optional<MemoryBytesWindow>& window)
+    {
+        std::vector<model::DataItemRow> rows;
+        bool ok = false;
+        if (window) {
+            ok = source->read_data_items_in_range(window->lo, window->hi, rows);
+        } else {
+            ok = source->read_data_items(rows);
+        }
+        if (!ok) {
+            rows = derive_data_item_rows(source);
+        }
+
+        // read_data_items_in_range() intentionally returns items whose byte
+        // spans overlap the requested window. The SQL predicate constrains the
+        // item START address, so remove below-bound overlap rows before telling
+        // SQLite that the constraint was fully consumed.
+        if (window) {
+            rows.erase(
+                std::remove_if(rows.begin(), rows.end(), [&](const auto& row) {
+                    return row.address < window->lo || row.address > window->hi;
+                }),
+                rows.end());
+        }
+
+        std::unordered_map<std::int64_t, size_t> address_slots;
+        rows_.reserve(rows.size());
+        for (auto& row : rows) {
+            const size_t slot = address_slots[row.address]++;
+            rows_.emplace_back(
+                encode_address_rowid(row.address, slot), std::move(row));
+        }
+    }
+
+    bool next() override {
+        if (index_ >= rows_.size()) return false;
+        current_rowid_ = rows_[index_].first;
+        current_ = std::move(rows_[index_].second);
+        ++index_;
+        return true;
+    }
+
+    const model::DataItemRow& current() const override { return current_; }
+    std::int64_t rowid() const override { return current_rowid_; }
+};
+
+inline xsql::GeneratorTableDef<model::DataItemRow> define_data_items(const std::shared_ptr<Source>& source) {
+    return xsql::generator_table<model::DataItemRow>("data_items")
+        // A planner estimate must not repeat the same live whole-program scan
+        // that execution is about to perform. It is deliberately approximate.
+        .estimate_rows([]() { return size_t(100000); })
+        .generator([source]() {
+            return std::make_unique<DataItemGenerator>(source, std::nullopt);
         })
         .column_int64("addr", [](const model::DataItemRow& r) { return r.address; })
         .column_text_rw(
@@ -2419,19 +2828,23 @@ inline xsql::CachedTableDef<model::DataItemRow> define_data_items(const std::sha
             row = std::move(rows[slot]);
             return true;
         })
-        .filter_eq("addr",
-            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
-                std::vector<model::DataItemRow> rows;
-                source->read_data_items_at(address, rows);
-                std::vector<std::pair<std::int64_t, model::DataItemRow>> indexed;
-                indexed.reserve(rows.size());
-                for (size_t i = 0; i < rows.size(); ++i) {
-                    indexed.emplace_back(encode_address_rowid(address, i), std::move(rows[i]));
-                }
-                return std::make_unique<IndexedOwnedRowIterator<model::DataItemRow>>(
-                    std::move(indexed),
-                    column_data_item);
-            }, 1.0, 2.0)
+        .constraint_filter(
+            {xsql::required_eq("addr", "")},
+            [source](const std::vector<xsql::GeneratorConstraintArg>& args)
+                -> std::unique_ptr<xsql::Generator<model::DataItemRow>> {
+                return std::make_unique<DataItemGenerator>(
+                    source, memory_bytes_window_from_args(args));
+            },
+            1.0, 2.0)
+        .constraint_filter(
+            {xsql::optional_ge("addr"), xsql::optional_gt("addr"),
+             xsql::optional_lt("addr"), xsql::optional_le("addr")},
+            [source](const std::vector<xsql::GeneratorConstraintArg>& args)
+                -> std::unique_ptr<xsql::Generator<model::DataItemRow>> {
+                return std::make_unique<DataItemGenerator>(
+                    source, memory_bytes_window_from_args(args));
+            },
+            10.0, 100.0)
         .build();
 }
 
@@ -2885,6 +3298,25 @@ inline xsql::CachedTableDef<model::ConstantRow> define_constants(const std::shar
         .column_int64("width", [](const model::ConstantRow& r) { return r.width; })
         .column_text("repr", [](const model::ConstantRow& r) { return r.repr; })
         .column_text("source_kind", [](const model::ConstantRow& r) { return r.source_kind; })
+        .filter_eq("func_addr",
+            [source](std::int64_t func_addr) -> std::unique_ptr<xsql::RowIterator> {
+                return std::make_unique<OwnedRowIterator<model::ConstantRow>>(
+                    derive_constant_rows_for(source, func_addr), column_constant);
+            },
+            5.0,
+            32.0)
+        .filter_eq("value",
+            [](std::int64_t) -> std::unique_ptr<xsql::RowIterator> {
+                xsql::set_vtab_error(
+                    "unbounded constants.value lookup is disabled because "
+                    "Ghidra has no indexed global scalar search; add an exact "
+                    "func_addr predicate to use bounded function-local lookup");
+                std::vector<model::ConstantRow> rows;
+                return std::make_unique<OwnedRowIterator<model::ConstantRow>>(
+                    std::move(rows), column_constant);
+            },
+            8.0,
+            16.0)
         .index_on("addr", [](const model::ConstantRow& r) { return r.address; })
         .index_on("func_addr", [](const model::ConstantRow& r) { return r.func_addr; })
         .index_on("value", [](const model::ConstantRow& r) { return r.value; })
@@ -3391,17 +3823,10 @@ inline xsql::CachedTableDef<model::SignatureRow> define_signatures(const std::sh
 inline xsql::CachedTableDef<model::FunctionParamRow> define_function_params(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::FunctionParamRow>("function_params")
         .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::FunctionParamRow> rows;
-            if (source->read_function_params(rows)) {
-                return rows.size();
-            }
-            std::vector<model::FunctionRow> funcs;
-            if (source->read_functions(funcs)) {
-                return std::max<size_t>(funcs.size(), 1);
-            }
-            return size_t(0);
-        })
+        // Planning must not perform the same full live signature scan that
+        // cache_builder performs during execution. Three parameters per 10k
+        // functions is a stable-enough heuristic for SQLite planning.
+        .estimate_rows([]() { return size_t(30000); })
         .cache_builder([source](std::vector<model::FunctionParamRow>& out) {
             if (!source->read_function_params(out)) {
                 out = derive_function_param_rows(source);
@@ -3445,6 +3870,40 @@ inline xsql::CachedTableDef<model::FunctionParamRow> define_function_params(cons
             })
         .column_text("storage", [](const model::FunctionParamRow& r) { return r.storage; })
         .column_int("is_user_named", [](const model::FunctionParamRow& r) { return r.is_user_named; })
+        .row_populator([source](model::FunctionParamRow& row, int argc, xsql::FunctionArg* argv) {
+            // argv[0]=old_rowid, argv[1]=new_rowid, argv[2..]=columns
+            const std::int64_t func_addr = argc > 2 ? argv[2].as_int64() : 0;
+            const std::int64_t ordinal = argc > 3 ? argv[3].as_int64() : 0;
+            row.func_addr = func_addr;
+            row.ordinal = ordinal;
+
+            std::vector<model::FunctionParamRow> current;
+            if (source->read_function_params_at(func_addr, current)) {
+                const auto it = std::find_if(current.begin(), current.end(),
+                    [ordinal](const model::FunctionParamRow& candidate) {
+                        return candidate.ordinal == ordinal;
+                    });
+                if (it != current.end()) {
+                    row = *it;
+                }
+            }
+        })
+        // The exact-function iterator uses function-local positional rowids.
+        // They are not stable identities in the full function-parameter table,
+        // so an UPDATE must reconstruct the target from the real func_addr and
+        // ordinal column values rather than treating the iterator position as a
+        // global cache position.
+        .update_from_column_values()
+        .filter_eq("func_addr",
+            [source](std::int64_t func_addr) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::FunctionParamRow> rows;
+                source->read_function_params_at(func_addr, rows);
+                return std::make_unique<OwnedRowIterator<model::FunctionParamRow>>(
+                    std::move(rows), column_function_param);
+            },
+            2.0,
+            8.0)
+        .index_on("func_addr", [](const model::FunctionParamRow& r) { return r.func_addr; })
         .build();
 }
 
@@ -3564,10 +4023,9 @@ inline xsql::CachedTableDef<model::SearchIndexRow> define_search_index(
 inline xsql::CachedTableDef<model::XrefIndexRow> define_xref_index(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::XrefIndexRow>("xref_index")
         .no_shared_cache()
-        .estimate_rows([source]() {
-            std::vector<model::XrefRow> rows;
-            return source->read_xrefs(rows) ? rows.size() : size_t(1000);
-        })
+        // Cardinality discovery must not materialize the same whole-program
+        // reference set that execution may later request.
+        .estimate_rows([]() { return size_t(100000); })
         .cache_builder([source](std::vector<model::XrefIndexRow>& out) {
             out = derive_xref_index_rows(source);
         })
@@ -3578,6 +4036,33 @@ inline xsql::CachedTableDef<model::XrefIndexRow> define_xref_index(const std::sh
         .column_text("kind", [](const model::XrefIndexRow& r) { return r.kind; })
         .column_int("is_code", [](const model::XrefIndexRow& r) { return r.is_code; })
         .column_int("is_data", [](const model::XrefIndexRow& r) { return r.is_data; })
+        .filter_eq("src_func_addr",
+            [source](std::int64_t function_address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::XrefRow> refs;
+                std::vector<model::XrefIndexRow> rows;
+                if (source->read_xrefs_from_function(function_address, refs)) {
+                    std::vector<model::FunctionRow> functions;
+                    source->read_functions(functions);
+                    rows.reserve(refs.size());
+                    for (auto& ref : refs) {
+                        model::XrefIndexRow row;
+                        row.from_ea = ref.from_ea;
+                        row.to_ea = ref.to_ea;
+                        row.src_func_addr = function_address;
+                        const std::int64_t destination =
+                            containing_func_addr(functions, ref.to_ea);
+                        row.dst_func_addr = destination != 0 ? destination : ref.to_ea;
+                        row.kind = std::move(ref.kind);
+                        row.is_code = ref.is_code;
+                        row.is_data = ref.is_data;
+                        rows.push_back(std::move(row));
+                    }
+                }
+                return std::make_unique<OwnedRowIterator<model::XrefIndexRow>>(
+                    std::move(rows), column_xref_index);
+            },
+            4.0,
+            128.0)
         .index_on("from_addr", [](const model::XrefIndexRow& r) { return r.from_ea; })
         .index_on("to_addr", [](const model::XrefIndexRow& r) { return r.to_ea; })
         .index_on("src_func_addr", [](const model::XrefIndexRow& r) { return r.src_func_addr; })
@@ -3626,6 +4111,10 @@ inline xsql::CachedTableDef<model::PseudocodeRow> define_pseudocode(const std::s
         .column_text("func_name", [](const model::PseudocodeRow& r) { return r.func_name; })
         .column_text("text", [](const model::PseudocodeRow& r) { return r.text; })
         .column_int("is_stale", [](const model::PseudocodeRow& r) { return r.is_stale; })
+        .column_text("prototype", [](const model::PseudocodeRow& r) { return r.prototype; })
+        .column_int("completed", [](const model::PseudocodeRow& r) { return r.completed; })
+        .column_int("is_fallback", [](const model::PseudocodeRow& r) { return r.is_fallback; })
+        .column_text("error_message", [](const model::PseudocodeRow& r) { return r.error_message; })
         .filter_eq("func_addr",
             [source](std::int64_t func_addr) -> std::unique_ptr<xsql::RowIterator> {
                 auto rows = derive_pseudocode_row_for(source, func_addr);
@@ -4621,6 +5110,7 @@ struct TableRegistry::Impl {
         , project_files(define_project_files(source))
         , project_programs(define_project_programs(source))
         , funcs(define_funcs(source))
+        , leaf_funcs(define_leaf_funcs(source))
         , segments(define_segments(source))
         , memory_blocks(define_memory_blocks(source))
         , memory_bytes(define_memory_bytes(source))
@@ -4629,6 +5119,7 @@ struct TableRegistry::Impl {
         , imports(define_imports(source))
         , exports(define_exports(source))
         , strings(define_strings(source))
+        , string_refs(define_string_refs(source))
         , xrefs(define_xrefs(source))
         , call_edges(define_call_edges(source))
         , function_calls(define_function_calls(source))
@@ -4690,6 +5181,7 @@ struct TableRegistry::Impl {
         register_cached(db, "project_files", &project_files);
         register_cached(db, "project_programs", &project_programs);
         register_cached(db, "funcs", &funcs);
+        register_cached(db, "leaf_funcs", &leaf_funcs);
         register_cached(db, "segments", &segments);
         register_cached(db, "memory_blocks", &memory_blocks);
         register_generator(db, "bytes", &memory_bytes);
@@ -4698,6 +5190,7 @@ struct TableRegistry::Impl {
         register_cached(db, "imports", &imports);
         register_cached(db, "entries", &exports);
         register_cached(db, "strings", &strings);
+        register_cached(db, "string_refs", &string_refs);
         register_cached(db, "xrefs", &xrefs);
         register_cached(db, "call_edges", &call_edges);
         register_cached(db, "function_calls", &function_calls);
@@ -4707,10 +5200,10 @@ struct TableRegistry::Impl {
         register_cached(db, "switch_tables", &switch_tables);
         register_cached(db, "dominators", &dominators);
         register_cached(db, "post_dominators", &post_dominators);
-        register_cached(db, "instructions", &instructions);
+        register_generator(db, "instructions", &instructions);
         register_cached(db, "instruction_operands", &instruction_operands);
         register_cached(db, "comments", &comments);
-        register_cached(db, "data_items", &data_items);
+        register_generator(db, "data_items", &data_items);
         register_cached(db, "function_locals", &function_locals);
         register_cached(db, "stack_vars", &stack_vars);
         register_generator(db, "pcode_ops", &pcode_ops);
@@ -4761,6 +5254,7 @@ struct TableRegistry::Impl {
         project_files.invalidate_cache();
         project_programs.invalidate_cache();
         funcs.invalidate_cache();
+        leaf_funcs.invalidate_cache();
         segments.invalidate_cache();
         memory_blocks.invalidate_cache();
         // memory_bytes is a generator table: it derives fresh on every query,
@@ -4770,6 +5264,7 @@ struct TableRegistry::Impl {
         imports.invalidate_cache();
         exports.invalidate_cache();
         strings.invalidate_cache();
+        string_refs.invalidate_cache();
         xrefs.invalidate_cache();
         call_edges.invalidate_cache();
         function_calls.invalidate_cache();
@@ -4779,10 +5274,10 @@ struct TableRegistry::Impl {
         switch_tables.invalidate_cache();
         dominators.invalidate_cache();
         post_dominators.invalidate_cache();
-        instructions.invalidate_cache();
+        // instructions is a per-query generator; there is no cache to invalidate.
         instruction_operands.invalidate_cache();
         comments.invalidate_cache();
-        data_items.invalidate_cache();
+        // data_items is a generator table: it derives fresh on every query.
         function_locals.invalidate_cache();
         stack_vars.invalidate_cache();
         register_vars.invalidate_cache();
@@ -4829,6 +5324,10 @@ struct TableRegistry::Impl {
         query_scope->reset_for_table(name);
         if (name == "funcs") {
             funcs.invalidate_cache();
+            return true;
+        }
+        if (name == "leaf_funcs") {
+            leaf_funcs.invalidate_cache();
             return true;
         }
         if (name == "project_files") {
@@ -4913,7 +5412,7 @@ struct TableRegistry::Impl {
             return true;
         }
         if (name == "instructions") {
-            instructions.invalidate_cache();
+            // Per-query generator; there is no persistent cache to invalidate.
             return true;
         }
         if (name == "instruction_operands") {
@@ -4925,7 +5424,7 @@ struct TableRegistry::Impl {
             return true;
         }
         if (name == "data_items") {
-            data_items.invalidate_cache();
+            // Per-query generator; there is no persistent cache to invalidate.
             return true;
         }
         if (name == "function_locals") {
@@ -5028,6 +5527,10 @@ struct TableRegistry::Impl {
         }
         if (name == "xref_index") {
             xref_index.invalidate_cache();
+            return true;
+        }
+        if (name == "string_refs") {
+            string_refs.invalidate_cache();
             return true;
         }
         if (name == "function_metrics") {
@@ -5137,6 +5640,7 @@ public:
     xsql::CachedTableDef<model::ProjectFileRow> project_files;
     xsql::CachedTableDef<model::ProjectFileRow> project_programs;
     xsql::CachedTableDef<model::FunctionRow> funcs;
+    xsql::CachedTableDef<model::FunctionRow> leaf_funcs;
     xsql::CachedTableDef<model::SegmentRow> segments;
     xsql::CachedTableDef<model::MemoryBlockRow> memory_blocks;
     // Streaming generator table (derives fresh per query; no cache to invalidate).
@@ -5146,6 +5650,7 @@ public:
     xsql::CachedTableDef<model::ImportRow> imports;
     xsql::CachedTableDef<model::ExportRow> exports;
     xsql::CachedTableDef<model::StringRow> strings;
+    xsql::CachedTableDef<model::StringRefRow> string_refs;
     xsql::CachedTableDef<model::XrefRow> xrefs;
     xsql::CachedTableDef<model::CallEdgeRow> call_edges;
     xsql::CachedTableDef<model::FunctionCallRow> function_calls;
@@ -5155,10 +5660,10 @@ public:
     xsql::CachedTableDef<model::SwitchTableRow> switch_tables;
     xsql::CachedTableDef<model::DominatorRow> dominators;
     xsql::CachedTableDef<model::PostDominatorRow> post_dominators;
-    xsql::CachedTableDef<model::InstructionRow> instructions;
+    xsql::GeneratorTableDef<model::InstructionRow> instructions;
     xsql::CachedTableDef<model::InstructionOperandRow> instruction_operands;
     xsql::CachedTableDef<model::CommentRow> comments;
-    xsql::CachedTableDef<model::DataItemRow> data_items;
+    xsql::GeneratorTableDef<model::DataItemRow> data_items;
     xsql::CachedTableDef<model::FunctionLocalRow> function_locals;
     xsql::CachedTableDef<model::StackVarRow> stack_vars;
     xsql::GeneratorTableDef<model::PcodeOpRow> pcode_ops;

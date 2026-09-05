@@ -150,6 +150,8 @@ bool try_parse_int64_token(const std::string& token, std::int64_t& out);
 bool extract_first_numeric_literal(const std::string& text, std::int64_t& out);
 std::vector<model::RelocationRow> derive_relocation_rows(const std::shared_ptr<Source>& source);
 std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Source>& source);
+std::vector<model::ConstantRow> derive_constant_rows_for(
+    const std::shared_ptr<Source>& source, std::int64_t func_addr);
 std::vector<model::EquateRow> derive_equate_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionFrameRow> derive_function_frame_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionFrameRow> derive_function_frame_rows_for(

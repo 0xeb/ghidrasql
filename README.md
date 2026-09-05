@@ -6,6 +6,11 @@
 
 SQL interface for Ghidra program databases. Query functions, cross-references, types, decompilation output, and more using standard SQL.
 
+Virtual-table materialisation is query scoped: rows and derived indexes may be
+retained while one SQL statement executes, then are discarded with its cursor.
+No analysis-result cache is reused by a later statement, so read freshness does
+not depend on revision tokens or manual invalidation.
+
 ## Prebuilt seed — no toolchain, no compiling (fastest)
 
 One archive with the Linux CLI and the `LibGhidraHost` Ghidra extension already built by
@@ -164,6 +169,9 @@ ghidrasql --ghidra /path/to/ghidra_dist \
 
 # Then query it: curl -X POST http://localhost:8081/query -d "SELECT * FROM funcs LIMIT 5"
 
+# Cancel an in-flight query (the explicit empty body supplies Content-Length: 0)
+curl -X POST -d '' http://localhost:8081/cancel
+
 # Managed HTTP sessions can import/list/open project programs without restart
 curl http://localhost:8081/project/programs
 curl -X POST http://localhost:8081/project/open --json '{"program_path":"/target.exe"}'
@@ -184,8 +192,12 @@ SELECT * FROM string_refs WHERE string_value LIKE '%password%';
 -- Call graph
 SELECT src_func_name, dst_func_name FROM callgraph_edges LIMIT 50;
 
--- Decompile a function
-SELECT * FROM pseudocode WHERE func_addr = 0x401000;
+-- Decompile a function only when Ghidra produced an exact, completed result
+SELECT func_addr, prototype, text
+FROM pseudocode
+WHERE func_addr = 0x401000
+  AND completed = 1
+  AND is_fallback = 0;
 
 -- Struct types with members
 SELECT t.name AS type_name, m.member_name, m.member_type, m.offset
@@ -201,7 +213,7 @@ UPDATE funcs SET name = 'my_main' WHERE addr = 0x401000;
 -- Rewrite a function signature
 UPDATE funcs SET prototype = 'int main(int argc, char** argv)' WHERE addr = 0x401000;
 
--- Save changes to the Ghidra project
+-- Optional periodic checkpoint; normal managed shutdown saves once by default
 SELECT save_database();
 ```
 
@@ -252,7 +264,12 @@ SELECT save_database();
 | `--keep-host` | Don't auto-shutdown after query |
 | `--max-runtime <sec>` | Host lifetime bound (0=disable; default: 0 for `--http` serve mode, 600 for one-shot `-q`/`-f`/`-i`) |
 | `--fresh` | Delete existing project first |
-| `--auto-save <n>` | Save every N mutations (0=disabled) |
+Managed headless sessions save once on normal shutdown by default. Mutations
+remain in the live Ghidra project until that shutdown; `save_database()` is an
+optional operator-requested checkpoint that may be invoked at any time from an
+interactive or headless SQL session. No mutation path calls it automatically.
+`--shutdown discard`, `discard_changes()`, and read-only mode discard pending
+changes. `--shutdown none` performs no save or discard action.
 
 ### REPL commands
 
@@ -261,7 +278,7 @@ SELECT save_database();
 | `.tables` | List all tables and views |
 | `.schema <table>` | Show table schema |
 | `.info` | Show program metadata |
-| `.save` | Save pending changes |
+| `.save` | Checkpoint pending changes |
 | `.discard` | Discard pending changes |
 | `.refresh` | Refresh data from Ghidra |
 | `.http` / `.http start` / `.http stop` | Control HTTP server |
@@ -270,7 +287,7 @@ SELECT save_database();
 
 ## SQL Surface
 
-65 public tables and 81 views covering every aspect of a Ghidra program database.
+66 public tables and 80 views covering every aspect of a Ghidra program database.
 
 ### Tables
 
@@ -278,7 +295,7 @@ SELECT save_database();
 |----------|--------|
 | **Functions** | `funcs`, `function_params`, `function_locals`, `function_frames`, `function_chunks`, `function_metrics`, `stack_vars`, `register_vars`, `tail_calls` |
 | **Code** | `instructions`, `instruction_operands`, `blocks`, `cfg_edges`, `loops`, `switch_tables`, `dominators`, `post_dominators` |
-| **References** | `xrefs`, `call_edges`, `function_calls`, `xref_index` |
+| **References** | `xrefs`, `string_refs`, `call_edges`, `function_calls`, `xref_index` |
 | **Symbols** | `names`, `imports`, `entries`, `strings`, `equates`, `constants` |
 | **Memory** | `segments`, `memory_blocks`, `bytes`, `byte_search` |
 | **Types** | `types`, `type_members`, `type_enums`, `type_enum_members`, `type_unions`, `type_aliases`, `signatures` |
@@ -295,7 +312,7 @@ SELECT save_database();
 |----------|-------|
 | **Functions** | `functions`, `function_signatures`, `function_metrics_ranked`, `function_metrics_scored` |
 | **Call graph** | `callgraph_edges`, `callers`, `callees`, `function_call_stats` |
-| **References** | `string_refs`, `string_hotspots`, `xref_paths` |
+| **References** | `string_hotspots`, `xref_paths` |
 | **Memory** | `memory_hexdump`, `memory_layout` |
 | **Types** | `types_v_structs`, `types_v_unions`, `types_v_enums`, `types_v_typedefs`, `type_layout` |
 | **Decompiler** | `decompiler_listing`, `ctree`, `ctree_v_calls`, `ctree_v_loops`, `ctree_v_ifs`, `ir_ops`, `ir_operands`, `ir_maturities`, `ir_v_*` |
@@ -348,11 +365,42 @@ ghidrasql
   `Content-Type: application/json` the body must be valid JSON with a string
   `sql` (a malformed or `sql`-less declared-JSON body returns `400`); a body sent
   without that content type is treated as raw SQL.
+- `POST /cancel` cooperatively cancels the current SQL statement and forwards an
+  out-of-band cancellation request to the active LibGhidraHost RPC. Use
+  `curl -X POST -d '' .../cancel`: `-d ''` explicitly frames the zero-length
+  request body. A cancelled read can return accumulated rows with
+  `partial: true` and a `query cancelled` warning; a zero-row read or mutation
+  returns a normal JSON error. In both cases, the server remains reusable.
+- For a foreground one-shot `-q` query, Ctrl-C uses the same two-layer path:
+  it interrupts local SQLite work and sends an out-of-band cancellation request
+  when the query is blocked in LibGhidraHost.
+- `X-XSQL-Timeout: <milliseconds>` applies a per-statement deadline through the
+  same SQLite and LibGhidraHost cancellation path. If `query_timeout_ms` is also
+  set in `runtime_settings`, the stricter positive deadline wins. Timeout and
+  cancellation metadata are preserved in each statement result.
+- Exact equality on `call_edges.src_func_addr`, `call_edges.dst_func_addr`, or
+  `call_edges.call_site` is source-bounded. A call-site lookup first resolves
+  the containing function, then reads only that function's xrefs and retains
+  exact-site matches. SQLite drives `call_site IN (...)` as one such equality
+  lookup per right-hand value. `callgraph_edges` preserves these pushdowns, as
+  do exact `callers.func_addr` and `callees.func_addr` lookups. These resolved-function
+  views use the names already carried by each edge; they do not join the whole
+  `funcs` or `names` surfaces. Use `disasm_calls` when unresolved/raw targets
+  are required. Keep the equality visible to the query planner (do not hide it
+  behind a forced materialized CTE) when bounded work matters.
+- Exact equality on `string_refs.func_addr` similarly uses one function-scoped
+  reference read, one string-catalog read, and one function-identity read. It
+  does not materialize `xref_index` or join the whole function catalog.
 
 ## Known Limitations
 
 - For decompiler-backed locals, treat `local_id` as an opaque canonical identifier from the source;
   do not assume it will look like `local_8` or `param_1`.
+- Ghidra has no indexed whole-program scalar search. A value-only query such as
+  `SELECT * FROM constants WHERE value = 40000` therefore fails immediately instead of
+  materializing every instruction and data item. Add an exact `func_addr` predicate for
+  bounded lookup, for example
+  `SELECT * FROM constants WHERE func_addr = 0x401000 AND value = 40000`.
 
 ### Embedding
 

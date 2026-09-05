@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include <xsql/interruption.hpp>
+
 namespace ghidrasql::entities {
 
 namespace {
@@ -782,6 +784,11 @@ std::vector<model::DecompCommentRow> derive_decomp_comment_rows(const std::share
     std::vector<model::FunctionRow> functions;
     source->read_functions(functions);
     const auto function_ranges = build_function_ranges(functions);
+    std::unordered_map<std::int64_t, std::string> function_names;
+    function_names.reserve(functions.size());
+    for (const auto& function : functions) {
+        function_names.emplace(function.address, function.name);
+    }
 
     std::vector<model::DecompCommentRow> out;
     out.reserve(comments.size());
@@ -811,6 +818,12 @@ std::vector<model::PseudocodeRow> derive_pseudocode_row_for(
     const std::shared_ptr<Source>& source, std::int64_t func_addr)
 {
     if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
+        // Direct libghidra clients may decompile an address anywhere inside a
+        // function. A SQL equality predicate is stricter: never return a row
+        // whose canonical entry point differs from WHERE func_addr = X.
+        if (detail->func_addr != 0 && detail->func_addr != func_addr) {
+            return {};
+        }
         model::PseudocodeRow row;
         row.func_addr = detail->func_addr == 0 ? func_addr : detail->func_addr;
         row.func_name = detail->func_name;
@@ -821,6 +834,10 @@ std::vector<model::PseudocodeRow> derive_pseudocode_row_for(
         }
         row.text = detail->pseudocode;
         row.is_stale = (!detail->completed || detail->is_fallback) ? 1 : 0;
+        row.prototype = detail->prototype;
+        row.completed = detail->completed ? 1 : 0;
+        row.is_fallback = detail->is_fallback ? 1 : 0;
+        row.error_message = detail->error_message;
         if (!row.text.empty()) {
             return {std::move(row)};
         }
@@ -837,6 +854,7 @@ std::vector<model::PseudocodeRow> derive_pseudocode_row_for(
         row.func_name = fn->name;
     }
     row.is_stale = 0;
+    row.completed = 1;
     return {std::move(row)};
 }
 
@@ -2442,29 +2460,20 @@ std::vector<model::RelocationRow> derive_relocation_rows(const std::shared_ptr<S
     return out;
 }
 
-std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Source>& source) {
-    std::vector<model::InstructionRow> instructions;
-    source->read_instructions(instructions);
-    std::vector<model::DataItemRow> data_items;
-    source->read_data_items(data_items);
-    std::vector<model::FunctionRow> functions;
-    source->read_functions(functions);
-    auto function_for = [&functions](std::int64_t address) -> std::int64_t {
-        for (const auto& fn : functions) {
-            const std::int64_t end = fn.end_ea > fn.address
-                ? fn.end_ea
-                : (fn.address + std::max<std::int64_t>(fn.size, 1));
-            if (address >= fn.address && address < end) {
-                return fn.address;
-            }
-        }
-        return 0;
-    };
+namespace {
 
+std::vector<model::ConstantRow> derive_constant_rows_from(
+        const std::vector<model::InstructionRow>& instructions,
+        const std::vector<model::DataItemRow>& data_items,
+        const std::vector<FunctionRange>& function_ranges) {
     std::unordered_set<std::int64_t> seen_addr;
     std::vector<model::ConstantRow> out;
+    out.reserve(instructions.size() / 4 + data_items.size() / 4);
 
     for (const auto& insn : instructions) {
+        if (xsql::vtab_interrupted()) {
+            break;
+        }
         std::int64_t literal = 0;
         bool ok = extract_first_numeric_literal(insn.operands, literal);
         if (!ok) {
@@ -2479,7 +2488,7 @@ std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Sourc
 
         model::ConstantRow row;
         row.address = insn.address;
-        row.func_addr = 0;
+        row.func_addr = function_for_address(function_ranges, insn.address);
         row.value = literal;
         row.width = 8;
         std::ostringstream repr;
@@ -2491,6 +2500,9 @@ std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Sourc
     }
 
     for (const auto& d : data_items) {
+        if (xsql::vtab_interrupted()) {
+            break;
+        }
         std::int64_t literal = 0;
         if (!extract_first_numeric_literal(d.value_repr, literal)) {
             continue;
@@ -2500,7 +2512,7 @@ std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Sourc
         }
         model::ConstantRow row;
         row.address = d.address;
-        row.func_addr = function_for(d.address);
+        row.func_addr = function_for_address(function_ranges, d.address);
         row.value = literal;
         row.width = d.size > 0 ? std::min<std::int64_t>(d.size, 8) : 8;
         row.repr = d.value_repr;
@@ -2509,6 +2521,55 @@ std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Sourc
         seen_addr.insert(d.address);
     }
     return out;
+}
+
+std::int64_t constant_function_end_inclusive(const model::FunctionRow& fn) {
+    if (fn.end_ea > fn.address) {
+        return fn.end_ea - 1;
+    }
+    const std::int64_t delta = std::max<std::int64_t>(fn.size, 1) - 1;
+    if (fn.address > std::numeric_limits<std::int64_t>::max() - delta) {
+        return std::numeric_limits<std::int64_t>::max();
+    }
+    return fn.address + delta;
+}
+
+}  // namespace
+
+std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Source>& source) {
+    std::vector<model::InstructionRow> instructions;
+    if (!source->read_instructions(instructions)) {
+        return {};
+    }
+    std::vector<model::DataItemRow> data_items;
+    if (!source->read_data_items(data_items)) {
+        return {};
+    }
+    std::vector<model::FunctionRow> functions;
+    if (!source->read_functions(functions)) {
+        return {};
+    }
+    return derive_constant_rows_from(
+        instructions, data_items, build_function_ranges(functions));
+}
+
+std::vector<model::ConstantRow> derive_constant_rows_for(
+        const std::shared_ptr<Source>& source, std::int64_t func_addr) {
+    model::FunctionRow function;
+    if (!source->read_function_at(func_addr, function)) {
+        return {};
+    }
+    const auto end = constant_function_end_inclusive(function);
+    std::vector<model::InstructionRow> instructions;
+    if (!source->read_instructions_in_range(function.address, end, instructions)) {
+        return {};
+    }
+    std::vector<model::DataItemRow> data_items;
+    if (!source->read_data_items_in_range(function.address, end, data_items)) {
+        return {};
+    }
+    return derive_constant_rows_from(
+        instructions, data_items, build_function_ranges({function}));
 }
 
 std::vector<model::EquateRow> derive_equate_rows(const std::shared_ptr<Source>& source) {
@@ -2865,6 +2926,11 @@ std::vector<model::CallEdgeRow> derive_call_edge_rows(const std::shared_ptr<Sour
     std::vector<model::FunctionRow> functions;
     source->read_functions(functions);
     const auto function_ranges = build_function_ranges(functions);
+    std::unordered_map<std::int64_t, std::string> function_names;
+    function_names.reserve(functions.size());
+    for (const auto& function : functions) {
+        function_names.emplace(function.address, function.name);
+    }
 
     struct CallEdgeKey {
         std::int64_t src;
@@ -2891,10 +2957,16 @@ std::vector<model::CallEdgeRow> derive_call_edge_rows(const std::shared_ptr<Sour
         }
         model::CallEdgeRow row;
         row.src_func_addr = function_for_address(function_ranges, x.from_ea);
+        if (const auto it = function_names.find(row.src_func_addr); it != function_names.end()) {
+            row.src_func_name = it->second;
+        }
         row.call_site = x.from_ea;
         row.dst_addr = x.to_ea;
         const std::int64_t dst_func = function_for_address(function_ranges, x.to_ea);
         row.dst_func_addr = dst_func != 0 ? dst_func : x.to_ea;
+        if (const auto it = function_names.find(row.dst_func_addr); it != function_names.end()) {
+            row.dst_func_name = it->second;
+        }
         row.kind = x.kind.empty() ? "call" : x.kind;
         CallEdgeKey key{row.src_func_addr, row.call_site, row.dst_func_addr, row.kind};
         if (!seen.insert(std::move(key)).second) {

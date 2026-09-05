@@ -87,12 +87,63 @@ public:
         return read_rows(callbacks_.read_xrefs, out);
     }
 
+    bool read_xrefs_to(
+        std::int64_t to_address, std::vector<model::XrefRow>& out) const override {
+        if (callbacks_.read_xrefs_to) {
+            return callbacks_.read_xrefs_to(to_address, out);
+        }
+        return Source::read_xrefs_to(to_address, out);
+    }
+
+    bool read_xrefs_from_function(
+        std::int64_t function_address,
+        std::vector<model::XrefRow>& out) const override {
+        if (callbacks_.read_xrefs_from_function) {
+            return callbacks_.read_xrefs_from_function(function_address, out);
+        }
+        return Source::read_xrefs_from_function(function_address, out);
+    }
+
     bool read_function_calls(std::vector<model::FunctionCallRow>& out) const override {
         return read_rows(callbacks_.read_function_calls, out);
     }
 
+    bool read_leaf_functions(std::vector<model::FunctionRow>& out) const override {
+        if (callbacks_.read_leaf_functions) {
+            return callbacks_.read_leaf_functions(out);
+        }
+        return Source::read_leaf_functions(out);
+    }
+
     bool read_call_edges(std::vector<model::CallEdgeRow>& out) const override {
         return read_rows(callbacks_.read_call_edges, out);
+    }
+
+    bool read_call_edges_at(
+        std::int64_t call_site,
+        std::vector<model::CallEdgeRow>& out) const override {
+        if (callbacks_.read_call_edges_at) {
+            return callbacks_.read_call_edges_at(call_site, out);
+        }
+        return Source::read_call_edges_at(call_site, out);
+    }
+
+    bool read_call_edges_from(
+        std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const override {
+        if (callbacks_.read_call_edges_from) {
+            return callbacks_.read_call_edges_from(function_address, out);
+        }
+        return Source::read_call_edges_from(function_address, out);
+    }
+
+    bool read_call_edges_to(
+        std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const override {
+        if (callbacks_.read_call_edges_to) {
+            return callbacks_.read_call_edges_to(function_address, out);
+        }
+        return Source::read_call_edges_to(function_address, out);
     }
 
     bool read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const override {

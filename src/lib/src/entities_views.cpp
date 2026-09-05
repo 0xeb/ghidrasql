@@ -98,28 +98,19 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS callgraph_edges AS
             SELECT
                 c.src_func_addr,
-                COALESCE(sf.name, printf('sub_%X', c.src_func_addr)) AS src_func_name,
+                COALESCE(NULLIF(c.src_func_name, ''),
+                         printf('sub_%X', c.src_func_addr)) AS src_func_name,
                 c.dst_func_addr,
-                COALESCE(df.name, ds.name, printf('sub_%X', c.dst_func_addr)) AS dst_func_name,
-                c.call_site
+                COALESCE(NULLIF(c.dst_func_name, ''),
+                         printf('sub_%X', c.dst_func_addr)) AS dst_func_name,
+                c.call_site,
+                -- Raw target. dst_func_addr is 0 when the destination is not
+                -- inside a function (import, PLT/thunk stub, unresolved
+                -- indirect), and dst_addr is then the only thing identifying
+                -- where the call goes. callers/callees need it to keep those
+                -- edges visible.
+                c.dst_addr
             FROM call_edges c
-            LEFT JOIN funcs sf ON sf.addr = c.src_func_addr
-            LEFT JOIN funcs df ON df.addr = c.dst_func_addr
-            LEFT JOIN names ds ON ds.addr = c.dst_func_addr
-        )");
-
-        db.exec(R"(
-            CREATE VIEW IF NOT EXISTS string_refs AS
-            SELECT
-                s.addr AS string_addr,
-                s.content AS string_value,
-                s.length AS string_length,
-                xi.from_addr AS ref_addr,
-                f.addr AS func_addr,
-                f.name AS func_name
-            FROM strings s
-            JOIN xref_index xi ON xi.to_addr = s.addr
-            LEFT JOIN funcs f ON f.addr = xi.src_func_addr
         )");
 
         db.exec(R"(
@@ -217,17 +208,16 @@ namespace ghidrasql::entities {
             CREATE VIEW IF NOT EXISTS disasm_calls AS
             SELECT
                 src_func_addr AS func_addr,
+                src_func_name,
                 call_site AS addr,
                 CASE
                     WHEN dst_func_addr IS NOT NULL AND dst_func_addr != 0 THEN dst_func_addr
                     ELSE dst_addr
                 END AS callee_addr,
-                COALESCE(df.name, dn.name, '') AS callee_name,
+                dst_func_name AS callee_name,
                 call_site AS call_addr,
                 kind
             FROM call_edges c
-            LEFT JOIN funcs df ON df.addr = c.dst_func_addr
-            LEFT JOIN names dn ON dn.addr = c.dst_addr
         )");
 
         db.exec(R"(
@@ -267,10 +257,8 @@ namespace ghidrasql::entities {
                     END AS obj_addr,
                     CAST(NULL AS INTEGER) AS num_value,
                     CAST(NULL AS TEXT) AS str_value,
-                    COALESCE(df.name, dn.name, '') AS var_name
+                    c.dst_func_name AS var_name
                 FROM call_edges c
-                LEFT JOIN funcs df ON df.addr = c.dst_func_addr
-                LEFT JOIN names dn ON dn.addr = c.dst_addr
             ),
             loop_nodes AS (
                 SELECT
@@ -358,9 +346,13 @@ namespace ghidrasql::entities {
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS ctree_call_args AS
             WITH calls AS (
-                SELECT func_addr, item_id
-                FROM ctree
-                WHERE op_name = 'cot_call'
+                SELECT
+                    c.src_func_addr AS func_addr,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.src_func_addr
+                        ORDER BY c.call_site, c.dst_func_addr, c.dst_addr
+                    ) AS item_id
+                FROM call_edges c
             )
             SELECT
                 c.func_addr,
@@ -540,30 +532,14 @@ namespace ghidrasql::entities {
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS ctree_v_leaf_funcs AS
-            SELECT
-                f.addr,
-                f.name
-            FROM funcs f
-            LEFT JOIN ctree_v_calls c
-                ON c.func_addr = f.addr
-               AND c.callee_addr IS NOT NULL
-               AND c.callee_addr != 0
-            GROUP BY f.addr, f.name
-            HAVING COUNT(c.callee_addr) = 0
+            SELECT addr, name
+            FROM leaf_funcs
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS disasm_v_leaf_funcs AS
-            SELECT
-                f.addr,
-                f.name
-            FROM funcs f
-            LEFT JOIN disasm_calls c
-                ON c.func_addr = f.addr
-               AND c.callee_addr IS NOT NULL
-               AND c.callee_addr != 0
-            GROUP BY f.addr, f.name
-            HAVING COUNT(c.callee_addr) = 0
+            SELECT addr, name
+            FROM leaf_funcs
         )");
 
         db.exec(R"(
@@ -622,26 +598,61 @@ namespace ghidrasql::entities {
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS callers AS
+            -- Two branches rather than one COALESCE, deliberately.
+            --
+            -- Re-basing these views on callgraph_edges buys an exact
+            -- dst_func_addr pushdown, but a bare `dst_func_addr != 0` also drops
+            -- every call to a non-function destination -- imports, PLT/thunk
+            -- stubs, unresolved indirect targets. Those rows were present before
+            -- (disasm_calls.callee_addr coalesces to dst_addr), they are what
+            -- makes "who calls memcpy" answerable, and idasql/bnsql include them
+            -- in callees, so dropping them would break cross-tool parity too.
+            --
+            -- Wrapping func_addr in a CASE would keep the rows but hide the
+            -- column behind an expression, defeating the pushdown this patch
+            -- exists for. The union keeps the resolved branch a direct
+            -- column-to-column mapping, so `WHERE func_addr = X` still pushes
+            -- down there, and only the unresolved minority falls back to a scan.
             SELECT
-                d.callee_addr AS func_addr,
-                d.addr AS caller_addr,
-                COALESCE(f.name, printf('sub_%X', d.func_addr)) AS caller_name,
-                d.func_addr AS caller_func_addr
-            FROM disasm_calls d
-            LEFT JOIN funcs f ON f.addr = d.func_addr
-            WHERE d.callee_addr IS NOT NULL AND d.callee_addr != 0
+                c.dst_func_addr AS func_addr,
+                c.call_site AS caller_addr,
+                c.src_func_name AS caller_name,
+                c.src_func_addr AS caller_func_addr
+            FROM callgraph_edges c
+            WHERE c.dst_func_addr IS NOT NULL AND c.dst_func_addr != 0
+            UNION ALL
+            SELECT
+                c.dst_addr AS func_addr,
+                c.call_site AS caller_addr,
+                c.src_func_name AS caller_name,
+                c.src_func_addr AS caller_func_addr
+            FROM callgraph_edges c
+            WHERE (c.dst_func_addr IS NULL OR c.dst_func_addr = 0)
+              AND c.dst_addr IS NOT NULL AND c.dst_addr != 0
         )");
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS callees AS
+            -- Same reasoning as callers: keep calls to non-function
+            -- destinations. Here func_addr is src_func_addr in BOTH branches, so
+            -- the common `callees WHERE func_addr = X` pushes down for imports
+            -- and resolved targets alike; only callee_addr differs per branch.
             SELECT
-                d.func_addr,
-                COALESCE(f.name, printf('sub_%X', d.func_addr)) AS func_name,
-                d.callee_addr,
-                d.callee_name
-            FROM disasm_calls d
-            LEFT JOIN funcs f ON f.addr = d.func_addr
-            WHERE d.callee_addr IS NOT NULL AND d.callee_addr != 0
+                c.src_func_addr AS func_addr,
+                c.src_func_name AS func_name,
+                c.dst_func_addr AS callee_addr,
+                c.dst_func_name AS callee_name
+            FROM callgraph_edges c
+            WHERE c.dst_func_addr IS NOT NULL AND c.dst_func_addr != 0
+            UNION ALL
+            SELECT
+                c.src_func_addr AS func_addr,
+                c.src_func_name AS func_name,
+                c.dst_addr AS callee_addr,
+                c.dst_func_name AS callee_name
+            FROM callgraph_edges c
+            WHERE (c.dst_func_addr IS NULL OR c.dst_func_addr = 0)
+              AND c.dst_addr IS NOT NULL AND c.dst_addr != 0
         )");
 
         db.exec(R"(
@@ -877,21 +888,26 @@ namespace ghidrasql::entities {
 
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS decompiler_listing AS
-            WITH local_counts AS (
-                SELECT func_addr, COUNT(*) AS local_count
-                FROM decomp_lvars
-                GROUP BY func_addr
-            )
             SELECT
                 p.func_addr,
                 p.func_name,
                 p.text AS pseudocode,
-                COALESCE(fm.token_count, 0) AS token_count,
-                COALESCE(lc.local_count, 0) AS local_count,
-                COALESCE(fm.hotness_score, 0) AS hotness_score
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM decomp_tokens dt
+                    WHERE dt.func_addr = p.func_addr
+                ), 0) AS token_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM decomp_lvars dl
+                    WHERE dl.func_addr = p.func_addr
+                ), 0) AS local_count,
+                COALESCE((
+                    SELECT fm.hotness_score
+                    FROM function_metrics_scored fm
+                    WHERE fm.func_addr = p.func_addr
+                ), 0) AS hotness_score
             FROM pseudocode p
-            LEFT JOIN function_metrics_scored fm ON fm.func_addr = p.func_addr
-            LEFT JOIN local_counts lc ON lc.func_addr = p.func_addr
         )");
 
         db.exec(R"(

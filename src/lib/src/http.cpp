@@ -20,6 +20,9 @@ xsql::json query_result_to_json(const QueryResult& result) {
     j["success"] = result.success;
     j["timed_out"] = result.timed_out;
     j["partial"] = result.partial;
+    if (!result.warnings.empty()) {
+        j["warnings"] = result.warnings;
+    }
     j["elapsed_ms"] = result.elapsed_ms;
     if (!result.success) {
         j["error"] = result.error;
@@ -44,6 +47,9 @@ xsql::ScriptStatementResult to_script_stmt(const QueryResult& src, std::size_t i
     dst.success = src.success;
     dst.error = src.error;
     dst.elapsed_ms = static_cast<double>(src.elapsed_ms);
+    dst.timed_out = src.timed_out;
+    dst.partial = src.partial;
+    dst.warnings = src.warnings;
     dst.columns = src.columns;
     dst.rows.reserve(src.rows.size());
     for (const auto& row : src.rows) {
@@ -139,6 +145,7 @@ static std::string build_http_help_text() {
         "  GET  /         - Welcome message\n"
         "  GET  /help     - This documentation\n"
         "  POST /query    - Execute SQL (body = raw SQL, or JSON {sql,continue_on_error,include_sql}; multi-statement supported, response = JSON)\n"
+        "  POST /cancel   - Cancel the in-flight query and its active libghidra RPC\n"
         "  GET  /status   - Server status\n"
         "  POST /shutdown        - Stop server (async; returns immediately)\n"
         "  GET  /shutdown/status - Poll shutdown progress (phase: idle|http_stopping|java_exiting|complete|force_killed)\n"
@@ -185,14 +192,16 @@ int HttpServer::start(
     InfoFn info_fn,
     Options options,
     RefreshFn refresh_fn,
-    ProjectControlFns project_fns) {
+    ProjectControlFns project_fns,
+    CancelFn cancel_fn) {
     if (server_) {
         return server_->port();
     }
 
     xsql::thinclient::http_query_server_config cfg;
     configure_common(cfg, std::move(info_fn), std::move(options),
-                     std::move(refresh_fn), std::move(project_fns));
+                     std::move(refresh_fn), std::move(project_fns),
+                     std::move(cancel_fn));
 
     // Wrap the user-supplied script executor so /health/deep can observe whether
     // a worker is currently busy and how long the oldest in-flight call has
@@ -224,14 +233,16 @@ int HttpServer::start(
     InfoFn info_fn,
     Options options,
     RefreshFn refresh_fn,
-    ProjectControlFns project_fns) {
+    ProjectControlFns project_fns,
+    CancelFn cancel_fn) {
     if (server_) {
         return server_->port();
     }
 
     xsql::thinclient::http_query_server_config cfg;
     configure_common(cfg, std::move(info_fn), std::move(options),
-                     std::move(refresh_fn), std::move(project_fns));
+                     std::move(refresh_fn), std::move(project_fns),
+                     std::move(cancel_fn));
 
     cfg.query_fn = [this, fn = std::move(query_fn)](const std::string& sql) -> std::string {
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -253,7 +264,8 @@ void HttpServer::configure_common(
     InfoFn info_fn,
     Options options,
     RefreshFn refresh_fn,
-    ProjectControlFns project_fns) {
+    ProjectControlFns project_fns,
+    CancelFn cancel_fn) {
     options_ = std::move(options);
     info_fn_ = std::move(info_fn);
     refresh_fn_ = std::move(refresh_fn);
@@ -269,6 +281,7 @@ void HttpServer::configure_common(
     cfg.port = options_.port;
     cfg.bind_address = options_.bind_address;
     cfg.auth_token = options_.auth_token;
+    cfg.cancel_fn = std::move(cancel_fn);
     // /status carries readiness DATA (running/port/info) here, and ghidrasql exposes a
     // separate public /health liveness probe, so /status stays bearer-guarded (unlike
     // the shared server's default of a public /status liveness probe).

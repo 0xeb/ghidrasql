@@ -36,6 +36,7 @@ struct QueryResult {
     std::vector<std::string> columns;
     std::vector<Row> rows;
     std::string error;
+    std::vector<std::string> warnings;
     bool success = false;
     bool timed_out = false;
     bool partial = false;
@@ -56,6 +57,7 @@ public:
     ~QueryEngine();
 
     QueryResult query(const std::string& sql);
+    QueryResult query(const std::string& sql, const xsql::QueryOptions& options);
     bool execute(const std::string& sql);
     bool execute_script(
         const std::string& script,
@@ -91,8 +93,7 @@ private:
 std::unique_ptr<QueryEngine> create_libghidra_engine(
     const std::string& base_url,
     const std::string& auth_token = {},
-    bool read_only = false,
-    int auto_save_interval = 0);
+    bool read_only = false);
 std::unique_ptr<QueryEngine> create_libghidra_engine(const LibGhidraSourceOptions& options);
 std::unique_ptr<QueryEngine> create_callback_engine(SourceCallbacks callbacks);
 
@@ -186,6 +187,7 @@ public:
         std::function<xsql::ScriptResult(const std::string&, const xsql::ScriptOptions&)>;
     using InfoFn = std::function<std::string()>;
     using RefreshFn = std::function<bool()>;
+    using CancelFn = std::function<void()>;
     using ProjectBodyFn = std::function<std::string(const std::string&)>;
     using ProjectInfoFn = std::function<std::string()>;
 
@@ -212,7 +214,8 @@ public:
         InfoFn info_fn,
         Options options = {},
         RefreshFn refresh_fn = {},
-        ProjectControlFns project_fns = {});
+        ProjectControlFns project_fns = {},
+        CancelFn cancel_fn = {});
     // Legacy overload: wires the JSON-string callback directly (no server-side
     // option parsing). Overload resolution selects this for 1-arg callbacks.
     int start(
@@ -220,7 +223,8 @@ public:
         InfoFn info_fn,
         Options options = {},
         RefreshFn refresh_fn = {},
-        ProjectControlFns project_fns = {});
+        ProjectControlFns project_fns = {},
+        CancelFn cancel_fn = {});
     void stop();
     bool is_running() const;
     int port() const;
@@ -240,7 +244,8 @@ private:
         InfoFn info_fn,
         Options options,
         RefreshFn refresh_fn,
-        ProjectControlFns project_fns);
+        ProjectControlFns project_fns,
+        CancelFn cancel_fn);
     // Construct and start the underlying server from a fully-populated config.
     // Returns the bound port, or 0 on failure.
     int launch(xsql::thinclient::http_query_server_config cfg);

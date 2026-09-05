@@ -47,7 +47,7 @@ class QueryEngine::Impl {
 public:
     explicit Impl(std::shared_ptr<Source> source = nullptr)
         : source_(std::move(source)) {
-        // Shared runtime settings for this engine instance. ghidrasql historically
+        // Runtime settings for this engine instance. ghidrasql historically
         // applied a per-query timeout only when it was explicitly > 0 (default 0 ==
         // "no timeout / use the transport default"); the shared core defaults
         // query_timeout_ms to 60000, so seed it back to 0 to preserve behavior.
@@ -69,6 +69,12 @@ public:
     ~Impl() = default;
 
     QueryResult query(const std::string& sql) {
+        return query(sql, nullptr);
+    }
+
+    QueryResult query(
+        const std::string& sql,
+        const xsql::QueryOptions* request_options) {
         // Multi-statement input must run per-statement: sqlite3_prepare consumes
         // only the FIRST statement (silently dropping the rest), and the
         // single-pragma fast path below mis-parses a block that merely BEGINS with
@@ -92,7 +98,7 @@ public:
             BatchScope batch_scope(*this);
             QueryResult last;
             for (const auto& stmt : statements) {
-                last = execute_one_in_batch(stmt);
+                last = execute_one_in_batch(stmt, request_options);
                 if (!last.success) {
                     error_ = last.error;
                     return last;
@@ -113,7 +119,7 @@ public:
             return pragma_result;
         }
         refresh_if_needed();
-        return execute_sql(sql);
+        return execute_sql(sql, request_options);
     }
 
     bool execute(const std::string& sql) {
@@ -183,12 +189,18 @@ public:
         }
         refresh_if_needed();
         BatchScope batch_scope(*this);
+        xsql::QueryOptions query_options;
+        query_options.timeout_ms = options.timeout_ms;
+        query_options.should_cancel = options.should_cancel;
         xsql::ScriptResult out = xsql::run_script(script, options,
-            [this](const std::string& stmt, xsql::ScriptStatementResult& sr) {
-                QueryResult r = execute_one_in_batch(stmt);
+            [this, &query_options](const std::string& stmt, xsql::ScriptStatementResult& sr) {
+                QueryResult r = execute_one_in_batch(stmt, &query_options);
                 sr.success = r.success;
                 sr.error = r.error;
                 sr.elapsed_ms = static_cast<double>(r.elapsed_ms);
+                sr.timed_out = r.timed_out;
+                sr.partial = r.partial;
+                sr.warnings = r.warnings;
                 sr.columns = r.columns;
                 sr.rows.reserve(r.rows.size());
                 for (const auto& row : r.rows) {
@@ -374,7 +386,9 @@ private:
         return true;
     }
 
-    QueryResult execute_sql(const std::string& sql) {
+    QueryResult execute_sql(
+        const std::string& sql,
+        const xsql::QueryOptions* request_options = nullptr) {
         QueryResult result;
         if (!db_.is_open()) {
             error_ = "database is not open";
@@ -382,11 +396,29 @@ private:
             return result;
         }
 
+        // A few writable derived tables need indexed rows while SQLite executes
+        // xUpdate. Their state is statement-owned even though the callbacks live
+        // in the long-lived table registry. Clear defensively before execution
+        // and unconditionally at scope exit, including errors and cancellation.
+        struct QueryStateGuard {
+            entities::TableRegistry* tables = nullptr;
+            explicit QueryStateGuard(entities::TableRegistry* value) : tables(value) {
+                if (tables) tables->invalidate_all();
+            }
+            ~QueryStateGuard() {
+                if (tables) tables->invalidate_all();
+            }
+        } query_state(tables_.get());
+
+        xsql::QueryOptions opts = request_options
+            ? *request_options : xsql::QueryOptions{};
+        const int runtime_timeout_ms = settings_->query_timeout_ms();
+        if (runtime_timeout_ms > 0 &&
+            (opts.timeout_ms <= 0 || runtime_timeout_ms < opts.timeout_ms)) {
+            opts.timeout_ms = runtime_timeout_ms;
+        }
         xsql::Result raw;
-        const int timeout_ms = settings_->query_timeout_ms();
-        if (timeout_ms > 0) {
-            xsql::QueryOptions opts;
-            opts.timeout_ms = timeout_ms;
+        if (opts.timeout_ms > 0 || opts.should_cancel) {
             raw = db_.query(sql, opts);
         } else {
             raw = db_.query(sql);
@@ -398,6 +430,7 @@ private:
             result.rows.push_back(Row{std::move(raw_row.values)});
         }
         result.error = raw.error;
+        result.warnings = std::move(raw.warnings);
         result.success = raw.ok();
         result.timed_out = raw.timed_out;
         result.partial = raw.partial;
@@ -440,12 +473,14 @@ private:
     }
 
     // Execute one statement inside an active BatchScope, applying read-only
-    // detection, a pre-read cache flush, and post-mutation revision tracking.
+    // detection and post-mutation revision tracking.
     // This is the single per-statement path shared by execute_script() (vector
     // results) and run_script() (canonical envelope) so they cannot drift. A
     // prepare failure (e.g. unknown table) returns an unsuccessful QueryResult
     // carrying the error.
-    QueryResult execute_one_in_batch(const std::string& stmt) {
+    QueryResult execute_one_in_batch(
+        const std::string& stmt,
+        const xsql::QueryOptions* query_options = nullptr) {
         QueryResult result;
 
         // A `PRAGMA ghidrasql.*` statement is a runtime control, not SQL: it must
@@ -473,7 +508,7 @@ private:
         const std::int64_t revision_before =
             token_before ? token_before->modification_number : current_revision();
 
-        result = execute_sql(stmt);
+        result = execute_sql(stmt, query_options);
         if (!result.success) {
             return result;
         }
@@ -556,6 +591,8 @@ private:
     void register_cache_functions() {
         db_.register_function("cache_stats", 0, [this](xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
             xsql::json j;
+            j["materialization_scope"] = "query";
+            j["retained_rows_between_statements"] = false;
             j["cache_invalidations_total"] = cache_invalidations_total_;
             j["last_seen_revision"] = last_seen_revision_;
             if (last_seen_token_) {
@@ -586,6 +623,7 @@ private:
                 "project_files",
                 "project_programs",
                 "funcs",
+                "leaf_funcs",
                 "segments",
                 "memory_blocks",
                 "bytes",
@@ -594,6 +632,7 @@ private:
                 "imports",
                 "entries",
                 "strings",
+                "string_refs",
                 "xrefs",
                 "call_edges",
                 "function_calls",
@@ -766,6 +805,12 @@ QueryResult QueryEngine::query(const std::string& sql) {
     return impl_->query(sql);
 }
 
+QueryResult QueryEngine::query(
+    const std::string& sql,
+    const xsql::QueryOptions& options) {
+    return impl_->query(sql, &options);
+}
+
 bool QueryEngine::execute(const std::string& sql) {
     return impl_->execute(sql);
 }
@@ -831,13 +876,11 @@ int QueryEngine::query_timeout_ms() const {
 
 std::unique_ptr<QueryEngine> create_libghidra_engine(const std::string& base_url,
                                                      const std::string& auth_token,
-                                                     bool read_only,
-                                                     int auto_save_interval) {
+                                                     bool read_only) {
     LibGhidraSourceOptions options;
     options.base_url = base_url;
     options.auth_token = auth_token;
     options.read_only = read_only;
-    options.auto_save_interval = auto_save_interval;
     return create_libghidra_engine(options);
 }
 

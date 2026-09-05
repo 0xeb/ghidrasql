@@ -145,6 +145,15 @@ struct StringRow {
     std::string content;
 };
 
+struct StringRefRow {
+    std::int64_t string_addr = 0;
+    std::string string_value;
+    std::int64_t string_length = 0;
+    std::int64_t ref_addr = 0;
+    std::int64_t func_addr = 0;
+    std::string func_name;
+};
+
 struct XrefRow {
     std::int64_t from_ea = 0;
     std::int64_t to_ea = 0;
@@ -155,9 +164,11 @@ struct XrefRow {
 
 struct CallEdgeRow {
     std::int64_t src_func_addr = 0;
+    std::string src_func_name;
     std::int64_t call_site = 0;
     std::int64_t dst_addr = 0;
     std::int64_t dst_func_addr = 0;
+    std::string dst_func_name;
     std::string kind;
 };
 
@@ -499,6 +510,10 @@ struct PseudocodeRow {
     std::string func_name;
     std::string text;
     int is_stale = 0;
+    std::string prototype;
+    int completed = 1;
+    int is_fallback = 0;
+    std::string error_message;
 };
 
 // One high-P-code (SSA) op — the Ghidra leg of the cross-tool low-level IR. `op` is the
@@ -686,7 +701,6 @@ struct LibGhidraSourceOptions {
     std::string program_path;
     bool analyze = false;
     bool read_only = false;
-    int auto_save_interval = 0;  // 0 = disabled; N > 0 = save every N mutations
     // HTTP read timeout for libghidra RPCs (per-call wall-clock budget).
     // 0 = use libghidra's default (120s). Tune lower (e.g. 30000) when
     // you'd rather have a wedged RPC fail fast and free the worker than
@@ -697,6 +711,7 @@ struct LibGhidraSourceOptions {
 struct SourceCallbacks {
     std::function<bool(std::vector<model::ProjectFileRow>&)> read_project_files;
     std::function<bool(std::vector<model::FunctionRow>&)> read_functions;
+    std::function<bool(std::vector<model::FunctionRow>&)> read_leaf_functions;
     std::function<bool(std::int64_t, model::FunctionRow&)> read_function_at;
     std::function<bool(std::vector<model::SegmentRow>&)> read_segments;
     std::function<bool(std::vector<model::SymbolRow>&)> read_symbols;
@@ -718,8 +733,14 @@ struct SourceCallbacks {
     // unmapped/uninitialized ranges (so uninitialized bytes stay NULL-valued).
     std::function<bool(std::int64_t, std::int64_t, std::vector<std::uint8_t>&)> read_bytes;
     std::function<bool(std::vector<model::XrefRow>&)> read_xrefs;
+    std::function<bool(std::int64_t, std::vector<model::XrefRow>&)> read_xrefs_to;
+    std::function<bool(std::int64_t, std::vector<model::XrefRow>&)>
+        read_xrefs_from_function;
     std::function<bool(std::vector<model::FunctionCallRow>&)> read_function_calls;
     std::function<bool(std::vector<model::CallEdgeRow>&)> read_call_edges;
+    std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_at;
+    std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_from;
+    std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_to;
     std::function<bool(std::vector<model::MemoryBlockRow>&)> read_memory_blocks;
     std::function<bool(std::vector<model::DataItemRow>&)> read_data_items;
     std::function<bool(std::int64_t, std::vector<model::DataItemRow>&)> read_data_items_at;
@@ -894,9 +915,18 @@ public:
     // Last error message from a failed write operation (empty if none).
     virtual std::string last_error() const;
 
+    // Request out-of-band cancellation of an operation currently blocked in
+    // this source. Live transports may override this; fixture and callback
+    // sources report that downstream cancellation is unavailable.
+    virtual bool request_cancel() const;
+
     // Direct live row readers. Default implementation returns false (no data).
     virtual bool read_project_files(std::vector<model::ProjectFileRow>& out) const;
     virtual bool read_functions(std::vector<model::FunctionRow>& out) const;
+    // Functions with no outgoing call-like references. Live backends should
+    // classify these inside the native analysis host instead of transferring
+    // and aggregating the entire xref graph in SQL.
+    virtual bool read_leaf_functions(std::vector<model::FunctionRow>& out) const;
     virtual bool read_function_at(std::int64_t address, model::FunctionRow& out) const;
     virtual bool read_segments(std::vector<model::SegmentRow>& out) const;
     virtual bool read_symbols(std::vector<model::SymbolRow>& out) const;
@@ -922,8 +952,43 @@ public:
     virtual bool read_bytes(std::int64_t address, std::int64_t length,
                             std::vector<std::uint8_t>& out) const;
     virtual bool read_xrefs(std::vector<model::XrefRow>& out) const;
+    // References emitted at one exact source address. Live backends should
+    // override this with a bounded source query; the default filters read_xrefs
+    // so callback/fixture sources remain source-compatible.
+    virtual bool read_xrefs_from(
+        std::int64_t from_address,
+        std::vector<model::XrefRow>& out) const;
+    // References targeting one exact destination address. Live Ghidra-backed
+    // sources should use ReferenceManager.getReferencesTo rather than scanning
+    // every source reference. The default filters the bulk read for fixture
+    // and callback compatibility.
+    virtual bool read_xrefs_to(
+        std::int64_t to_address, std::vector<model::XrefRow>& out) const;
+    // Every reference emitted by one exact function entry. Live sources should
+    // bound the listing to that function and reject body holes/nested owners.
+    virtual bool read_xrefs_from_function(
+        std::int64_t function_address,
+        std::vector<model::XrefRow>& out) const;
     virtual bool read_function_calls(std::vector<model::FunctionCallRow>& out) const;
     virtual bool read_call_edges(std::vector<model::CallEdgeRow>& out) const;
+    // Calls emitted at one exact instruction address. Live backends should
+    // resolve the containing function and inspect only that function's xrefs;
+    // the default filters the bulk reader for fixture compatibility.
+    virtual bool read_call_edges_at(
+        std::int64_t call_site,
+        std::vector<model::CallEdgeRow>& out) const;
+    // Calls emitted by one exact function entry. Live backends should use the
+    // function body/range rather than materialising every reference in the
+    // program. The default filters the bulk reader for fixture compatibility.
+    virtual bool read_call_edges_from(
+        std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const;
+    // Calls targeting one exact function entry. Live backends should inspect
+    // only references whose destinations lie in that function body. The
+    // default filters the bulk reader for fixture compatibility.
+    virtual bool read_call_edges_to(
+        std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const;
     virtual bool read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const;
     virtual bool read_data_items(std::vector<model::DataItemRow>& out) const;
     virtual bool read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const;
@@ -953,6 +1018,10 @@ public:
         std::int64_t end_address,
         std::vector<model::StackVarRow>& out) const;
     virtual bool read_function_params(std::vector<model::FunctionParamRow>& out) const;
+    // Parameters belonging to one exact function. Live backends should
+    // override this with a point lookup; the default filters the bulk read so
+    // fixture and callback sources remain source-compatible.
+    virtual bool read_function_params_at(std::int64_t func_addr, std::vector<model::FunctionParamRow>& out) const;
     virtual bool read_instructions(std::vector<model::InstructionRow>& out) const;
     virtual bool read_instruction_at(std::int64_t address, model::InstructionRow& out) const;
     // Windowed instruction read; end_address INCLUSIVE, span-intersection

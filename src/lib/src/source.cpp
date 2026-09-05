@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_set>
 
 namespace ghidrasql {
 namespace {
@@ -183,9 +184,34 @@ bool byte_span_intersects_range(
 }
 
 std::string Source::last_error() const { return {}; }
+bool Source::request_cancel() const { return false; }
 
 bool Source::read_project_files(std::vector<model::ProjectFileRow>& out) const { return clear_and_fail(out); }
 bool Source::read_functions(std::vector<model::FunctionRow>& out) const { return clear_and_fail(out); }
+bool Source::read_leaf_functions(std::vector<model::FunctionRow>& out) const {
+    std::vector<model::FunctionRow> functions;
+    std::vector<model::CallEdgeRow> edges;
+    if (!read_functions(functions) || !read_call_edges(edges)) {
+        out.clear();
+        return false;
+    }
+    std::unordered_set<std::int64_t> callers;
+    callers.reserve(edges.size());
+    for (const auto& edge : edges) {
+        if (edge.src_func_addr != 0 &&
+            (edge.dst_func_addr != 0 || edge.dst_addr != 0)) {
+            callers.insert(edge.src_func_addr);
+        }
+    }
+    out.clear();
+    out.reserve(functions.size());
+    for (auto& function : functions) {
+        if (callers.find(function.address) == callers.end()) {
+            out.push_back(std::move(function));
+        }
+    }
+    return true;
+}
 bool Source::read_function_at(std::int64_t address, model::FunctionRow& out) const {
     std::vector<model::FunctionRow> all;
     if (!read_functions(all)) {
@@ -245,8 +271,113 @@ bool Source::read_bytes(std::int64_t, std::int64_t, std::vector<std::uint8_t>& o
     return false;
 }
 bool Source::read_xrefs(std::vector<model::XrefRow>& out) const { return clear_and_fail(out); }
+bool Source::read_xrefs_from(
+    std::int64_t from_address,
+    std::vector<model::XrefRow>& out) const {
+    std::vector<model::XrefRow> all;
+    if (!read_xrefs(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        if (row.from_ea == from_address) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
+bool Source::read_xrefs_to(
+    std::int64_t to_address,
+    std::vector<model::XrefRow>& out) const {
+    std::vector<model::XrefRow> all;
+    if (!read_xrefs(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        if (row.to_ea == to_address) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
+bool Source::read_xrefs_from_function(
+    std::int64_t function_address,
+    std::vector<model::XrefRow>& out) const {
+    std::vector<model::XrefRow> all;
+    std::vector<model::FunctionRow> functions;
+    if (!read_xrefs(all) || !read_functions(functions)) {
+        out.clear();
+        return false;
+    }
+    bool exact_entry = false;
+    for (const auto& fn : functions) {
+        if (fn.address == function_address) {
+            exact_entry = true;
+            break;
+        }
+    }
+    out.clear();
+    if (!exact_entry) return true;
+    for (auto& row : all) {
+        if (containing_func_addr(functions, row.from_ea) == function_address) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
 bool Source::read_function_calls(std::vector<model::FunctionCallRow>& out) const { return clear_and_fail(out); }
 bool Source::read_call_edges(std::vector<model::CallEdgeRow>& out) const { return clear_and_fail(out); }
+bool Source::read_call_edges_at(
+    std::int64_t call_site,
+    std::vector<model::CallEdgeRow>& out) const {
+    std::vector<model::CallEdgeRow> all;
+    if (!read_call_edges(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        if (row.call_site == call_site) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
+bool Source::read_call_edges_from(
+    std::int64_t function_address,
+    std::vector<model::CallEdgeRow>& out) const {
+    std::vector<model::CallEdgeRow> all;
+    if (!read_call_edges(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        if (row.src_func_addr == function_address) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
+bool Source::read_call_edges_to(
+    std::int64_t function_address,
+    std::vector<model::CallEdgeRow>& out) const {
+    std::vector<model::CallEdgeRow> all;
+    if (!read_call_edges(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        if (row.dst_func_addr == function_address) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
 bool Source::read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const { return clear_and_fail(out); }
 bool Source::read_data_items(std::vector<model::DataItemRow>& out) const { return clear_and_fail(out); }
 bool Source::read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const {
@@ -262,7 +393,22 @@ bool Source::read_data_items_in_range(
     std::int64_t start_address,
     std::int64_t end_address,
     std::vector<model::DataItemRow>& out) const {
-    // Default: filter the bulk read by covered-span intersection (end is
+    // A single-address window is an exact `WHERE addr = X` lookup, so delegate
+    // to the point reader.
+    //
+    // This matters because read_data_items_at() is virtual and a Source may
+    // override it WITHOUT overriding this range reader -- the callback-backed
+    // Source is exactly that shape. Since data_items became a generator table
+    // with range pushdown, every exact query arrives here instead of at the
+    // point reader, and without this branch it degrades to the bulk scan below.
+    // For a source whose bulk read is empty or expensive (a plugin serving
+    // point queries on demand), that turned a working exact lookup into zero
+    // rows. The regression is invisible against libghidra, which implements
+    // both readers.
+    if (start_address == end_address) {
+        return read_data_items_at(start_address, out);
+    }
+    // Otherwise: filter the bulk read by covered-span intersection (end is
     // INCLUSIVE — the read_comments_in_range convention).
     std::vector<model::DataItemRow> all;
     if (!read_data_items(all)) { out.clear(); return false; }
@@ -311,6 +457,22 @@ bool Source::read_stack_vars_in_range(
     return true;
 }
 bool Source::read_function_params(std::vector<model::FunctionParamRow>& out) const { return clear_and_fail(out); }
+bool Source::read_function_params_at(
+    std::int64_t func_addr,
+    std::vector<model::FunctionParamRow>& out) const {
+    std::vector<model::FunctionParamRow> all;
+    if (!read_function_params(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        if (row.func_addr == func_addr) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
 bool Source::read_instructions(std::vector<model::InstructionRow>& out) const { return clear_and_fail(out); }
 bool Source::read_instruction_at(std::int64_t address, model::InstructionRow& out) const {
     std::vector<model::InstructionRow> all;
@@ -537,6 +699,10 @@ std::optional<model::DecompilationDetail> Source::decompile_detail(std::int64_t 
     detail.completed = true;
     if (pseudo_it != pseudocode_rows.end()) {
         detail.func_name = pseudo_it->func_name;
+        detail.prototype = pseudo_it->prototype;
+        detail.completed = pseudo_it->completed != 0;
+        detail.is_fallback = pseudo_it->is_fallback != 0;
+        detail.error_message = pseudo_it->error_message;
     }
 
     model::FunctionRow function;

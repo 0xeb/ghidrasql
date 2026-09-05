@@ -34,6 +34,7 @@
 #include <cctype>
 #include <cerrno>
 #include <climits>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
@@ -53,6 +54,67 @@ std::atomic<bool> g_stop{false};
 
 void signal_handler(int) {
     g_stop.store(true);
+}
+
+// The process-wide SIGINT handler must remain async-signal-safe, so it only
+// latches g_stop. This request-scoped bridge turns that latch into both forms of
+// cancellation a live query needs: a cooperative SQLite predicate and an
+// out-of-band LibGhidraHost Cancel RPC for a thread blocked inside transport.
+// Without the bridge, installing signal_handler() accidentally swallows Ctrl-C
+// during one-shot -q execution until the current query/RPC finishes by itself.
+class CliCancellationBridge {
+public:
+    explicit CliCancellationBridge(std::shared_ptr<ghidrasql::Source> source)
+        : source_(std::move(source)), worker_([this]() { watch(); }) {}
+
+    CliCancellationBridge(const CliCancellationBridge&) = delete;
+    CliCancellationBridge& operator=(const CliCancellationBridge&) = delete;
+
+    ~CliCancellationBridge() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            finished_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    xsql::QueryOptions query_options() const {
+        xsql::QueryOptions options;
+        options.should_cancel = []() { return g_stop.load(); };
+        return options;
+    }
+
+private:
+    void watch() {
+        std::unique_lock<std::mutex> lock(mu_);
+        while (!finished_) {
+            if (g_stop.load()) {
+                lock.unlock();
+                if (source_) {
+                    source_->request_cancel();
+                }
+                return;
+            }
+            cv_.wait_for(lock, std::chrono::milliseconds(20));
+        }
+    }
+
+    std::shared_ptr<ghidrasql::Source> source_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool finished_ = false;
+    std::thread worker_;
+};
+
+ghidrasql::QueryResult run_interruptible_query(
+    ghidrasql::QueryEngine& engine,
+    const std::shared_ptr<ghidrasql::Source>& source,
+    const std::string& sql) {
+    CliCancellationBridge cancellation(source);
+    return engine.query(sql, cancellation.query_options());
 }
 
 struct Args {
@@ -92,6 +154,9 @@ struct Args {
     bool keep_host = false;
     int max_runtime = 600;
     bool max_runtime_explicit = false;
+    // Periodic wall-clock checkpoint in seconds; 0 disables. Driven from the
+    // serve loop, never from a mutation path.
+    int auto_save_seconds = 0;
 
     // Default is the ephemeral sentinel (0): when the CLI SPAWNS a headless
     // host and the user did not pass --rpc-port, the host binds an OS-assigned
@@ -101,7 +166,6 @@ struct Args {
     // clients. See make_headless_project_opts.
     int rpc_port = 18080;
     bool rpc_port_explicit = false;
-    int auto_save_interval = 0;
     int rpc_timeout_ms = 0;  // 0 = use libghidra default (120s)
 
     std::string format;
@@ -221,6 +285,9 @@ void print_help() {
         << "Lifecycle (headless):\n"
         << "  --shutdown <mode>          save|discard|none (default: save; discard when --readonly)\n"
         << "  --keep-host                Don't auto-shutdown after query\n"
+        << "  --auto-save <sec>          Periodic checkpoint every N seconds in serve\n"
+        << "                             mode (0=disabled, default). Never triggered by\n"
+        << "                             a mutation; same effect as save_database().\n"
         << "  --max-runtime <sec>        Host lifetime bound (0=disable; default: 0 for\n"
         << "                             --http serve mode, 600 for one-shot/-q/-f/-i)\n"
         << "  --rpc-port <n>             LibGhidraHost RPC port (headless only). Default is an\n"
@@ -229,8 +296,7 @@ void print_help() {
         << "                             a value to pin it (18080 is the conventional port a\n"
         << "                             standalone host uses for --url clients).\n"
         << "  --rpc-timeout-ms <n>       Per-RPC read timeout (0=libghidra default 120000)\n"
-        << "  --fresh                    Delete existing project first\n"
-        << "  --auto-save <n>            Save every N mutations (0=disabled, default)\n\n"
+        << "  --fresh                    Delete existing project first\n\n"
         << "Meta:\n"
         << "  -h, --help                 Show this help\n"
         << "  --version                  Show version\n";
@@ -264,7 +330,7 @@ bool parse_port_string(const std::string& s, int& out, bool allow_zero = false) 
 // Parse a non-negative integer from a full numeric string (0 .. INT_MAX).
 // Same full-string strictness as parse_port_string (rejects trailing garbage,
 // signs, and overflow) but without a port range -- for CLI options like
-// --rpc-timeout-ms / --max-runtime / --auto-save where any non-negative value
+// --rpc-timeout-ms / --max-runtime where any non-negative value
 // is valid.
 bool parse_nonnegative_int_string(const std::string& s, int& out) {
     if (s.empty()) {
@@ -469,6 +535,16 @@ bool parse_args(int argc, char** argv, Args& args) {
             args.shutdown_explicit = true;
         } else if (arg == "--keep-host") {
             args.keep_host = true;
+        } else if (arg == "--auto-save") {
+            if (++i >= argc) {
+                std::cerr << "missing value for --auto-save\n";
+                return false;
+            }
+            if (!parse_nonnegative_int_string(argv[i], args.auto_save_seconds)) {
+                std::cerr << "invalid --auto-save value: " << argv[i]
+                          << " (expected >= 0)\n";
+                return false;
+            }
         } else if (arg == "--max-runtime") {
             if (++i >= argc) {
                 std::cerr << "missing value for --max-runtime\n";
@@ -480,16 +556,6 @@ bool parse_args(int argc, char** argv, Args& args) {
                 return false;
             }
             args.max_runtime_explicit = true;
-        } else if (arg == "--auto-save") {
-            if (++i >= argc) {
-                std::cerr << "missing value for --auto-save\n";
-                return false;
-            }
-            if (!parse_nonnegative_int_string(argv[i], args.auto_save_interval)) {
-                std::cerr << "invalid --auto-save value: " << argv[i]
-                          << " (expected >= 0)\n";
-                return false;
-            }
         } else if (arg == "--format") {
             if (++i >= argc) {
                 std::cerr << "missing value for --format\n";
@@ -517,6 +583,78 @@ bool parse_args(int argc, char** argv, Args& args) {
     return true;
 }
 
+
+// Ghidra ships prebuilt native binaries for Windows x86-64, Windows ARM-64 and Linux
+// x86-64 ONLY. On every other supported platform (Linux arm64, macOS, FreeBSD) the user
+// must run `gradle buildNatives` themselves. When the decompiler is absent, Ghidra still
+// analyses happily and ghidrasql answers funcs/strings/xrefs correctly -- but every
+// `pseudocode` row silently comes back as `// decompiler unavailable`, and the only
+// real diagnostic is one ERROR line buried in the server log. Say it up front instead.
+const char* ghidra_native_platform_dir() {
+#if defined(_WIN32)
+    return "win_x86_64";
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+    return "mac_arm_64";
+#  else
+    return "mac_x86_64";
+#  endif
+#elif defined(__FreeBSD__)
+#  if defined(__aarch64__)
+    return "freebsd_arm_64";
+#  else
+    return "freebsd_x86_64";
+#  endif
+#elif defined(__linux__)
+#  if defined(__aarch64__)
+    return "linux_arm_64";
+#  else
+    return "linux_x86_64";
+#  endif
+#else
+    return nullptr;
+#endif
+}
+
+void warn_if_decompiler_missing(const std::string& ghidra_dir) {
+    if (ghidra_dir.empty()) {
+        return;
+    }
+    const char* platform = ghidra_native_platform_dir();
+    if (platform == nullptr) {
+        return;  // unknown platform: no useful claim to make
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path decompile = fs::path(ghidra_dir) / "Ghidra" / "Features" / "Decompiler" /
+                         "os" / platform /
+#if defined(_WIN32)
+                         "decompile.exe";
+#else
+                         "decompile";
+#endif
+    if (fs::exists(decompile, ec)) {
+        return;
+    }
+    std::cerr
+        << "\n"
+        << "**********************************************************************\n"
+        << "WARNING: no Ghidra decompiler for this platform (" << platform << ")\n"
+        << "  missing: " << decompile.string() << "\n"
+        << "\n"
+        << "  Analysis and funcs/strings/xrefs queries will work, but EVERY\n"
+        << "  pseudocode query will return '// decompiler unavailable', and\n"
+        << "  DecompilerCallConventionAnalyzer will be skipped -- so any analysis\n"
+        << "  run now has to be redone after you fix this.\n"
+        << "\n"
+        << "  An official Ghidra release ships natives for Windows x86-64,\n"
+        << "  Windows ARM-64 and Linux x86-64 only. Build them for this platform:\n"
+        << "      cd \"" << ghidra_dir << "/support/gradle\" && gradle buildNatives\n"
+        << "  then copy each <Module>/build/os/" << platform << "/* into the matching\n"
+        << "  <Module>/os/" << platform << "/ -- buildNatives does not install them.\n"
+        << "**********************************************************************\n\n";
+}
+
 bool validate_headless_args(Args& args) {
     bool ok = true;
     auto require_value = [&](const std::string& value, const std::string& name) {
@@ -529,6 +667,8 @@ bool validate_headless_args(Args& args) {
 
     require_value(args.project, "--project");
     require_value(args.project_name, "--project-name");
+
+    warn_if_decompiler_missing(args.ghidra);
 
     if (!args.shutdown_explicit) {
         args.shutdown = args.readonly ? "discard" : "save";
@@ -705,6 +845,13 @@ int run_repl(
             [&]() {
                 std::lock_guard<std::mutex> lock(session_mu);
                 return engine.refresh();
+            },
+            {},
+            [source]() {
+                if (!source->request_cancel()) {
+                    throw std::runtime_error(
+                        "the active source does not support downstream cancellation");
+                }
             });
         if (port <= 0) {
             return "failed to start HTTP server";
@@ -900,13 +1047,16 @@ bool bool_from_json(
 
 libghidra::client::ShutdownPolicy shutdown_policy_from_string(const std::string& raw) {
     const std::string value = to_lower(raw);
+    if (value == "save") {
+        return libghidra::client::ShutdownPolicy::kSave;
+    }
     if (value == "discard") {
         return libghidra::client::ShutdownPolicy::kDiscard;
     }
     if (value == "none") {
         return libghidra::client::ShutdownPolicy::kNone;
     }
-    return libghidra::client::ShutdownPolicy::kSave;
+    throw std::invalid_argument("invalid shutdown policy: " + raw);
 }
 
 bool import_programs_and_open_active(
@@ -1005,8 +1155,7 @@ int run_headless_live_query_local(const Args& args) {
 
     HeadlessProjectSession session;
     if (!import_programs_and_open_active(*headless, args, session)) {
-        const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-        headless->close(save);
+        headless->close(shutdown_policy_from_string(args.shutdown));
         return 1;
     }
 
@@ -1015,7 +1164,6 @@ int run_headless_live_query_local(const Args& args) {
     source_opts.auth_token = args.auth_token;
     source_opts.auto_open_program = false;
     source_opts.read_only = args.readonly;
-    source_opts.auto_save_interval = args.auto_save_interval;
     source_opts.read_timeout_ms = args.rpc_timeout_ms;
 
     auto source = ghidrasql::create_libghidra_live_source(source_opts);
@@ -1031,7 +1179,7 @@ int run_headless_live_query_local(const Args& args) {
     if (args.list_project_programs) {
         exit_code = print_project_programs(engine, args.format);
     } else if (!args.query.empty()) {
-        auto result = engine.query(args.query);
+        auto result = run_interruptible_query(engine, source, args.query);
         print_result(result, args.format);
         if (!result.success) {
             exit_code = 1;
@@ -1051,8 +1199,7 @@ int run_headless_live_query_local(const Args& args) {
         std::cout << "Host kept running at " << headless->base_url() << "\n";
         headless->detach();
     } else {
-        const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-        int rc = headless->close(save);
+        int rc = headless->close(shutdown_policy_from_string(args.shutdown));
         if (rc != 0) {
             std::cerr << "analyzeHeadless exited with code " << rc << "\n";
             if (exit_code == 0) exit_code = 1;
@@ -1113,8 +1260,7 @@ int run_headless_live_server(const Args& args) {
 
     HeadlessProjectSession session;
     if (!import_programs_and_open_active(*headless, args, session)) {
-        const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-        headless->close(save);
+        headless->close(shutdown_policy_from_string(args.shutdown));
         return 1;
     }
 
@@ -1123,7 +1269,6 @@ int run_headless_live_server(const Args& args) {
     source_opts.auth_token = args.auth_token;
     source_opts.auto_open_program = false;
     source_opts.read_only = args.readonly;
-    source_opts.auto_save_interval = args.auto_save_interval;
     source_opts.read_timeout_ms = args.rpc_timeout_ms;
 
     auto source = ghidrasql::create_libghidra_live_source(source_opts);
@@ -1245,9 +1390,19 @@ int run_headless_live_server(const Args& args) {
     auto open_program_json = [&](const std::string& body) -> std::string {
         std::lock_guard<std::mutex> lock(session_mu);
         std::string program_path = string_from_json_or_raw(body, "program_path", "path");
+        if (program_path.empty()) {
+            // GET /project/programs reports BOTH `name` and `path` for every entry, so
+            // callers reasonably reach for `name` first and then hit
+            // "program_path is required" on a field this very API advertises. Accept the
+            // aliases instead of failing. Resolution itself is unchanged --
+            // normalize_project_program_arg still decides how a bare name maps to a
+            // project path, so this only widens what we are willing to be handed.
+            program_path = string_from_json_or_raw(body, "name", "program_name");
+        }
         program_path = normalize_project_program_arg(program_path);
         if (program_path.empty()) {
-            return json_error("program_path is required");
+            return json_error(
+                "program_path is required (also accepted: path, name, program_name)");
         }
         if (!session.active_program_path.empty() && session.active_program_path != program_path) {
             auto closed = (*headless)->CloseProgram(shutdown_policy_from_string(args.shutdown));
@@ -1283,6 +1438,11 @@ int run_headless_live_server(const Args& args) {
         if (policy.empty()) {
             policy = args.shutdown;
         }
+        policy = to_lower(policy);
+        if (!is_one_of(policy, {"save", "discard", "none"})) {
+            return json_error(
+                "invalid shutdown_policy (expected save|discard|none)");
+        }
         auto closed = (*headless)->CloseProgram(shutdown_policy_from_string(policy));
         if (!closed.ok()) {
             return json_error("CloseProgram failed: " + closed.status.message);
@@ -1314,11 +1474,16 @@ int run_headless_live_server(const Args& args) {
                 std::lock_guard<std::mutex> lock(session_mu);
                 return engine.refresh();
             },
-            project_fns);
+            project_fns,
+            [source]() {
+                if (!source->request_cancel()) {
+                    throw std::runtime_error(
+                        "the active source does not support downstream cancellation");
+                }
+            });
         if (started_port <= 0) {
             std::cerr << "failed to start ghidrasql HTTP server\n";
-            const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-            headless->close(save);
+            headless->close(shutdown_policy_from_string(args.shutdown));
             return 1;
         }
         std::cout << "HTTP started at " << http.url() << "\n";
@@ -1347,8 +1512,7 @@ int run_headless_live_server(const Args& args) {
             // close so no worker thread is serving /query while we tear down.
             if (http.is_running()) http.stop();
             mcp_server->stop();
-            const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-            headless->close(save);
+            headless->close(shutdown_policy_from_string(args.shutdown));
             return 1;
         }
         std::cout << ghidrasql::format_mcp_info(mcp_started, args.bind);
@@ -1360,8 +1524,7 @@ int run_headless_live_server(const Args& args) {
         // Stop the HTTP listener before headless close so no worker thread is
         // serving while we tear down (workers capture &session_mu).
         if (http.is_running()) http.stop();
-        const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-        headless->close(save);
+        headless->close(shutdown_policy_from_string(args.shutdown));
         return 1;
     }
 #endif
@@ -1378,7 +1541,33 @@ int run_headless_live_server(const Args& args) {
     const bool have_runtime_cap = args.max_runtime_explicit && args.max_runtime > 0;
     const auto serve_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(args.max_runtime);
+
+    // Periodic checkpoint, driven by the wall clock from the serve loop.
+    //
+    // The mutation-counting version of --auto-save was removed with its ~62
+    // call sites because it hooked every successful write path, which is the
+    // thing the persistence rule rightly forbids: a checkpoint must never be a
+    // side effect of a mutation. The CAPABILITY is not the problem, and losing
+    // it entirely would leave a long unattended annotation run with no
+    // protection at all -- a SIGKILL, an OOM, a --max-runtime expiry or the new
+    // parent-death reaping would discard everything since session start.
+    //
+    // Driving it from here keeps the operator's explicit request (they passed
+    // the flag) while satisfying the rule: this is the serve loop, not a write
+    // path, and it calls the same single explicit save_database() a user could
+    // issue by hand.
+    const bool have_auto_save = args.auto_save_seconds > 0;
+    auto next_auto_save =
+        std::chrono::steady_clock::now() + std::chrono::seconds(args.auto_save_seconds);
     while (!g_stop.load() && (!args.serve || http.is_running())) {
+        if (have_auto_save && std::chrono::steady_clock::now() >= next_auto_save) {
+            if (source && source->save_database()) {
+                std::cout << "auto-save: checkpointed (every "
+                          << args.auto_save_seconds << "s)\n" << std::flush;
+            }
+            next_auto_save = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(args.auto_save_seconds);
+        }
         if (have_runtime_cap &&
             std::chrono::steady_clock::now() >= serve_deadline) {
             std::cout << "max-runtime (" << args.max_runtime
@@ -1414,8 +1603,7 @@ int run_headless_live_server(const Args& args) {
     }
 #endif
 
-    const bool save = (args.shutdown != "discard" && args.shutdown != "none");
-    int rc = headless->close(save);
+    int rc = headless->close(shutdown_policy_from_string(args.shutdown));
     http.set_shutdown_phase(rc == -2
         ? ghidrasql::HttpServer::ShutdownPhase::kForceKilled
         : ghidrasql::HttpServer::ShutdownPhase::kComplete);
@@ -1561,7 +1749,6 @@ int main(int argc, char** argv) {
     // already-analyzed attached program by default.
     opts.analyze = args.analyze && args.analyze_explicit;
     opts.read_only = args.readonly;
-    opts.auto_save_interval = args.auto_save_interval;
     opts.read_timeout_ms = args.rpc_timeout_ms;
     source = ghidrasql::create_libghidra_live_source(opts);
     if (!source) {
@@ -1600,6 +1787,13 @@ int main(int argc, char** argv) {
             [&]() {
                 std::lock_guard<std::mutex> lock(session_mu);
                 return engine.refresh();
+            },
+            {},
+            [source]() {
+                if (!source->request_cancel()) {
+                    throw std::runtime_error(
+                        "the active source does not support downstream cancellation");
+                }
             });
         if (started_port <= 0) {
             std::cerr << "failed to start HTTP server\n";
@@ -1644,7 +1838,7 @@ int main(int argc, char** argv) {
     }
 
     if (!args.query.empty()) {
-        auto result = engine.query(args.query);
+        auto result = run_interruptible_query(engine, source, args.query);
         print_result(result, args.format);
         return result.success ? 0 : 1;
     }

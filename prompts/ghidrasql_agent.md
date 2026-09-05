@@ -66,9 +66,9 @@ Pick `--binary` for new analysis; pick `--program` to revisit existing work.
    SELECT name, (SELECT COUNT(*) FROM xrefs WHERE to_addr = funcs.addr) FROM funcs;
    ```
 
-4. **Use `callgraph_edges`, `callers`, `callees` views** for call graph analysis — they pre-compute function names via JOINs.
+4. **Use `callgraph_edges`, `callers`, `callees` views** for resolved function call-graph analysis — exact `src_func_addr = X`, `dst_func_addr = X`, `call_site = X` (including `call_site IN (...)`), `callers.func_addr = X`, and `callees.func_addr = X` reads are source-bounded and avoid whole-program scans and per-edge lookup joins. Keep the predicate visible; a forced materialized wrapper defeats pushdown. Use `disasm_calls` only when unresolved/raw call targets are required.
 
-5. **Use `string_refs` view** for string cross-reference analysis — it joins strings, xrefs, and funcs efficiently.
+5. **Use `string_refs`** for string cross-reference analysis — exact `func_addr` predicates use its bounded lookup path.
 
 6. **Join `funcs` only in the final SELECT** — not in every CTE step.
 
@@ -225,7 +225,7 @@ INSERT INTO comments (addr, comment, source) VALUES (0x4011F0, 'Parses config fi
 -- 7. Re-decompile to see changes
 SELECT text FROM pseudocode WHERE func_addr = 0x4011F0;
 
--- 8. Save to Ghidra project
+-- 8. Optional periodic checkpoint (normal managed shutdown saves by default)
 SELECT save_database();
 ```
 
@@ -243,7 +243,7 @@ WHERE name = 'FUN_00401200';
 -- 3. Re-decompile to see typed output
 SELECT text FROM pseudocode WHERE func_addr = 0x401200;
 
--- 4. Save
+-- 4. Optional periodic checkpoint
 SELECT save_database();
 ```
 
@@ -281,7 +281,7 @@ JOIN funcs f ON f.addr = m.func_addr
 GROUP BY m.func_addr
 HAVING tag_count > 1;
 
--- 5. Save
+-- 5. Optional periodic checkpoint
 SELECT save_database();
 ```
 
@@ -412,12 +412,20 @@ SELECT printf('0x%X', from_addr) as caller FROM xrefs WHERE to_addr = 0x401000 A
 ### call_edges
 Raw call graph edges with addresses.
 
+Exact equality on `src_func_addr`, `dst_func_addr`, or `call_site` is
+source-bounded. A site lookup resolves its containing function, reads only that
+function's xrefs, and returns exact-site matches. SQLite evaluates
+`call_site IN (...)` through one exact lookup per right-hand value. Range,
+non-key, and unfiltered reads materialize the whole call-edge surface.
+
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
 | `src_func_addr` | INT64 | | Caller function address |
+| `src_func_name` | TEXT | | Caller function name |
 | `call_site` | INT64 | | Call instruction address |
 | `dst_addr` | INT64 | | Call target address |
 | `dst_func_addr` | INT64 | | Callee function address |
+| `dst_func_name` | TEXT | | Callee function or primary-symbol name |
 | `kind` | TEXT | | Call type |
 
 ### blocks
@@ -492,16 +500,28 @@ Decompiled C-like pseudocode. **MUST be function-scoped by `func_addr` or exact 
 |--------|------|----------|-------------|
 | `func_addr` | INT64 | | Function address |
 | `func_name` | TEXT | | Function name |
-| `text` | TEXT | | **Full pseudocode text** |
-| `is_stale` | INT | | Stale flag |
+| `text` | TEXT | | **Full Ghidra `getC()` text on success; synthetic diagnostic comment only on fallback** |
+| `is_stale` | INT | | Compatibility flag: 1 when incomplete or fallback |
+| `prototype` | TEXT | | Prototype returned with the decompilation |
+| `completed` | INT | | Ghidra decompile-completed flag |
+| `is_fallback` | INT | | 1 when `text` is a synthetic diagnostic instead of Ghidra C |
+| `error_message` | TEXT | | Native decompiler error/diagnostic text |
 
 ```sql
 -- Decompile a specific function
 SELECT text FROM pseudocode WHERE func_addr = 0x401000;
 SELECT func_addr, text FROM pseudocode WHERE func_name = 'main';
+
+-- Require an exact successful Ghidra decompilation rather than fallback text
+SELECT text FROM pseudocode
+WHERE func_addr = 0x401000 AND completed = 1 AND is_fallback = 0;
 ```
 
-**IMPORTANT:** The `text` column contains the entire function's decompilation as a single string. This is different from bnsql where pseudocode has per-line rows with `line` and `line_num` columns.
+**IMPORTANT:** On success, `text` is the extension's unchanged
+`DecompiledFunction.getC()` string and contains the entire function as one value.
+GhidraSQL does not add agent anchors. Always inspect `completed`, `is_fallback`,
+and `error_message` when the request requires an exact result. This is different
+from bnsql where pseudocode has per-line rows with `line` and `line_num` columns.
 
 ### decomp_lvars
 Decompiler local variables. **MUST be function-scoped; use `func_addr`, or exact `func_name = ...` for reads.** Used for renaming and retyping variables.
@@ -1174,7 +1194,11 @@ Additional tables available for specialized analysis:
 ## Convenience Views
 
 ### callgraph_edges
-Call graph with function names resolved.
+Call graph with function names supplied by the underlying call-edge records.
+Exact `src_func_addr = X`, `dst_func_addr = X`, and `call_site = X` predicates
+push through this view; `call_site IN (...)` remains a bounded set of exact
+lookups. The view deliberately does not join `funcs` or `names`, preventing duplicate
+edges from colliding symbols and per-edge function lookup RPCs.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1191,7 +1215,9 @@ FROM callgraph_edges WHERE src_func_name LIKE '%main%';
 ```
 
 ### callers
-Who calls each function.
+Who calls each resolved function. Exact `func_addr = X` predicates stay visible
+as `callgraph_edges.dst_func_addr = X` and use one bounded destination-function
+RPC. Use `disasm_calls` when unresolved/raw call targets must also be included.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1211,7 +1237,10 @@ FROM callers GROUP BY func_addr ORDER BY caller_count DESC LIMIT 10;
 ```
 
 ### callees
-What each function calls.
+Which resolved functions each function calls. Exact `func_addr = X` predicates
+stay visible as `callgraph_edges.src_func_addr = X` and use one bounded
+source-function RPC. Use `disasm_calls` when unresolved/raw call targets must
+also be included.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1232,6 +1261,10 @@ FROM callees GROUP BY func_addr ORDER BY unique_callees DESC LIMIT 10;
 
 ### string_refs
 String cross-references with function context.
+
+Use an exact `func_addr` predicate when investigating one function. That form is
+pushed into a bounded function-reference read and avoids whole-program xref and
+function-catalog materialization.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1270,6 +1303,11 @@ Function prototypes.
 
 ### decompiler_listing
 Decompiled code with complexity metrics.
+
+Use `SELECT text FROM pseudocode WHERE func_addr = ...` when you only need one
+exact decompilation. `decompiler_listing` is an enriched projection that also
+requests tokens, locals, and function metrics; keep it function-scoped and use
+it only when those extra columns are needed.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -1339,13 +1377,20 @@ Hex dump view.
 
 ### Ctree Views (AST-like)
 
-For advanced decompiler analysis, ghidrasql provides AST-like views. **Always filter by `func_addr`.**
+For advanced decompiler analysis, ghidrasql provides AST-like compatibility
+views. They are SQL compositions over calls, blocks, loops, functions, and
+decompiler locals; they are **not Ghidra's native decompiler AST**. In
+particular, `ctree_call_args` repeats the caller's declared parameters as a
+compatibility approximation and must not be cited as evidence of actual
+call-site argument expressions. Use exact `pseudocode`, `decomp_tokens`, or
+`pcode_ops` for native decompiler evidence. **Always filter by `func_addr`.**
 
 | View | Description |
 |------|-------------|
 | `ctree` | Unified AST node tree |
 | `ctree_lvars` | Decompiler locals (writable — UPDATE name/type routes to decomp_lvars) |
 | `ctree_v_calls` | Call nodes with callee info |
+| `ctree_call_args` | Compatibility approximation from caller parameters; not native call-site arguments |
 | `ctree_v_loops` | Loop nodes (for, while, do) |
 | `ctree_v_ifs` | If/else condition nodes |
 | `ctree_v_comparisons` | Comparison operations |
@@ -1445,6 +1490,8 @@ SELECT name, kind, size FROM types WHERE name = 'Session';
 - Returns `0` if all types already existed (e.g., recovered from PDB)
 - Returns `>0` for newly created types
 - Standard C syntax only — no `#include`, no macros, no `#pragma`
+- The live host seeds exact `int8_t`/`uint8_t` through `int64_t`/`uint64_t`
+  typedef identities, so declarations may use those names without `<stdint.h>`
 - Supports: structs, unions, enums, typedefs, function pointer types
 - Types are immediately available for use in `UPDATE funcs SET prototype = ...`
 
@@ -1454,21 +1501,23 @@ SELECT name, kind, size FROM types WHERE name = 'Session';
 | `string_count()` | Get current string count from source |
 | `rebuild_strings()` | Refresh string table and return count |
 | `program_revision()` | Get Ghidra's native modification number for the current program |
-| `save_database()` | **Save pending changes** to Ghidra project. Returns 1 on success. |
+| `save_database()` | Create an optional checkpoint of pending changes. Returns 1 on success. |
 | `discard_changes()` | Discard all pending changes. Returns 1 on success. |
 | `refresh_database()` | Refresh source live readers so the next query is rebuilt from fresh source state. Returns 1 on success. |
 
-### Cache / Freshness Model
+### Query-scoped Materialisation
 
 | Function | Description |
 |----------|-------------|
-| `cache_stats()` | Returns JSON: `cache_invalidations_total`, `last_seen_revision`, `source_revision`, `revision_tracked`, and the list of cacheable tables |
-| `cache_invalidate(table)` | Drop one table's cache so the next read pulls fresh data. Most useful inside a batched script after a write. |
-| `cache_invalidate_all()` | Drop every cached table |
+| `cache_stats()` | Compatibility/introspection JSON; reports `materialization_scope = query` |
+| `cache_invalidate(table)` | Compatibility no-op for query-scoped tables |
+| `cache_invalidate_all()` | Compatibility no-op for query-scoped tables |
 
-GhidraSQL materializes virtual tables because decompiler-backed tables are expensive. With libghidra live sources, caches may persist across `/query` calls while the native freshness token is unchanged. The token includes `program_id`, Ghidra's `modification_number`, program path, and cheap project-file metadata when available, so program switches and Ghidra UI/API edits invalidate cached tables before reading.
-
-For custom sources that do not expose a freshness token, GhidraSQL keeps the conservative behavior: every one-shot query invalidates table materialization. Inside multi-statement scripts, writes and freshness changes force invalidation before later reads. Use `refresh_database()` or `.refresh` when you want to force a full refresh.
+GhidraSQL may materialize rows and derived indexes while one SQL statement is
+running. That state belongs to the statement's cursor and is destroyed when the
+statement closes; it is never reused by a later `/query`, REPL statement, or
+statement in a batch. Use `refresh_database()` or `.refresh` only when the
+underlying source itself needs an explicit reload.
 
 ---
 
@@ -1545,14 +1594,16 @@ For custom sources that do not expose a freshness token, GhidraSQL keeps the con
 | `function_tag_mappings` | Row match (func_addr + tag_name) |
 | `perf_benchmarks` | Row match (bench_id); each row DELETE is one host-side RPC; DELETE with no WHERE removes all rows (one RPC per row) |
 
-### Explicit Save Model
+### Durable Shutdown Model
 
-Changes are **not auto-saved**. After mutations, you must explicitly save:
+Changes remain in the live Ghidra project during the session. Normal managed
+shutdown uses `save` by default, so an explicit save is not required for the
+ordinary workflow. For a periodic checkpoint you may call:
 ```sql
 SELECT save_database();
 ```
 
-Or discard all pending changes:
+Discarding is explicit. Discard pending changes with:
 ```sql
 SELECT discard_changes();
 ```
@@ -1596,7 +1647,7 @@ INSERT INTO comments (addr, comment, source) VALUES (0x4011F0, 'Reads and parses
 -- 10. Re-decompile to verify
 SELECT text FROM pseudocode WHERE func_addr = 0x4011F0;
 
--- 11. Save changes
+-- 11. Optional periodic checkpoint
 SELECT save_database();
 ```
 
@@ -1604,7 +1655,9 @@ SELECT save_database();
 - Always decompile first to understand the function before renaming
 - Use the exact `local_id` values returned by `decomp_lvars` — not variable names or guessed offsets
 - Re-decompile after changes to verify they look correct
-- Batch all mutations before calling `save_database()`
+- Ordinary SQL writes never call `save_database()` internally. Invoke it only
+  when you deliberately want an intermediate checkpoint; otherwise the final
+  save happens during normal managed shutdown.
 - Use `discard_changes()` if you make mistakes
 
 ---
@@ -1713,7 +1766,7 @@ When running in interactive mode, these dot-commands are available:
 | `.info` | Show database metadata (program info, row counts, capabilities) |
 | `.save` | Save pending changes (calls `save_database()`) |
 | `.discard` | Discard pending changes (calls `discard_changes()`) |
-| `.refresh` | Force source refresh and cache invalidation |
+| `.refresh` | Force an underlying source refresh |
 | `.http` | Show HTTP server status |
 | `.http start` | Start HTTP server |
 | `.http stop` | Stop HTTP server |
@@ -1756,7 +1809,7 @@ ghidrasql --url http://localhost:18080 --http --port 9000 --auth mysecret
 | `POST /query` | POST | Execute SQL query (body = raw SQL text) |
 | `GET /status` | GET | Server status |
 | `POST /refresh` | POST | Refresh database |
-| `POST /save` | POST | Save changes |
+| `POST /save` | POST | Checkpoint pending changes |
 | `POST /discard` | POST | Discard changes |
 
 **Response format (JSON):**
@@ -1811,8 +1864,10 @@ int parseConfig(const char *path) {
 ### Addresses in Hex
 Always display addresses in hex format using `printf('0x%X', addr)`.
 
-### Batch Mutations Before Save
-Group all your UPDATE/INSERT/DELETE operations together, then call `SELECT save_database()` once at the end.
+### Periodic Checkpoints
+Normal managed shutdown saves once by default. Ordinary writes never call
+`save_database()` internally. An operator may invoke it when a long-running
+session warrants an intermediate checkpoint.
 
 ### Decompilation Workflow
 1. Run `SELECT text FROM pseudocode WHERE func_addr = <addr>`
@@ -1833,11 +1888,11 @@ SELECT text FROM pseudocode WHERE func_addr = 0x401000;
 - **String content column = `content`** (NOT `value`)
 - **Decompiler variables table = `decomp_lvars`** (NOT `hlil_vars`)
 - **Pseudocode = single `text` column** (NOT per-line `line` + `line_num`)
-- **Save = `SELECT save_database()`** (NOT `SELECT save()`)
+- **Periodic checkpoint = `SELECT save_database()`** (normal managed shutdown saves by default)
 - **Decompile = `SELECT text FROM pseudocode WHERE func_addr = addr`**
 - **Function signature = `UPDATE funcs SET prototype = ...`** (the funcs prototype column; the `signatures` table also exposes `prototype`)
 - **Always filter `pseudocode`, `decomp_lvars` by `func_addr` or exact `func_name`; filter `instructions` by `addr` range or `func_addr`**
 - **xrefs has NO `from_func` column** — use `callers`/`callees`/`callgraph_edges` views
 - **Comments need `source` column** for INSERT: `'eol'`, `'pre'`, `'post'`, `'plate'`
-- **Changes are NOT auto-saved** — always call `save_database()` after mutations
+- **Normal shutdown saves by default** — discard/none/read-only must be explicit
 - **Use `printf('0x%X', addr)` for hex addresses** in output

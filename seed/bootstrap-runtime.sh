@@ -36,6 +36,29 @@ fetch() {  # url sha256 dest
     echo "$sha  $dest" | sha256sum -c
 }
 
+# Pick the JDK for THIS machine. Ghidra is portable Java, but the JDK is not: on an
+# arm64 host a hard-coded x64 archive downloads and sha256-verifies perfectly and then
+# produces a runtime that cannot execute a single class.
+case "$(uname -m)" in
+    x86_64|amd64)
+        JDK_ARCHIVE="$JDK_ARCHIVE_X64"
+        JDK_URL="$JDK_URL_X64"
+        JDK_SHA256="$JDK_SHA256_X64"
+        ;;
+    aarch64|arm64)
+        JDK_ARCHIVE="$JDK_ARCHIVE_AARCH64"
+        JDK_URL="$JDK_URL_AARCH64"
+        JDK_SHA256="$JDK_SHA256_AARCH64"
+        ;;
+    *)
+        echo "No pinned Temurin JDK for architecture '$(uname -m)'." >&2
+        echo "Add JDK_ARCHIVE_/JDK_URL_/JDK_SHA256_ entries to seed/versions.env." >&2
+        exit 1
+        ;;
+esac
+export JDK_ARCHIVE JDK_URL JDK_SHA256
+echo "runtime: $(uname -m) -> $JDK_ARCHIVE"
+
 fetch "$GHIDRA_URL" "$GHIDRA_SHA256" "$downloads/$GHIDRA_ARCHIVE"
 fetch "$JDK_URL" "$JDK_SHA256" "$downloads/$JDK_ARCHIVE"
 

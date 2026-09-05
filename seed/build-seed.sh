@@ -71,7 +71,10 @@ chmod +x "$stage/scripts/"*.sh
     echo "| skills commit | ${SKILLS_SHA:-unknown} |"
     echo "| built on | $(uname -srm) |"
     echo "| pinned Ghidra | $GHIDRA_VERSION ($GHIDRA_SHA256) |"
-    echo "| pinned JDK | $JDK_VERSION ($JDK_SHA256) |"
+    # versions.env pins one JDK per architecture (bootstrap-runtime.sh picks by
+    # `uname -m`), so there is no single sha256 to report here.
+    echo "| pinned JDK | $JDK_VERSION (x64 $JDK_SHA256_X64) |"
+    echo "| pinned JDK | $JDK_VERSION (aarch64 $JDK_SHA256_AARCH64) |"
     echo
     echo "Ghidra and the JDK are NOT bundled. \`scripts/bootstrap-runtime.sh\` downloads"
     echo "the two archives above from their official releases and verifies both digests"

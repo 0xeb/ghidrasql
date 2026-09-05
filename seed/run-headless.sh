@@ -50,7 +50,11 @@ printf '%s\n' "$server_pid" >"$pid_file"
 # Watch the process too: if it dies, say so immediately with its log rather than
 # burning the full timeout.
 for _ in $(seq 1 150); do
-    if curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+    # /health is a LIVENESS probe and always succeeds once the process is up -- it
+    # stays {"status":"ok"} even when the query worker is wedged. /health/deep is the
+    # readiness probe that actually reflects the worker, which is what "ready" should
+    # mean here (and is what docs/connect/server-and-http.md tells users to poll).
+    if curl -fsS "http://127.0.0.1:$port/health/deep" >/dev/null 2>&1; then
         echo "ghidrasql ready: http://127.0.0.1:$port"
         echo "Log:     $log_file"
         echo "Project: $project_dir/$project_name"

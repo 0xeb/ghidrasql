@@ -24,6 +24,56 @@
 #ifdef GHIDRASQL_HAS_LIBGHIDRA
 #include <libghidra/http.hpp>
 #include <xsql/vtable.hpp>
+
+#include <cstdlib>
+
+// ---------------------------------------------------------------------------
+// Decompiler timeout.
+//
+// libghidra's DecompileFunctionRequest carries a `timeout_ms` (proto field 3), the C++
+// client takes it as a parameter, and the Java side normalises it:
+//   normalizeDecompileTimeoutSeconds(ms): ms <= 0 -> 30s, else ceil(ms/1000), CAPPED AT 300s.
+//
+// Every call site here previously passed a hardcoded 30000, so the 300 s ceiling was
+// unreachable and any function needing more than 30 s of decompiler time failed with
+// "Exception while decompiling <addr>: process: timeout" and no way to retry harder.
+// A single heavily-inlined -O2 translation unit is not exotic; this made the most
+// interesting function in such a binary permanently unreadable.
+//
+// Now overridable via GHIDRASQL_DECOMPILE_TIMEOUT_MS. Default is unchanged at 30000, so
+// this is behaviour-preserving unless the operator opts in. Clamped to the Java cap.
+static int decompile_timeout_ms() {
+    static const int value = [] {
+        const char* env = std::getenv("GHIDRASQL_DECOMPILE_TIMEOUT_MS");
+        if (env == nullptr || *env == '\0') return 30000;
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || parsed <= 0) return 30000;   // unparseable -> documented default
+        // TWO ceilings, and the lower one is the SQL layer's, not Ghidra's.
+        //
+        // Ghidra caps the decompiler at 300 s. But `queue_admission_timeout_ms` defaults to
+        // 120 s, and a decompile that outlives it makes the QUERY give up while the
+        // decompiler keeps running: /query returns an EMPTY BODY (the wedged-worker
+        // signature), /health/deep goes 503, and an orphaned `decompile` child is left
+        // burning 100% of a core until something kills it.
+        //
+        // Verified the hard way: 300000 here turned a clean "process: timeout" at 30 s into
+        // a wedged server plus a runaway child. Raising this past the admission timeout
+        // makes the failure mode strictly WORSE, not longer.
+        //
+        // So clamp to just under the admission timeout by default. To go higher you must
+        // also raise the SQL side, and opting into that is deliberate:
+        //     SELECT setting_set('queue_admission_timeout_ms', 280000);
+        constexpr int kGhidraCapMs = 300000;
+        constexpr int kSafeVsAdmissionMs = 110000;   // < the 120 s default admission timeout
+        const char* unsafe = std::getenv("GHIDRASQL_DECOMPILE_TIMEOUT_UNSAFE");
+        const int ceiling = (unsafe != nullptr && *unsafe != '\0') ? kGhidraCapMs
+                                                                   : kSafeVsAdmissionMs;
+        if (parsed > ceiling) return ceiling;
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
 #endif
 
 namespace ghidrasql {
@@ -34,9 +84,12 @@ public:
     static constexpr std::uint64_t kAllAddressesMin = 0;
     static constexpr std::uint64_t kAllAddressesMax = std::numeric_limits<std::uint64_t>::max();
 
-    // read_function_at memo ceiling: ~1M entries (~100 MB worst case) before a
-    // full reset; see the memo note in read_function_at.
-    static constexpr std::size_t kFunctionAtMemoCap = 1'000'000;
+    bool request_cancel() const override {
+        // Deliberately do not take mu_: the query thread can hold it while
+        // blocked inside an RPC. HttpClient::Cancel uses a dedicated control
+        // connection and is safe to call concurrently with that RPC.
+        return client_.Cancel().ok();
+    }
 
     // Full-table decompilation (ListDecompilations) is the single most expensive
     // RPC: every row is a live decompile of one function. A large page means one
@@ -101,55 +154,87 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(2048, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            trace_rpc_locked("ListFunctions");
-            auto listed = client_.ListFunctions(kAllAddressesMin, kAllAddressesMax, ps, off);
-            if (!ok_or_record_error_locked(listed, "ListFunctions")) return false;
-            const auto& rows = listed.value->functions;
-            count = rows.size();
-            dest.reserve(dest.size() + count);
-            for (const auto& row : rows) {
-                dest.push_back(map_function(row));
+        // Do not use offset pagination here. The Java host implements an offset
+        // by reopening the function iterator at the program minimum and skipping
+        // `offset` rows. For N rows that makes a full read O(N^2/page_size), which
+        // is very visible on 20k-function firmware images. Advance the address
+        // range instead, so every function is traversed once.
+        constexpr int page_size = 2048;
+        std::uint64_t range_start = kAllAddressesMin;
+        for (;;) {
+            if (xsql::vtab_interrupted()) {
+                out.clear();
+                return false;
             }
-            return true;
-        });
+            trace_rpc_locked("ListFunctions");
+            auto listed = client_.ListFunctions(
+                range_start, kAllAddressesMax, page_size, 0);
+            if (!ok_or_record_error_locked(listed, "ListFunctions")) {
+                out.clear();
+                return false;
+            }
+            const auto& rows = listed.value->functions;
+            if (rows.empty()) break;
+            out.reserve(out.size() + rows.size());
+            for (const auto& row : rows) {
+                out.push_back(map_function(row));
+            }
+            if (rows.size() < static_cast<std::size_t>(page_size)) break;
+            const std::uint64_t last = rows.back().entry_address;
+            if (last == kAllAddressesMax) break;
+            range_start = last + 1;
+        }
+        last_error_.clear();
+        return true;
+    }
+
+    bool read_leaf_functions(std::vector<model::FunctionRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        // The host performs one native reference/function pass. Request the
+        // complete relation in one RPC so pagination cannot repeat that pass.
+        trace_rpc_locked("ListLeafFunctions");
+        auto listed = client_.ListLeafFunctions(
+            kAllAddressesMin, kAllAddressesMax,
+            std::numeric_limits<int>::max(), 0);
+        if (!ok_or_record_error_locked(listed, "ListLeafFunctions")) {
+            return false;
+        }
+        const auto& rows = listed.value->functions;
+        out.reserve(rows.size());
+        for (const auto& row : rows) {
+            out.push_back(map_function(row));
+        }
+        last_error_.clear();
+        return true;
     }
 
     bool read_function_at(std::int64_t address, model::FunctionRow& out) const override {
         out = {};
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        // Correlated probes (e.g. `... NOT EXISTS (SELECT 1 FROM funcs f WHERE
-        // f.addr = i.func_addr)`) call this once per outer row, so N probes over
-        // K distinct addresses must cost K RPCs, not N. Misses are memoized too
-        // (an orphan check probes mostly-missing addresses). The memo clears on
-        // every local mutation and whenever the freshness token observes a new
-        // program identity or modification number — the same staleness window
-        // the engine's own row caches already live with.
-        if (auto memo = function_at_memo_.find(address); memo != function_at_memo_.end()) {
-            trace_rpc_locked("GetFunction(memo-hit)");
-            last_error_.clear();
-            if (!memo->second.has_value()) return false;
-            out = *memo->second;
-            return true;
+        // Observe cooperative interruption before starting a downstream RPC.
+        if (xsql::vtab_interrupted()) {
+            last_error_ = "cancelled";
+            return false;
         }
         trace_rpc_locked("GetFunction");
         auto got = client_.GetFunction(to_u64(address));
         if (!ok_or_record_error_locked(got, "GetFunction")) return false;
-        // The memo lives until the next mutation/program switch, so a long
-        // read-only session probing per-byte addresses (memory_bytes joins)
-        // would otherwise grow it without bound. Resetting at the cap keeps
-        // the worst case at "one extra RPC per re-probed address".
-        if (function_at_memo_.size() >= kFunctionAtMemoCap) {
-            function_at_memo_.clear();
-        }
         if (!got.value->function.has_value()) {
-            function_at_memo_.emplace(address, std::nullopt);
             last_error_.clear();
             return false;
         }
         out = map_function(*got.value->function);
-        function_at_memo_.emplace(address, out);
+        // libghidra resolves interior addresses too. Preserve the exact-entry
+        // contract of this Source method rather than silently satisfying
+        // `funcs.addr = ?` with a different address.
+        if (out.address != address) {
+            out = {};
+            last_error_.clear();
+            return false;
+        }
         last_error_.clear();
         return true;
     }
@@ -489,11 +574,211 @@ public:
             }
             model::CallEdgeRow row;
             row.src_func_addr = find_owner(xref.from_ea);
+            auto src_it = std::lower_bound(functions.begin(), functions.end(), row.src_func_addr,
+                [](const model::FunctionRow& fn, std::int64_t addr) { return fn.address < addr; });
+            if (src_it != functions.end() && src_it->address == row.src_func_addr) {
+                row.src_func_name = src_it->name;
+            }
             row.call_site = xref.from_ea;
             row.dst_addr = xref.to_ea;
             row.dst_func_addr = find_owner(xref.to_ea);
+            auto dst_it = std::lower_bound(functions.begin(), functions.end(), row.dst_func_addr,
+                [](const model::FunctionRow& fn, std::int64_t addr) { return fn.address < addr; });
+            if (dst_it != functions.end() && dst_it->address == row.dst_func_addr) {
+                row.dst_func_name = dst_it->name;
+            }
             row.kind = xref.kind;
             out.push_back(std::move(row));
+        }
+        return true;
+    }
+
+    bool read_call_edges_at(
+        std::int64_t call_site,
+        std::vector<model::CallEdgeRow>& out) const override {
+        out.clear();
+
+        // GetFunction intentionally accepts an interior address. Do not route
+        // this through read_function_at(), whose SQL-facing contract rejects
+        // interiors for exact funcs.addr equality.
+        model::FunctionRow owner;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!ensure_session_open_locked()) return false;
+            if (xsql::vtab_interrupted()) {
+                last_error_ = "cancelled";
+                return false;
+            }
+            trace_rpc_locked("GetFunction");
+            auto got = client_.GetFunction(to_u64(call_site));
+            if (!ok_or_record_error_locked(got, "GetFunction")) return false;
+            if (!got.value->function.has_value()) {
+                last_error_.clear();
+                return true;
+            }
+            owner = map_function(*got.value->function);
+            last_error_.clear();
+        }
+
+        std::vector<model::CallEdgeRow> owner_edges;
+        if (!read_call_edges_from_resolved_function(owner, owner_edges)) {
+            return false;
+        }
+        for (auto& edge : owner_edges) {
+            if (edge.call_site == call_site) {
+                out.push_back(std::move(edge));
+            }
+        }
+        return true;
+    }
+
+    bool read_call_edges_from(
+        std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const override {
+        out.clear();
+
+        model::FunctionRow source_function;
+        if (!read_function_at(function_address, source_function)) {
+            // A valid equality probe with no function is an empty result, not
+            // a failed source read. Interior addresses also cannot equal the
+            // src_func_addr column, which always stores the entry address.
+            return last_error().empty();
+        }
+        if (source_function.address != function_address) {
+            return true;
+        }
+
+        return read_call_edges_from_resolved_function(source_function, out);
+    }
+
+    bool read_call_edges_from_resolved_function(
+        const model::FunctionRow& source_function,
+        std::vector<model::CallEdgeRow>& out) const {
+        out.clear();
+
+        std::vector<libghidra::client::XrefRecord> xrefs;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!ensure_session_open_locked()) return false;
+            if (!paginate_locked(4096, xrefs,
+                    [&](int page_size, int offset, auto& dest, std::size_t& count) {
+                        auto listed = client_.ListXrefsFromFunction(
+                            to_u64(source_function.address), page_size, offset);
+                        if (!listed.ok() && is_absent_subject(listed)) {
+                            count = 0;
+                            return true;  // no function there -> no rows
+                        }
+                        if (!ok_or_record_error_locked(listed, "ListXrefsFromFunction")) return false;
+                        const auto& rows = listed.value->xrefs;
+                        count = rows.size();
+                        dest.reserve(dest.size() + count);
+                        for (const auto& row : rows) {
+                            dest.push_back(row);
+                        }
+                        return true;
+                    })) {
+                out.clear();
+                return false;
+            }
+        }
+
+        auto is_call_like = [](const std::string& kind) {
+            std::string lowered = kind;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return lowered.find("call") != std::string::npos;
+        };
+
+        out.reserve(xrefs.size());
+        for (const auto& xref : xrefs) {
+            if (!is_call_like(xref.ref_type)) {
+                continue;
+            }
+            model::CallEdgeRow edge;
+            edge.src_func_addr = source_function.address;
+            edge.src_func_name = !xref.from_function_name.empty()
+                ? xref.from_function_name : source_function.name;
+            edge.call_site = to_i64(xref.from_address);
+            edge.dst_addr = to_i64(xref.to_address);
+            // 0 when the destination is not inside a function (an import, a PLT
+            // or thunk stub, or an unresolved indirect target) -- the SAME value
+            // the full-scan path produces there via find_owner().
+            //
+            // The pushdown originally fell back to dst_addr here, which is
+            // non-zero. That made one logical row carry a different
+            // dst_func_addr depending only on whether the planner chose the
+            // pushdown, and any consumer filtering on `dst_func_addr != 0` would
+            // then include or exclude the same call site depending on the query
+            // shape. dst_addr is still available in its own column for callers
+            // that want the raw target.
+            edge.dst_func_addr =
+                xref.to_function_address != 0 ? to_i64(xref.to_function_address) : 0;
+            edge.dst_func_name = xref.to_function_name;
+            edge.kind = xref.ref_type;
+            out.push_back(std::move(edge));
+        }
+        return true;
+    }
+
+    bool read_call_edges_to(
+        std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const override {
+        out.clear();
+
+        model::FunctionRow destination_function;
+        if (!read_function_at(function_address, destination_function)) {
+            return last_error().empty();
+        }
+        if (destination_function.address != function_address) {
+            return true;
+        }
+
+        std::vector<libghidra::client::XrefRecord> xrefs;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!ensure_session_open_locked()) return false;
+            if (!paginate_locked(4096, xrefs,
+                    [&](int page_size, int offset, auto& dest, std::size_t& count) {
+                        auto listed = client_.ListXrefsToFunction(
+                            to_u64(destination_function.address), page_size, offset);
+                        if (!ok_or_record_error_locked(listed, "ListXrefsToFunction")) return false;
+                        const auto& rows = listed.value->xrefs;
+                        count = rows.size();
+                        dest.reserve(dest.size() + count);
+                        for (const auto& row : rows) {
+                            dest.push_back(row);
+                        }
+                        return true;
+                    })) {
+                out.clear();
+                return false;
+            }
+        }
+
+        auto is_call_like = [](const std::string& kind) {
+            std::string lowered = kind;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return lowered.find("call") != std::string::npos;
+        };
+
+        out.reserve(xrefs.size());
+        for (const auto& xref : xrefs) {
+            if (!is_call_like(xref.ref_type)) {
+                continue;
+            }
+            model::CallEdgeRow edge;
+            edge.src_func_addr = to_i64(xref.from_function_address);
+            edge.src_func_name = xref.from_function_name;
+            edge.call_site = to_i64(xref.from_address);
+            edge.dst_addr = to_i64(xref.to_address);
+            edge.dst_func_addr = destination_function.address;
+            edge.dst_func_name = !xref.to_function_name.empty()
+                ? xref.to_function_name : destination_function.name;
+            edge.kind = xref.ref_type;
+            out.push_back(std::move(edge));
         }
         return true;
     }
@@ -802,17 +1087,35 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(2048, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.ListDataItems(kAllAddressesMin, kAllAddressesMax, ps, off);
-            if (!ok_or_record_error_locked(listed, "ListDataItems")) return false;
-            const auto& rows = listed.value->data_items;
-            count = rows.size();
-            dest.reserve(dest.size() + count);
-            for (const auto& row : rows) {
-                dest.push_back(map_data_item(row));
+        // Offset pagination makes the host reopen its defined-data iterator and
+        // skip every preceding item on every page. Cursor by address so a full
+        // relation read is linear in the number of data items.
+        constexpr int page_size = 2048;
+        std::uint64_t range_start = kAllAddressesMin;
+        for (;;) {
+            if (xsql::vtab_interrupted()) {
+                out.clear();
+                return false;
             }
-            return true;
-        });
+            auto listed = client_.ListDataItems(
+                range_start, kAllAddressesMax, page_size, 0);
+            if (!ok_or_record_error_locked(listed, "ListDataItems")) {
+                out.clear();
+                return false;
+            }
+            const auto& rows = listed.value->data_items;
+            if (rows.empty()) break;
+            out.reserve(out.size() + rows.size());
+            for (const auto& row : rows) {
+                out.push_back(map_data_item(row));
+            }
+            if (rows.size() < static_cast<std::size_t>(page_size)) break;
+            const std::uint64_t last = rows.back().address;
+            if (last == kAllAddressesMax) break;
+            range_start = last + 1;
+        }
+        last_error_.clear();
+        return true;
     }
 
     bool read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const override {
@@ -849,26 +1152,34 @@ public:
             // window but covers into it is still listed (see kItemLowSlackBytes
             // for the heuristic's limits); span-intersection filters the rest.
             const std::uint64_t lo = widen_low(win.first, kItemLowSlackBytes);
-            std::vector<model::DataItemRow> page;
-            const bool ok = paginate_locked(2048, page, [&](int ps, int off, auto& dest, std::size_t& count) {
-                auto listed = client_.ListDataItems(lo, win.second, ps, off);
-                if (!ok_or_record_error_locked(listed, "ListDataItems")) return false;
+            constexpr int page_size = 2048;
+            std::uint64_t range_start = lo;
+            for (;;) {
+                if (xsql::vtab_interrupted()) {
+                    out.clear();
+                    return false;
+                }
+                auto listed = client_.ListDataItems(
+                    range_start, win.second, page_size, 0);
+                if (!ok_or_record_error_locked(listed, "ListDataItems")) {
+                    out.clear();
+                    return false;
+                }
                 const auto& rows = listed.value->data_items;
-                count = rows.size();
+                if (rows.empty()) break;
                 for (const auto& row : rows) {
                     auto mapped = map_data_item(row);
                     if (byte_span_intersects_range(
                             mapped.address, data_item_byte_span(mapped),
                             signed_start, signed_end)) {
-                        dest.push_back(std::move(mapped));
+                        out.push_back(std::move(mapped));
                     }
                 }
-                return true;
-            });
-            if (!ok) return false;
-            out.insert(out.end(),
-                       std::make_move_iterator(page.begin()),
-                       std::make_move_iterator(page.end()));
+                if (rows.size() < static_cast<std::size_t>(page_size)) break;
+                const std::uint64_t last = rows.back().address;
+                if (last == win.second || last == kAllAddressesMax) break;
+                range_start = last + 1;
+            }
         }
         last_error_.clear();
         return true;
@@ -879,7 +1190,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
         return paginate_locked(kDecompilationPageSize, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, 30000);
+            auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, decompile_timeout_ms());
             if (!ok_or_record_error_locked(listed, "ListDecompilations")) return false;
             const auto& rows = listed.value->decompilations;
             count = rows.size();
@@ -918,7 +1229,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
         return paginate_locked(kDecompilationPageSize, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, 30000);
+            auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, decompile_timeout_ms());
             if (!ok_or_record_error_locked(listed, "ListDecompilations")) return false;
             const auto& rows = listed.value->decompilations;
             count = rows.size();
@@ -1023,6 +1334,42 @@ public:
             }
             return true;
         });
+    }
+
+    bool read_function_params_at(
+        std::int64_t func_addr,
+        std::vector<model::FunctionParamRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        trace_rpc_locked("GetFunctionSignature");
+        auto got = client_.GetFunctionSignature(to_u64(func_addr));
+        if (!ok_or_record_error_locked(got, "GetFunctionSignature")) return false;
+        if (!got.value->signature.has_value()) {
+            last_error_.clear();
+            return true;
+        }
+        const auto& sig = *got.value->signature;
+        // GetFunctionSignature accepts an interior address and returns the
+        // containing function. SQL func_addr equality is entry-address exact.
+        if (to_i64(sig.function_entry_address) != func_addr) {
+            last_error_.clear();
+            return true;
+        }
+        out.reserve(sig.parameters.size());
+        std::int64_t ordinal = 0;
+        for (const auto& param : sig.parameters) {
+            model::FunctionParamRow mapped;
+            mapped.func_addr = to_i64(sig.function_entry_address);
+            mapped.ordinal = ordinal++;
+            mapped.param_name = param.name;
+            mapped.param_type = param.data_type.empty() ? param.formal_data_type : param.data_type;
+            mapped.storage.clear();
+            mapped.is_user_named = param.is_auto_parameter ? 0 : 1;
+            out.push_back(std::move(mapped));
+        }
+        last_error_.clear();
+        return true;
     }
 
     bool read_types(std::vector<model::TypeRow>& out) const override {
@@ -1171,7 +1518,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
         return paginate_locked(kDecompilationPageSize, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, 30000);
+            auto listed = client_.ListDecompilations(kAllAddressesMin, kAllAddressesMax, ps, off, decompile_timeout_ms());
             if (!ok_or_record_error_locked(listed, "ListDecompilations")) return false;
             const auto& rows = listed.value->decompilations;
             count = rows.size();
@@ -1183,6 +1530,10 @@ public:
                 mapped.func_name = detail.func_name;
                 mapped.text = detail.pseudocode;
                 mapped.is_stale = (!detail.completed || detail.is_fallback) ? 1 : 0;
+                mapped.prototype = detail.prototype;
+                mapped.completed = detail.completed ? 1 : 0;
+                mapped.is_fallback = detail.is_fallback ? 1 : 0;
+                mapped.error_message = detail.error_message;
                 dest.push_back(std::move(mapped));
             }
             return true;
@@ -1201,7 +1552,7 @@ public:
         auto req_mat = maturity == model::PcodeMaturity::Raw
                            ? libghidra::client::PcodeMaturity::Raw
                            : libghidra::client::PcodeMaturity::High;
-        auto got = client_.GetPcode(to_u64(address), req_mat, 30000);
+        auto got = client_.GetPcode(to_u64(address), req_mat, decompile_timeout_ms());
         if (!ok_or_record_error_locked(got, "GetPcode")) return false;
         if (!got.value->pcode.has_value()) {
             last_error_.clear();
@@ -1249,7 +1600,7 @@ public:
         auto req_mat = maturity == model::PcodeMaturity::Raw
                            ? libghidra::client::PcodeMaturity::Raw
                            : libghidra::client::PcodeMaturity::High;
-        auto got = client_.GetPcode(to_u64(address), req_mat, 30000);
+        auto got = client_.GetPcode(to_u64(address), req_mat, decompile_timeout_ms());
         if (!ok_or_record_error_locked(got, "GetPcode")) return false;
         if (!got.value->pcode.has_value()) {
             last_error_.clear();
@@ -1294,17 +1645,34 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(4096, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.ListInstructions(kAllAddressesMin, kAllAddressesMax, ps, off);
-            if (!ok_or_record_error_locked(listed, "ListInstructions")) return false;
-            const auto& rows = listed.value->instructions;
-            count = rows.size();
-            dest.reserve(dest.size() + count);
-            for (const auto& row : rows) {
-                dest.push_back(map_instruction(row));
+        // As with functions and data items, cursor by address instead of making
+        // the host rescan and skip a growing offset for every page.
+        constexpr int page_size = 4096;
+        std::uint64_t range_start = kAllAddressesMin;
+        for (;;) {
+            if (xsql::vtab_interrupted()) {
+                out.clear();
+                return false;
             }
-            return true;
-        });
+            auto listed = client_.ListInstructions(
+                range_start, kAllAddressesMax, page_size, 0);
+            if (!ok_or_record_error_locked(listed, "ListInstructions")) {
+                out.clear();
+                return false;
+            }
+            const auto& rows = listed.value->instructions;
+            if (rows.empty()) break;
+            out.reserve(out.size() + rows.size());
+            for (const auto& row : rows) {
+                out.push_back(map_instruction(row));
+            }
+            if (rows.size() < static_cast<std::size_t>(page_size)) break;
+            const std::uint64_t last = rows.back().address;
+            if (last == kAllAddressesMax) break;
+            range_start = last + 1;
+        }
+        last_error_.clear();
+        return true;
     }
 
     // func_addr is left 0 here; the table layer range-maps `address` into the
@@ -1418,26 +1786,34 @@ public:
             // cover into it, so widen the low RPC bound by 16 (x86 max is 15)
             // and let the span-intersection filter clamp the result.
             const std::uint64_t lo = widen_low(win.first, kInstructionLowSlackBytes);
-            std::vector<model::InstructionRow> page;
-            const bool ok = paginate_locked(4096, page, [&](int ps, int off, auto& dest, std::size_t& count) {
-                auto listed = client_.ListInstructions(lo, win.second, ps, off);
-                if (!ok_or_record_error_locked(listed, "ListInstructions")) return false;
+            constexpr int page_size = 4096;
+            std::uint64_t range_start = lo;
+            for (;;) {
+                if (xsql::vtab_interrupted()) {
+                    out.clear();
+                    return false;
+                }
+                auto listed = client_.ListInstructions(
+                    range_start, win.second, page_size, 0);
+                if (!ok_or_record_error_locked(listed, "ListInstructions")) {
+                    out.clear();
+                    return false;
+                }
                 const auto& rows = listed.value->instructions;
-                count = rows.size();
+                if (rows.empty()) break;
                 for (const auto& row : rows) {
                     auto mapped = map_instruction(row);
                     if (byte_span_intersects_range(
                             mapped.address, instruction_byte_span(mapped),
                             signed_start, signed_end)) {
-                        dest.push_back(std::move(mapped));
+                        out.push_back(std::move(mapped));
                     }
                 }
-                return true;
-            });
-            if (!ok) return false;
-            out.insert(out.end(),
-                       std::make_move_iterator(page.begin()),
-                       std::make_move_iterator(page.end()));
+                if (rows.size() < static_cast<std::size_t>(page_size)) break;
+                const std::uint64_t last = rows.back().address;
+                if (last == win.second || last == kAllAddressesMax) break;
+                range_start = last + 1;
+            }
         }
         last_error_.clear();
         return true;
@@ -1447,17 +1823,48 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(4096, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.GetComments(kAllAddressesMin, kAllAddressesMax, ps, off);
-            if (!ok_or_record_error_locked(listed, "GetComments")) return false;
-            const auto& rows = listed.value->comments;
-            count = rows.size();
-            dest.reserve(dest.size() + count);
-            for (const auto& row : rows) {
-                dest.push_back(map_comment(row));
+        // GetComments implements offsets by reopening the listing iterator and
+        // collecting every preceding comment. Cursor by address instead so a
+        // complete table read traverses each code-unit range only once. Retain
+        // an offset only when one address has enough comment kinds to split a
+        // page.
+        constexpr int page_size = 4096;
+        std::uint64_t range_start = kAllAddressesMin;
+        int offset_at_start = 0;
+        for (;;) {
+            if (xsql::vtab_interrupted()) {
+                out.clear();
+                return false;
             }
-            return true;
-        });
+            auto listed = client_.GetComments(
+                range_start, kAllAddressesMax, page_size, offset_at_start);
+            if (!ok_or_record_error_locked(listed, "GetComments")) {
+                out.clear();
+                return false;
+            }
+            const auto& rows = listed.value->comments;
+            if (rows.empty()) break;
+            out.reserve(out.size() + rows.size());
+            for (const auto& row : rows) {
+                out.push_back(map_comment(row));
+            }
+            if (rows.size() < static_cast<std::size_t>(page_size)) break;
+
+            const std::uint64_t last = rows.back().address;
+            int trailing_at_last = 0;
+            for (auto it = rows.rbegin();
+                 it != rows.rend() && it->address == last; ++it) {
+                ++trailing_at_last;
+            }
+            if (last == range_start) {
+                offset_at_start += trailing_at_last;
+            } else {
+                range_start = last;
+                offset_at_start = trailing_at_last;
+            }
+        }
+        last_error_.clear();
+        return true;
     }
 
     bool read_comments_at(std::int64_t address, std::vector<model::CommentRow>& out) const override {
@@ -1497,25 +1904,44 @@ public:
         // the GetComments RPC is not handed lo > hi (which returns nothing); the
         // per-window post-filter also neutralizes the host's 0/0 "all" sentinel.
         for (const auto& win : rpc_windows(start_address, end_address)) {
-            std::vector<model::CommentRow> page;
-            const bool ok = paginate_locked(4096, page, [&](int ps, int off, auto& dest, std::size_t& count) {
-                auto listed = client_.GetComments(win.first, win.second, ps, off);
-                if (!ok_or_record_error_locked(listed, "GetComments")) return false;
+            constexpr int page_size = 4096;
+            std::uint64_t range_start = win.first;
+            int offset_at_start = 0;
+            for (;;) {
+                if (xsql::vtab_interrupted()) {
+                    out.clear();
+                    return false;
+                }
+                auto listed = client_.GetComments(
+                    range_start, win.second, page_size, offset_at_start);
+                if (!ok_or_record_error_locked(listed, "GetComments")) {
+                    out.clear();
+                    return false;
+                }
                 const auto& rows = listed.value->comments;
-                count = rows.size();
-                dest.reserve(dest.size() + count);
+                if (rows.empty()) break;
+                out.reserve(out.size() + rows.size());
                 for (const auto& row : rows) {
                     if (row.address >= win.first &&
                         row.address <= win.second) {
-                        dest.push_back(map_comment(row));
+                        out.push_back(map_comment(row));
                     }
                 }
-                return true;
-            });
-            if (!ok) return false;
-            out.insert(out.end(),
-                       std::make_move_iterator(page.begin()),
-                       std::make_move_iterator(page.end()));
+                if (rows.size() < static_cast<std::size_t>(page_size)) break;
+
+                const std::uint64_t last = rows.back().address;
+                int trailing_at_last = 0;
+                for (auto it = rows.rbegin();
+                     it != rows.rend() && it->address == last; ++it) {
+                    ++trailing_at_last;
+                }
+                if (last == range_start) {
+                    offset_at_start += trailing_at_last;
+                } else {
+                    range_start = last;
+                    offset_at_start = trailing_at_last;
+                }
+            }
         }
         return true;
     }
@@ -1674,12 +2100,27 @@ public:
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        return paginate_locked(4096, out, [&](int ps, int off, auto& dest, std::size_t& count) {
-            auto listed = client_.ListXrefs(kAllAddressesMin, kAllAddressesMax, ps, off);
-            if (!ok_or_record_error_locked(listed, "ListXrefs")) return false;
+        // ListXrefs' host-side offset is also implemented by rescanning from the
+        // beginning. Cursor on the source address and use offset only when a page
+        // splits the references emitted by one instruction. This changes a full
+        // xref materialization from quadratic rescanning to a linear walk.
+        constexpr int page_size = 4096;
+        std::uint64_t range_start = kAllAddressesMin;
+        int offset_at_start = 0;
+        for (;;) {
+            if (xsql::vtab_interrupted()) {
+                out.clear();
+                return false;
+            }
+            auto listed = client_.ListXrefs(
+                range_start, kAllAddressesMax, page_size, offset_at_start);
+            if (!ok_or_record_error_locked(listed, "ListXrefs")) {
+                out.clear();
+                return false;
+            }
             const auto& rows = listed.value->xrefs;
-            count = rows.size();
-            dest.reserve(dest.size() + count);
+            if (rows.empty()) break;
+            out.reserve(out.size() + rows.size());
             for (const auto& row : rows) {
                 model::XrefRow mapped;
                 mapped.from_ea = to_i64(row.from_address);
@@ -1695,10 +2136,111 @@ public:
                 // isMemoryReference()==false, so `is_memory && !is_flow` wrongly drops it
                 // from BOTH is_data and is_code.)
                 mapped.is_data = row.is_flow ? 0 : 1;
-                dest.push_back(std::move(mapped));
+                out.push_back(std::move(mapped));
             }
-            return true;
-        });
+            if (rows.size() < static_cast<std::size_t>(page_size)) break;
+
+            const std::uint64_t last = rows.back().from_address;
+            int trailing_at_last = 0;
+            for (auto it = rows.rbegin();
+                 it != rows.rend() && it->from_address == last; ++it) {
+                ++trailing_at_last;
+            }
+            if (last == range_start) {
+                offset_at_start += trailing_at_last;
+            } else {
+                range_start = last;
+                offset_at_start = trailing_at_last;
+            }
+        }
+        last_error_.clear();
+        return true;
+    }
+
+    bool read_xrefs_from(
+        std::int64_t from_address,
+        std::vector<model::XrefRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        const std::uint64_t address = to_u64(from_address);
+        return paginate_locked(4096, out,
+            [&](int page_size, int offset, auto& dest, std::size_t& count) {
+                auto listed = client_.ListXrefs(
+                    address, address, page_size, offset);
+                if (!ok_or_record_error_locked(listed, "ListXrefs")) return false;
+                const auto& rows = listed.value->xrefs;
+                count = rows.size();
+                dest.reserve(dest.size() + count);
+                for (const auto& row : rows) {
+                    model::XrefRow mapped;
+                    mapped.from_ea = to_i64(row.from_address);
+                    mapped.to_ea = to_i64(row.to_address);
+                    mapped.kind = row.ref_type;
+                    mapped.is_code = row.is_flow ? 1 : 0;
+                    mapped.is_data = row.is_flow ? 0 : 1;
+                    dest.push_back(std::move(mapped));
+                }
+                return true;
+            });
+    }
+
+    bool read_xrefs_to(
+        std::int64_t to_address,
+        std::vector<model::XrefRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        const std::uint64_t address = to_u64(to_address);
+        return paginate_locked(4096, out,
+            [&](int page_size, int offset, auto& dest, std::size_t& count) {
+                auto listed = client_.ListXrefsTo(address, page_size, offset);
+                if (!ok_or_record_error_locked(listed, "ListXrefsTo")) return false;
+                const auto& rows = listed.value->xrefs;
+                count = rows.size();
+                dest.reserve(dest.size() + count);
+                for (const auto& row : rows) {
+                    model::XrefRow mapped;
+                    mapped.from_ea = to_i64(row.from_address);
+                    mapped.to_ea = to_i64(row.to_address);
+                    mapped.kind = row.ref_type;
+                    mapped.is_code = row.is_flow ? 1 : 0;
+                    mapped.is_data = row.is_flow ? 0 : 1;
+                    dest.push_back(std::move(mapped));
+                }
+                return true;
+            });
+    }
+
+    bool read_xrefs_from_function(
+        std::int64_t function_address,
+        std::vector<model::XrefRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        return paginate_locked(4096, out,
+            [&](int page_size, int offset, auto& dest, std::size_t& count) {
+                auto listed = client_.ListXrefsFromFunction(
+                    to_u64(function_address), page_size, offset);
+                if (!listed.ok() && is_absent_subject(listed)) {
+                    count = 0;
+                    return true;  // no function there -> no rows
+                }
+                if (!ok_or_record_error_locked(listed, "ListXrefsFromFunction")) return false;
+                const auto& rows = listed.value->xrefs;
+                count = rows.size();
+                dest.reserve(dest.size() + count);
+                for (const auto& row : rows) {
+                    model::XrefRow mapped;
+                    mapped.from_ea = to_i64(row.from_address);
+                    mapped.to_ea = to_i64(row.to_address);
+                    mapped.kind = row.ref_type;
+                    mapped.is_code = row.is_flow ? 1 : 0;
+                    mapped.is_data = row.is_flow ? 0 : 1;
+                    dest.push_back(std::move(mapped));
+                }
+                return true;
+            });
     }
 
     bool read_program_info(model::ProgramInfoRow& out) const override {
@@ -1819,14 +2361,6 @@ public:
             program_identity_switched_ = true;
             refresh_program_metadata_locked();
         }
-        // A new identity OR a new modification number means host-side state
-        // moved: drop the per-revision read memos.
-        if (identity != last_program_identity_ ||
-            rev.value->modification_number != last_modification_seen_) {
-            trace_rpc_locked("(freshness memo clear)");
-            function_at_memo_.clear();
-        }
-        last_modification_seen_ = rev.value->modification_number;
         last_program_identity_ = identity;
         out.program_id = std::to_string(rev.value->program_id);
         out.modification_number = to_i64(rev.value->modification_number);
@@ -1909,8 +2443,6 @@ public:
         if (!ok_or_record_error_locked(renamed, "RenameFunction") || !renamed.value->renamed) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -1923,8 +2455,6 @@ public:
         if (!ok_or_record_error_locked(renamed, "RenameSymbol") || !renamed.value->renamed) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -1937,8 +2467,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteSymbol") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -1951,8 +2479,6 @@ public:
         if (!ok_or_record_error_locked(renamed, "RenameDataItem") || !renamed.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -1965,8 +2491,6 @@ public:
         if (!ok_or_record_error_locked(updated, "ApplyDataType") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -1979,8 +2503,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteDataItem") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -1993,8 +2515,6 @@ public:
         if (!ok_or_record_error_locked(renamed, "RenameSymbol") || !renamed.value->renamed) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2013,8 +2533,6 @@ public:
                 return false;
             }
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2027,8 +2545,6 @@ public:
         if (!ok_or_record_error_locked(written, "WriteBytes") || written.value->bytes_written == 0) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2044,8 +2560,6 @@ public:
         if (!ok_or_record_error_locked(set, "SetComment") || !set.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2060,8 +2574,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteComment") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2074,8 +2586,6 @@ public:
         if (!ok_or_record_error_locked(set, "SetComment") || !set.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2088,8 +2598,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteComment") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2109,8 +2617,6 @@ public:
             }
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2144,7 +2650,6 @@ public:
             }
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2164,7 +2669,6 @@ public:
             }
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2184,7 +2688,6 @@ public:
             }
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2224,7 +2727,6 @@ public:
             }
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2243,8 +2745,6 @@ public:
             }
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2266,8 +2766,6 @@ public:
             }
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2289,8 +2787,6 @@ public:
             }
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2312,8 +2808,6 @@ public:
             }
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2337,7 +2831,6 @@ public:
         if (!ok_or_record_error_locked(added, "AddBreakpoint") || !added.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2350,7 +2843,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetBreakpointEnabled") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2363,7 +2855,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetBreakpointKind") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2376,7 +2867,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetBreakpointSize") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2389,7 +2879,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetBreakpointCondition") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2402,7 +2891,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetBreakpointGroup") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2415,7 +2903,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteBreakpoint") || !deleted.value->deleted) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2432,7 +2919,6 @@ public:
         if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2457,7 +2943,6 @@ public:
         if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2482,7 +2967,6 @@ public:
         if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2507,7 +2991,6 @@ public:
         if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2523,7 +3006,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteBookmark") || !deleted.value->deleted) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2538,7 +3020,6 @@ public:
         if (!ok_or_record_error_locked(added, "AddPerfBenchmark") || !added.value->added) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2558,7 +3039,6 @@ public:
             last_error_ = "perf benchmark not found: '" + bench_id + "'";
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2575,7 +3055,6 @@ public:
         if (!ok_or_record_error_locked(created, "CreateFunctionTag") || !created.value->created) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2588,7 +3067,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteFunctionTag") || !deleted.value->deleted) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2603,7 +3081,6 @@ public:
         if (!ok_or_record_error_locked(tagged, "TagFunction") || !tagged.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2618,7 +3095,6 @@ public:
         if (!ok_or_record_error_locked(untagged, "UntagFunction") || !untagged.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2631,8 +3107,6 @@ public:
         if (!ok_or_record_error_locked(updated, "RenameType") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2651,8 +3125,6 @@ public:
         if (!ok_or_record_error_locked(created, "CreateType") || !created.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2665,8 +3137,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteType") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2681,8 +3151,6 @@ public:
         if (!ok_or_record_error_locked(created, "CreateTypeAlias") || !created.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2695,8 +3163,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteTypeAlias") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2711,8 +3177,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetTypeAliasTarget") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2728,8 +3192,6 @@ public:
         if (!ok_or_record_error_locked(created, "CreateTypeEnum") || !created.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2742,8 +3204,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteTypeEnum") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2759,8 +3219,6 @@ public:
         if (!ok_or_record_error_locked(created, "AddTypeEnumMember") || !created.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2775,8 +3233,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteTypeEnumMember") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2792,8 +3248,6 @@ public:
         if (!ok_or_record_error_locked(updated, "RenameTypeMember") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2810,8 +3264,6 @@ public:
         if (!ok_or_record_error_locked(created, "AddTypeMember") || !created.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2826,8 +3278,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteTypeMember") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2843,8 +3293,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetTypeMemberType") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2860,7 +3308,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetTypeMemberComment") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2876,8 +3323,6 @@ public:
         if (!ok_or_record_error_locked(updated, "RenameTypeEnumMember") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2893,8 +3338,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetTypeEnumMemberValue") || !updated.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2910,7 +3353,6 @@ public:
         if (!ok_or_record_error_locked(updated, "SetTypeEnumMemberComment") || !updated.value->updated) {
             return false;
         }
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2927,8 +3369,6 @@ public:
         if (!ok_or_record_error_locked(created, "CreateType") || !created.value->updated) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2941,8 +3381,6 @@ public:
         if (!ok_or_record_error_locked(deleted, "DeleteType") || !deleted.value->deleted) {
             return false;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return true;
     }
 
@@ -2969,7 +3407,6 @@ public:
         if (!ensure_session_open_locked()) {
             return false;
         }
-        invalidate_decompile_cache_locked();
         auto rev = client_.GetRevision();
         return ok_or_record_error_locked(rev, "GetRevision");
     }
@@ -2987,8 +3424,6 @@ public:
             last_error_ = parsed.value->errors[0];
             return -1;
         }
-        invalidate_decompile_cache_locked();
-        maybe_auto_save_locked();
         return parsed.value->types_created;
     }
 
@@ -3002,7 +3437,7 @@ public:
         if (!ensure_session_open_locked()) {
             return std::nullopt;
         }
-        auto decomp = client_.GetDecompilation(to_u64(address), 30000);
+        auto decomp = client_.GetDecompilation(to_u64(address), decompile_timeout_ms());
         if (!ok_or_record_error_locked(decomp, "GetDecompilation")) {
             return std::nullopt;
         }
@@ -3023,10 +3458,6 @@ public:
     }
 
 private:
-    void invalidate_decompile_cache_locked() const {
-        // Query-scoped only: source does not retain decompilation state across queries.
-    }
-
     static std::string to_decomp_local_role(libghidra::client::DecompileLocalKind kind) {
         switch (kind) {
             case libghidra::client::DecompileLocalKind::kParam:
@@ -3098,21 +3529,20 @@ private:
         return detail;
     }
 
-    void maybe_auto_save_locked() const {
-        // Every mutation path lands here (even when auto-save is off), so it
-        // doubles as the local-mutation invalidation point for read memos.
-        trace_rpc_locked("(mutation memo clear)");
-        function_at_memo_.clear();
-        if (options_.auto_save_interval <= 0) {
-            return;
-        }
-        ++mutation_count_;
-        if (mutation_count_ % options_.auto_save_interval == 0) {
-            auto saved = client_.SaveProgram();
-            if (!saved.ok() || !saved.value->saved) {
-                last_error_ = "auto-save failed after " + std::to_string(mutation_count_) + " mutations";
-            }
-        }
+    // True when the host reported "there is no such function", which for a SQL
+    // equality filter is an EMPTY RESULT, not an error.
+    //
+    // libghidra distinguishes "no function starts at this address" from "this
+    // function has no references" -- a useful distinction for a direct RPC
+    // caller. But these RPCs also back `WHERE src_func_addr = X`, and a SQL
+    // filter whose value matches nothing must return zero rows; failing the
+    // statement instead would make any query over a non-entry address an error,
+    // which is ordinary usage (an address from a join, a user-supplied constant,
+    // a doc example). So the code is translated to "no rows" at this boundary
+    // and left intact at the RPC layer.
+    template <typename T>
+    static bool is_absent_subject(const libghidra::client::StatusOr<T>& status_or) {
+        return status_or.status.code == "not_found";
     }
 
     template <typename T>
@@ -3140,6 +3570,10 @@ private:
     bool paginate_locked(int page_size, std::vector<ModelRow>& out, FetchPage&& fetch_page) const {
         int offset = 0;
         for (;;) {
+            if (xsql::vtab_interrupted()) {
+                out.clear();
+                return false;
+            }
             std::size_t count = 0;
             if (!fetch_page(page_size, offset, out, count)) {
                 out.clear();
@@ -3506,11 +3940,8 @@ private:
     }
 
     static bool rpc_trace_enabled() {
-        static const bool enabled = []() {
-            const char* value = std::getenv("GHIDRASQL_RPC_TRACE");
-            return value != nullptr && value[0] != '\0' && std::string(value) != "0";
-        }();
-        return enabled;
+        const char* value = std::getenv("GHIDRASQL_RPC_TRACE");
+        return value != nullptr && value[0] != '\0' && std::string(value) != "0";
     }
 
     void trace_rpc_locked(const char* op) const {
@@ -3563,15 +3994,8 @@ private:
     // launch-time options_.program_path describes a *previous* program and must
     // never be used as a fallback (a stale path next to fresh name/hashes).
     mutable bool program_identity_switched_ = false;
-    // Per-revision memo for read_function_at (nullopt = negative hit). Cleared
-    // on every local mutation (maybe_auto_save_locked) and whenever the
-    // freshness token observes a new identity/modification number.
-    mutable std::unordered_map<std::int64_t, std::optional<model::FunctionRow>>
-        function_at_memo_;
-    mutable std::uint64_t last_modification_seen_ = 0;
     mutable bool opened_project_ = false;
     mutable libghidra::client::HttpClient client_;
-    mutable int mutation_count_ = 0;
 };
 #endif
 
