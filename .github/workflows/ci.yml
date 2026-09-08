@@ -27,6 +27,12 @@ jobs:
             os: ubuntu-latest
             cli_artifact: cli-linux
             cli_path: build/bin/ghidrasql
+          # AArch64 Linux, for Raspberry Pi / arm64 server users. The source
+          # already builds cleanly there; only a published binary was missing.
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            cli_artifact: cli-linux-arm64
+            cli_path: build/bin/ghidrasql
           - name: macOS
             os: macos-latest
             cli_artifact: cli-macos
@@ -190,6 +196,12 @@ jobs:
           name: cli-linux
           path: cli-linux
 
+      - name: Download Linux ARM64 CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux-arm64
+          path: cli-linux-arm64
+
       - name: Download macOS CLI
         uses: actions/download-artifact@v4
         with:
@@ -212,16 +224,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release/linux release/macos release/windows
+          mkdir -p release/linux release/linux-arm64 release/macos release/windows
           cp cli-linux/ghidrasql release/linux/ghidrasql
+          cp cli-linux-arm64/ghidrasql release/linux-arm64/ghidrasql
           cp cli-macos/ghidrasql release/macos/ghidrasql
           cp cli-windows/ghidrasql.exe release/windows/ghidrasql.exe
           cp README.md release/linux/
+          cp README.md release/linux-arm64/
           cp README.md release/macos/
           cp README.md release/windows/
           (
+            # Name kept as plain "linux" (x86-64) so existing download links
+            # and scripts keep resolving; arm64 is published alongside it.
             cd release/linux
             zip -9 "../ghidrasql-cli-linux-${GITHUB_REF_NAME}.zip" ghidrasql README.md
+          )
+          (
+            cd release/linux-arm64
+            zip -9 "../ghidrasql-cli-linux-arm64-${GITHUB_REF_NAME}.zip" ghidrasql README.md
           )
           (
             cd release/macos
@@ -243,6 +263,7 @@ jobs:
           generate_release_notes: true
           files: |
             release/ghidrasql-cli-linux-${{ github.ref_name }}.zip
+            release/ghidrasql-cli-linux-arm64-${{ github.ref_name }}.zip
             release/ghidrasql-cli-macos-${{ github.ref_name }}.zip
             release/ghidrasql-cli-windows-${{ github.ref_name }}.zip
             release/ghidrasql-seed-linux-x86_64.zip

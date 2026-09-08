@@ -701,17 +701,28 @@ public:
                 ? xref.from_function_name : source_function.name;
             edge.call_site = to_i64(xref.from_address);
             edge.dst_addr = to_i64(xref.to_address);
-            // 0 when the destination is not inside a function (an import, a PLT
-            // or thunk stub, or an unresolved indirect target) -- the SAME value
-            // the full-scan path produces there via find_owner().
+            // KNOWN DIVERGENCE from the full-scan path, for destinations that
+            // are NOT inside a function (imports, PLT/thunk stubs, unresolved
+            // indirect targets).
             //
-            // The pushdown originally fell back to dst_addr here, which is
-            // non-zero. That made one logical row carry a different
-            // dst_func_addr depending only on whether the planner chose the
-            // pushdown, and any consumer filtering on `dst_func_addr != 0` would
-            // then include or exclude the same call site depending on the query
-            // shape. dst_addr is still available in its own column for callers
-            // that want the raw target.
+            // The full scan derives ownership with find_owner(), which returns
+            // 0 when nothing contains the address. This bounded path cannot:
+            // the host seeds XrefRecord.to_function_address with the RAW
+            // destination offset and only overwrites it when
+            // getFunctionContaining() hits, so the field is never 0 for a valid
+            // destination and the ternary below always takes the first branch.
+            // Such rows therefore carry dst_func_addr = raw address here but 0
+            // under a full scan.
+            //
+            // Fixing it needs either one GetFunction per edge (this reader
+            // returns every call FROM a function, so destinations vary per row
+            // -- that is a per-edge RPC, which is exactly the cost the pushdown
+            // exists to avoid) or a host-side change making
+            // to_function_address mean "containing function, or 0".
+            // read_call_edges_to_addr resolves its single destination once and
+            // does not have this problem.
+            //
+            // dst_addr is always the raw target, in its own column, either way.
             edge.dst_func_addr =
                 xref.to_function_address != 0 ? to_i64(xref.to_function_address) : 0;
             edge.dst_func_name = xref.to_function_name;
@@ -774,6 +785,89 @@ public:
             edge.src_func_name = xref.from_function_name;
             edge.call_site = to_i64(xref.from_address);
             edge.dst_addr = to_i64(xref.to_address);
+            edge.dst_func_addr = destination_function.address;
+            edge.dst_func_name = !xref.to_function_name.empty()
+                ? xref.to_function_name : destination_function.name;
+            edge.kind = xref.ref_type;
+            out.push_back(std::move(edge));
+        }
+        return true;
+    }
+
+    // Calls targeting one exact RAW destination address.
+    //
+    // Unlike read_call_edges_to this must NOT require a function at `address`
+    // -- imports, PLT/thunk stubs and unresolved indirect targets are not
+    // function entries, and they are exactly the rows this reader exists to
+    // serve. But it must still RESOLVE the destination, because the host's
+    // XrefRecord.to_function_address is not a reliable "is this a function"
+    // signal: XrefsRuntime seeds it with the raw destination offset and only
+    // overwrites it when getFunctionContaining() hits. Trusting it directly
+    // gives every unresolved target a NON-ZERO dst_func_addr, which then fails
+    // the callers view's `dst_func_addr = 0` unresolved arm -- silently dropping
+    // precisely the import/thunk rows the UNION ALL exists to keep.
+    //
+    // So resolve the target once with GetFunction and use its address (0 when
+    // there is no function there). That keeps the resolved and unresolved arms
+    // disjoint, which is what makes the two bounded paths add up to the same
+    // row set as the unbounded scan.
+    bool read_call_edges_to_addr(
+        std::int64_t address,
+        std::vector<model::CallEdgeRow>& out) const override {
+        out.clear();
+
+        std::vector<libghidra::client::XrefRecord> xrefs;
+        model::FunctionRow destination_function;  // address stays 0 when absent
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!ensure_session_open_locked()) return false;
+            const std::uint64_t target = to_u64(address);
+
+            trace_rpc_locked("GetFunction");
+            auto got = client_.GetFunction(target);
+            if (!ok_or_record_error_locked(got, "GetFunction")) return false;
+            if (got.value->function.has_value()) {
+                destination_function = map_function(*got.value->function);
+            }
+            if (!paginate_locked(4096, xrefs,
+                    [&](int page_size, int offset, auto& dest, std::size_t& count) {
+                        auto listed = client_.ListXrefsTo(target, page_size, offset);
+                        if (!ok_or_record_error_locked(listed, "ListXrefsTo")) return false;
+                        const auto& rows = listed.value->xrefs;
+                        count = rows.size();
+                        dest.reserve(dest.size() + count);
+                        for (const auto& row : rows) {
+                            dest.push_back(row);
+                        }
+                        return true;
+                    })) {
+                out.clear();
+                return false;
+            }
+        }
+
+        auto is_call_like = [](const std::string& kind) {
+            std::string lowered = kind;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            return lowered.find("call") != std::string::npos;
+        };
+
+        out.reserve(xrefs.size());
+        for (const auto& xref : xrefs) {
+            if (!is_call_like(xref.ref_type)) {
+                continue;
+            }
+            model::CallEdgeRow edge;
+            edge.src_func_addr = to_i64(xref.from_function_address);
+            edge.src_func_name = xref.from_function_name;
+            edge.call_site = to_i64(xref.from_address);
+            edge.dst_addr = to_i64(xref.to_address);
+            // 0 when the destination is not inside a function -- which is
+            // exactly the unresolved case this reader exists to serve. Taken
+            // from the resolved lookup, NOT from xref.to_function_address (see
+            // the note above: that field falls back to the raw offset).
             edge.dst_func_addr = destination_function.address;
             edge.dst_func_name = !xref.to_function_name.empty()
                 ? xref.to_function_name : destination_function.name;

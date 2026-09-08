@@ -378,6 +378,24 @@ bool Source::read_call_edges_to(
     }
     return true;
 }
+bool Source::read_call_edges_to_addr(
+    std::int64_t address,
+    std::vector<model::CallEdgeRow>& out) const {
+    std::vector<model::CallEdgeRow> all;
+    if (!read_call_edges(all)) {
+        out.clear();
+        return false;
+    }
+    out.clear();
+    for (auto& row : all) {
+        // Keyed on the RAW destination, so this matches resolved and
+        // unresolved targets alike; callers of this reader narrow further.
+        if (row.dst_addr == address) {
+            out.push_back(std::move(row));
+        }
+    }
+    return true;
+}
 bool Source::read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const { return clear_and_fail(out); }
 bool Source::read_data_items(std::vector<model::DataItemRow>& out) const { return clear_and_fail(out); }
 bool Source::read_data_items_at(std::int64_t address, std::vector<model::DataItemRow>& out) const {

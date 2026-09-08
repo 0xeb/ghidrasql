@@ -1144,7 +1144,7 @@ INSERT/DELETE are rejected. `timeout_push`/`timeout_pop` remain PRAGMAs.
 | `timeout_pop` | action | `PRAGMA ghidrasql.timeout_pop` restores the previous timeout |
 
 ```sql
-SELECT key, value, type, scope FROM runtime_settings ORDER BY key;
+SELECT key, value, type, scope, kind, settable FROM runtime_settings ORDER BY key;
 UPDATE runtime_settings SET value='5000' WHERE key='query_timeout_ms';  -- set
 SELECT value FROM runtime_settings WHERE key='query_timeout_ms';        -- read
 PRAGMA ghidrasql.timeout_push = 30000;      -- scope a heavier timeout...

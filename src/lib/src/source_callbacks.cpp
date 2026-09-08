@@ -146,6 +146,15 @@ public:
         return Source::read_call_edges_to(function_address, out);
     }
 
+    bool read_call_edges_to_addr(
+        std::int64_t address,
+        std::vector<model::CallEdgeRow>& out) const override {
+        if (callbacks_.read_call_edges_to_addr) {
+            return callbacks_.read_call_edges_to_addr(address, out);
+        }
+        return Source::read_call_edges_to_addr(address, out);
+    }
+
     bool read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const override {
         return read_rows(callbacks_.read_memory_blocks, out);
     }

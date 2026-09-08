@@ -741,6 +741,7 @@ struct SourceCallbacks {
     std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_at;
     std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_from;
     std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_to;
+    std::function<bool(std::int64_t, std::vector<model::CallEdgeRow>&)> read_call_edges_to_addr;
     std::function<bool(std::vector<model::MemoryBlockRow>&)> read_memory_blocks;
     std::function<bool(std::vector<model::DataItemRow>&)> read_data_items;
     std::function<bool(std::int64_t, std::vector<model::DataItemRow>&)> read_data_items_at;
@@ -988,6 +989,17 @@ public:
     // default filters the bulk reader for fixture compatibility.
     virtual bool read_call_edges_to(
         std::int64_t function_address,
+        std::vector<model::CallEdgeRow>& out) const;
+    // Calls targeting one exact RAW destination address, whether or not that
+    // address is a function entry. This is the unresolved-destination
+    // counterpart to read_call_edges_to: imports, PLT/thunk stubs and
+    // unresolved indirect targets have dst_func_addr == 0, so they are
+    // identified only by dst_addr and read_call_edges_to (which requires a
+    // function at the address) cannot serve them. Live backends should use the
+    // bounded incoming-reference lookup for the address. The default filters
+    // the bulk reader for fixture compatibility.
+    virtual bool read_call_edges_to_addr(
+        std::int64_t address,
         std::vector<model::CallEdgeRow>& out) const;
     virtual bool read_memory_blocks(std::vector<model::MemoryBlockRow>& out) const;
     virtual bool read_data_items(std::vector<model::DataItemRow>& out) const;

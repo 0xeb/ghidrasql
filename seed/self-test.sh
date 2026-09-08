@@ -69,12 +69,33 @@ printf '%s' "$callers_json" | grep -q '"success":true' || {
     echo "self-test FAILED: exact callers lookup did not complete: $callers_json" >&2
     exit 1
 }
+# Completing is not enough: callers is a UNION ALL whose two arms are bounded by
+# different keys (dst_func_addr for resolved targets, dst_addr for imports /
+# thunks / unresolved indirects). A regression in either arm changes the ROW SET
+# while still succeeding. Compare against the same query with the pushdown
+# defeated by unary '+', which forces the unbounded path.
+callers_ref_json="$(timeout 30 "$script_dir/query.sh" \
+    "SELECT COUNT(*) AS n FROM callers WHERE +func_addr = $target_addr;" "$port")"
+callers_n="$(printf '%s' "$callers_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
+callers_ref_n="$(printf '%s' "$callers_ref_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
+[[ -n "$callers_n" && "$callers_n" == "$callers_ref_n" ]] || {
+    echo "self-test FAILED: bounded callers count ($callers_n) != unbounded reference ($callers_ref_n)" >&2
+    exit 1
+}
 
 echo "[7/11] push down exact callees"
 callees_json="$(timeout 5 "$script_dir/query.sh" \
     "SELECT COUNT(*) AS n FROM callees WHERE func_addr = $target_addr;" "$port")"
 printf '%s' "$callees_json" | grep -q '"success":true' || {
     echo "self-test FAILED: exact callees lookup did not complete: $callees_json" >&2
+    exit 1
+}
+callees_ref_json="$(timeout 30 "$script_dir/query.sh" \
+    "SELECT COUNT(*) AS n FROM callees WHERE +func_addr = $target_addr;" "$port")"
+callees_n="$(printf '%s' "$callees_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
+callees_ref_n="$(printf '%s' "$callees_ref_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
+[[ -n "$callees_n" && "$callees_n" == "$callees_ref_n" ]] || {
+    echo "self-test FAILED: bounded callees count ($callees_n) != unbounded reference ($callees_ref_n)" >&2
     exit 1
 }
 

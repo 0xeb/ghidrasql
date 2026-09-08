@@ -2059,6 +2059,22 @@ inline xsql::CachedTableDef<model::CallEdgeRow> define_call_edges(const std::sha
             },
             8.0,
             64.0)
+        // Raw destination. dst_func_addr only identifies edges whose target is
+        // a function entry; imports, PLT/thunk stubs and unresolved indirect
+        // targets have dst_func_addr == 0 and are identified solely by
+        // dst_addr. Without this filter the `callers` view's unresolved union
+        // arm plans as VIRTUAL TABLE INDEX 0 and falls through to the
+        // whole-program cache builder, so an exact `callers WHERE func_addr = X`
+        // paid a global ListFunctions on top of the bounded lookup.
+        .filter_eq("dst_addr",
+            [source](std::int64_t address) -> std::unique_ptr<xsql::RowIterator> {
+                std::vector<model::CallEdgeRow> rows;
+                source->read_call_edges_to_addr(address, rows);
+                return std::make_unique<OwnedRowIterator<model::CallEdgeRow>>(
+                    std::move(rows), column_call_edge);
+            },
+            8.0,
+            64.0)
         .filter_eq("call_site",
             [source](std::int64_t call_site) -> std::unique_ptr<xsql::RowIterator> {
                 std::vector<model::CallEdgeRow> rows;
@@ -2070,6 +2086,7 @@ inline xsql::CachedTableDef<model::CallEdgeRow> define_call_edges(const std::sha
             2.0)
         .index_on("src_func_addr", [](const model::CallEdgeRow& r) { return r.src_func_addr; })
         .index_on("dst_func_addr", [](const model::CallEdgeRow& r) { return r.dst_func_addr; })
+        .index_on("dst_addr", [](const model::CallEdgeRow& r) { return r.dst_addr; })
         .index_on("call_site", [](const model::CallEdgeRow& r) { return r.call_site; })
         .build();
 }

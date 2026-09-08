@@ -610,9 +610,17 @@ namespace ghidrasql::entities {
             --
             -- Wrapping func_addr in a CASE would keep the rows but hide the
             -- column behind an expression, defeating the pushdown this patch
-            -- exists for. The union keeps the resolved branch a direct
-            -- column-to-column mapping, so `WHERE func_addr = X` still pushes
-            -- down there, and only the unresolved minority falls back to a scan.
+            -- exists for. The union keeps BOTH branches a direct
+            -- column-to-column mapping, so `WHERE func_addr = X` pushes down
+            -- on each: the resolved branch through call_edges' dst_func_addr
+            -- filter, the unresolved branch through its dst_addr filter.
+            --
+            -- Both filters are required. dst_addr originally had none, so this
+            -- arm planned as VIRTUAL TABLE INDEX 0 and materialised the whole
+            -- call graph -- an exact lookup issued a global ListFunctions on
+            -- top of the bounded one (field report 2026-09-06). Query-plan
+            -- guards pin both arms; EXPLAIN QUERY PLAN on
+            -- `callers WHERE func_addr = X` must show no VIRTUAL TABLE INDEX 0.
             SELECT
                 c.dst_func_addr AS func_addr,
                 c.call_site AS caller_addr,
