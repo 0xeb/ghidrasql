@@ -76,8 +76,8 @@ printf '%s' "$callers_json" | grep -q '"success":true' || {
 # defeated by unary '+', which forces the unbounded path.
 callers_ref_json="$(timeout 30 "$script_dir/query.sh" \
     "SELECT COUNT(*) AS n FROM callers WHERE +func_addr = $target_addr;" "$port")"
-callers_n="$(printf '%s' "$callers_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
-callers_ref_n="$(printf '%s' "$callers_ref_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
+callers_n="$(printf '%s' "$callers_json" | sed -n 's/.*"rows":\[\["\([0-9]*\)"\]\].*/\1/p')"
+callers_ref_n="$(printf '%s' "$callers_ref_json" | sed -n 's/.*"rows":\[\["\([0-9]*\)"\]\].*/\1/p')"
 [[ -n "$callers_n" && "$callers_n" == "$callers_ref_n" ]] || {
     echo "self-test FAILED: bounded callers count ($callers_n) != unbounded reference ($callers_ref_n)" >&2
     exit 1
@@ -92,8 +92,8 @@ printf '%s' "$callees_json" | grep -q '"success":true' || {
 }
 callees_ref_json="$(timeout 30 "$script_dir/query.sh" \
     "SELECT COUNT(*) AS n FROM callees WHERE +func_addr = $target_addr;" "$port")"
-callees_n="$(printf '%s' "$callees_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
-callees_ref_n="$(printf '%s' "$callees_ref_json" | sed -n 's/.*"rows":\[\[\([0-9]*\)\]\].*/\1/p')"
+callees_n="$(printf '%s' "$callees_json" | sed -n 's/.*"rows":\[\["\([0-9]*\)"\]\].*/\1/p')"
+callees_ref_n="$(printf '%s' "$callees_ref_json" | sed -n 's/.*"rows":\[\["\([0-9]*\)"\]\].*/\1/p')"
 [[ -n "$callees_n" && "$callees_n" == "$callees_ref_n" ]] || {
     echo "self-test FAILED: bounded callees count ($callees_n) != unbounded reference ($callees_ref_n)" >&2
     exit 1
