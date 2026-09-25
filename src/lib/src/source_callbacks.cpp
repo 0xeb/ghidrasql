@@ -394,6 +394,18 @@ public:
         return read_rows(callbacks_.read_perf_benchmarks, out);
     }
 
+    bool read_program_options(std::vector<model::ProgramOptionRow>& out) const override {
+        return read_rows(callbacks_.read_program_options, out);
+    }
+
+    bool read_analysis_passes(std::vector<model::AnalysisPassRow>& out) const override {
+        return read_rows(callbacks_.read_analysis_passes, out);
+    }
+
+    bool read_transactions(std::vector<model::TransactionRow>& out) const override {
+        return read_rows(callbacks_.read_transactions, out);
+    }
+
     bool read_live_meta(std::vector<model::LiveMetaRow>& out) const override {
         return read_rows(callbacks_.read_live_meta, out);
     }
@@ -554,6 +566,19 @@ public:
 
     bool delete_perf_benchmark(const std::string& bench_id) override {
         return call_write(callbacks_.delete_perf_benchmark, bench_id);
+    }
+
+    bool set_program_option(const std::string& scope, const std::string& key,
+                            const std::string& value) override {
+        return call_write(callbacks_.set_program_option, scope, key, value);
+    }
+
+    bool start_analysis(const std::string& mode, model::AnalysisPassRow& out) override {
+        return call_write(callbacks_.start_analysis, mode, out);
+    }
+
+    bool cancel_analysis(std::int64_t pass_id) override {
+        return call_write(callbacks_.cancel_analysis, pass_id);
     }
 
     bool rename_type(const std::string& type_id, const std::string& new_name) override {

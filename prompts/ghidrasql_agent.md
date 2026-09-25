@@ -38,11 +38,17 @@ enumerate project contents, then choose the active domain path with `--program
   in one shot. Imports **skip loading external system libraries by default**
   (fast) — imports-by-name still resolve, but imports-by-ordinal show as
   ordinals; pass **`--load-libraries`** to load/link them (slower, pulls
-  kernel32/CRT into the project).
+  kernel32/CRT into the project). **`--analyzers-off <patterns>`** /
+  **`--analyzers-on <patterns>`** turn Ghidra analyzers off/on for the import
+  *before* analysis runs (comma-separated, case-insensitive; `*` makes a glob,
+  otherwise a substring) — e.g. `--analyzers-off 'Objective-C'` on a pure-Swift
+  binary. The CLI echoes what each pattern matched and warns on a pattern that
+  matched nothing.
 - **`--program <name>`** opens an **already-imported program** inside an
-  existing project. Use this when you've previously imported a binary and
-  want to re-attach without re-running analysis. Pair with `--no-analyze`
-  for fast reopens.
+  existing project without re-running analysis. An **explicit** `--analyze`
+  here re-runs a full analysis job before serving. To re-tune analyzers on an
+  existing program, `UPDATE program_options` (see *Analysis control*), then
+  `INSERT INTO analysis_passes(mode) VALUES ('all')`.
 
 Pick `--binary` for new analysis; pick `--program` to revisit existing work.
 
@@ -1152,6 +1158,55 @@ SELECT text FROM pseudocode WHERE func_addr = 0x401000;
 PRAGMA ghidrasql.timeout_pop;               -- ...then restore
 ```
 
+### Analysis control: `program_options`, `analysis_passes`, `transactions`
+
+Ghidra's analyzer set is program data: every option lives in `program_options`,
+analysis runs are rows of `analysis_passes`, and every committed change is a row
+of `transactions`. Tune analyzers that do not apply to the target (they can cost
+minutes each on a large binary), then re-run analysis — all in SQL.
+
+`program_options(option_key, option_value, value_type, option_scope,
+description, default_value, settable, allowed_values)` — the program's real
+Ghidra options, every category (`option_scope` is the Ghidra category:
+`'Analyzers'`, `'Program Information'`, `'Decompiler'`, ...). Analyzer on/off
+toggles are the `Analyzers` rows with `value_type = 'boolean'` and no `.` in the
+key; dotted keys are that analyzer's sub-options. `allowed_values` is a JSON
+array of an enum's constants (NULL otherwise). **Writable:** `UPDATE
+option_value` on `settable = 1` rows (scalar and enum `Analyzers` options). A
+value the type rejects fails the statement; other categories are read-only.
+Changes persist with `save_database()` and revert with `discard_changes()`.
+
+`analysis_passes(pass_id, mode, state, started_unix_ms, ended_unix_ms,
+elapsed_ms, message)` — background analysis jobs of the active program.
+**`INSERT INTO analysis_passes(mode) VALUES ('all')`** starts a job and returns
+at once: `'all'` re-runs every enabled analyzer; `'changed'` (the default) runs
+only the work queued by edits made since the program was opened. **While a job
+runs it owns the program: every other query fails with `analysis_running`** —
+poll `analysis_passes` (it stays readable) until `state` is `done`, `error` or
+`cancelled`. `DELETE FROM analysis_passes WHERE state = 'running'` cancels the
+job (work already done is kept). `ended_unix_ms` is 0 while running.
+
+`transactions(tx_position, tx_name, tx_kind, open_subtransactions)` — the undo
+history (`tx_kind = 'undo'`, `tx_position` 1 = most recent), undone entries
+(`'redo'`), and the transaction in progress (`'open'`, position 0). Read-only.
+
+```sql
+-- what can be tuned
+SELECT option_key, option_value, value_type FROM program_options
+ WHERE option_scope = 'Analyzers' AND settable = 1 ORDER BY option_key;
+
+-- switch off analyzers that do not apply to this target, then re-run analysis
+UPDATE program_options SET option_value = 'false'
+ WHERE option_scope = 'Analyzers' AND option_key LIKE 'Objective-C%';
+INSERT INTO analysis_passes(mode) VALUES ('all');
+SELECT state, elapsed_ms, message FROM analysis_passes ORDER BY pass_id DESC LIMIT 1;
+SELECT save_database();
+```
+
+Do not disable the parameter/type-recovery analyzers (e.g. `Decompiler
+Parameter ID`) to save time without a reason: functions then decompile with
+`undefined8`/`unaff_*` noise.
+
 ### Other Tables
 
 Additional tables available for specialized analysis:
@@ -1177,13 +1232,13 @@ Additional tables available for specialized analysis:
 | `function_metrics` | Function complexity metrics (instruction_count, block_count, cyclomatic_complexity, etc.) |
 | `text_index` | Full-text search index |
 | `search_index` | Search term index |
-| `program_options` | Program settings |
-| `analysis_passes` | Analysis history |
-| `transactions` | Transaction log |
+| `program_options` | The program's real Ghidra options (all categories). Writable: `UPDATE option_value` on `settable` rows — see *Analysis control* |
+| `analysis_passes` | Background analysis jobs. Writable: `INSERT (mode)` starts one, `DELETE` of the running row cancels it — see *Analysis control* |
+| `transactions` | Undo/redo history and the open transaction |
 | `project_properties` | Project metadata |
 | `project_files` | Project files and folders (`path`, `folder_path`, `content_type`, `is_program`) |
 | `project_programs` | Program-only project files; use this before switching active programs |
-| `sql_capabilities` | Feature capability matrix (includes `feature.runtime_settings`) |
+| `sql_capabilities` | Feature capability matrix (includes `feature.runtime_settings`, `feature.analysis_control`) |
 | `runtime_settings` | Writable live view of runtime controls — `UPDATE value` to set; `timeout_push`/`timeout_pop` are PRAGMAs (see below) |
 | `parity_findings` | Cross-tool parity analysis findings |
 | `perf_benchmarks` | Performance benchmark results (writable: `INSERT`/`DELETE` persist in the program database). INSERT upserts by `bench_id` — re-inserting the same `bench_id` replaces the record; DELETE by `bench_id` is atomic host-side |
@@ -1547,6 +1602,7 @@ underlying source itself needs an explicit reload.
 | `decomp_comments` | comment, source |
 | `breakpoints` | enabled, type, size, condition, group |
 | `bookmarks` | type, category, comment |
+| `program_options` | option_value (`settable = 1` rows: scalar/enum `Analyzers` options; typed by the host) |
 
 **Note:** `function_tags` and `function_tag_mappings` are INSERT/DELETE only (no UPDATE).
 
@@ -1571,6 +1627,7 @@ underlying source itself needs an explicit reload.
 | `function_tags` | name [, comment] |
 | `function_tag_mappings` | func_addr, tag_name |
 | `perf_benchmarks` | bench_id [, query_family, dataset_profile, cold_ms_p50, cold_ms_p95, warm_ms_p50, warm_ms_p95, throughput_qps, regression_pct, status] — upserts by bench_id (re-inserting the same bench_id replaces the record) |
+| `analysis_passes` | [mode] only (`'changed'` default, or `'all'`) — starts a background analysis job and returns at once |
 
 ### DELETE Support
 
@@ -1593,6 +1650,7 @@ underlying source itself needs an explicit reload.
 | `function_tags` | Row match (name) |
 | `function_tag_mappings` | Row match (func_addr + tag_name) |
 | `perf_benchmarks` | Row match (bench_id); each row DELETE is one host-side RPC; DELETE with no WHERE removes all rows (one RPC per row) |
+| `analysis_passes` | The running row only (`WHERE state = 'running'`) — cancels the job; finished rows are rejected |
 
 ### Durable Shutdown Model
 

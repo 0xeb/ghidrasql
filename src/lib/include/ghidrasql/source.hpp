@@ -275,29 +275,42 @@ struct TailCallRow {
     std::string tail_kind;
 };
 
+// One of the program's real Ghidra options. option_scope is the Ghidra options
+// category ("Analyzers", "Program Information", ...). value_type is the Ghidra
+// OptionType in lower case without _TYPE (boolean, int, long, double, float,
+// string, enum, file, ...). allowed_values lists an ENUM's constants (empty
+// otherwise). Only settable rows (scalar/enum "Analyzers" options) accept UPDATE.
 struct ProgramOptionRow {
     std::string option_key;
     std::string option_value;
     std::string value_type;
     std::string option_scope;
+    std::string description;
+    std::string default_value;
+    int settable = 0;
+    std::vector<std::string> allowed_values;
 };
 
+// One background auto-analysis job of the current program. state is running |
+// done | error | cancelled; ended_unix_ms is 0 while running.
 struct AnalysisPassRow {
     std::int64_t pass_id = 0;
-    std::string pass_name;
-    std::string status;
-    std::int64_t started_unix = 0;
-    std::int64_t ended_unix = 0;
-    std::string notes;
+    std::string mode;
+    std::string state;
+    std::int64_t started_unix_ms = 0;
+    std::int64_t ended_unix_ms = 0;
+    std::int64_t elapsed_ms = 0;
+    std::string message;
 };
 
+// One entry of the program's transaction history. tx_kind is "undo" (committed;
+// tx_position 1 is the most recent), "redo" (undone; 1 is the next to redo) or
+// "open" (the transaction in progress, tx_position 0).
 struct TransactionRow {
-    std::int64_t tx_id = 0;
+    std::int64_t tx_position = 0;
     std::string tx_name;
     std::string tx_kind;
-    std::int64_t start_revision = 0;
-    std::int64_t end_revision = 0;
-    int committed = 0;
+    std::vector<std::string> open_subtransactions;
 };
 
 struct ProjectPropertyRow {
@@ -699,7 +712,6 @@ struct LibGhidraSourceOptions {
     std::string project_path;
     std::string project_name;
     std::string program_path;
-    bool analyze = false;
     bool read_only = false;
     // HTTP read timeout for libghidra RPCs (per-call wall-clock budget).
     // 0 = use libghidra's default (120s). Tune lower (e.g. 30000) when
@@ -796,6 +808,9 @@ struct SourceCallbacks {
     std::function<bool(std::vector<model::CapabilityRow>&)> read_capabilities;
     std::function<bool(std::vector<model::ParityFindingRow>&)> read_parity_findings;
     std::function<bool(std::vector<model::PerfBenchmarkRow>&)> read_perf_benchmarks;
+    std::function<bool(std::vector<model::ProgramOptionRow>&)> read_program_options;
+    std::function<bool(std::vector<model::AnalysisPassRow>&)> read_analysis_passes;
+    std::function<bool(std::vector<model::TransactionRow>&)> read_transactions;
     std::function<bool(std::vector<model::LiveMetaRow>&)> read_live_meta;
     std::function<bool(std::int64_t, const std::string&)> rename_function;
     std::function<bool(std::int64_t, const std::string&)> rename_symbol;
@@ -825,6 +840,9 @@ struct SourceCallbacks {
     std::function<bool(std::int64_t, const std::string&, const std::string&)> delete_bookmark;
     std::function<bool(const model::PerfBenchmarkRow&)> add_perf_benchmark;
     std::function<bool(const std::string&)> delete_perf_benchmark;
+    std::function<bool(const std::string&, const std::string&, const std::string&)> set_program_option;
+    std::function<bool(const std::string&, model::AnalysisPassRow&)> start_analysis;
+    std::function<bool(std::int64_t)> cancel_analysis;
     std::function<bool(const std::string&, const std::string&)> create_function_tag;
     std::function<bool(const std::string&)> delete_function_tag;
     std::function<bool(std::int64_t, const std::string&)> tag_function;
@@ -1084,6 +1102,12 @@ public:
     virtual bool read_capabilities(std::vector<model::CapabilityRow>& out) const;
     virtual bool read_parity_findings(std::vector<model::ParityFindingRow>& out) const;
     virtual bool read_perf_benchmarks(std::vector<model::PerfBenchmarkRow>& out) const;
+    // The program's real Ghidra options, every category.
+    virtual bool read_program_options(std::vector<model::ProgramOptionRow>& out) const;
+    // Analysis jobs of the current program, oldest first.
+    virtual bool read_analysis_passes(std::vector<model::AnalysisPassRow>& out) const;
+    // Undo/redo history and the open transaction, if any.
+    virtual bool read_transactions(std::vector<model::TransactionRow>& out) const;
     virtual bool read_live_meta(std::vector<model::LiveMetaRow>& out) const;
 
     // Optional write callbacks.
@@ -1151,6 +1175,17 @@ public:
         const std::string& category);
     virtual bool add_perf_benchmark(const model::PerfBenchmarkRow& row);
     virtual bool delete_perf_benchmark(const std::string& bench_id);
+    // Typed write of one option; the host rejects values the type cannot take.
+    virtual bool set_program_option(
+        const std::string& scope,
+        const std::string& key,
+        const std::string& value);
+    // Start a background analysis job ("changed" or "all"). ASYNCHRONOUS: returns as
+    // soon as the job exists; `out` receives it. While it runs the job owns the
+    // program and other reads fail with analysis_running.
+    virtual bool start_analysis(const std::string& mode, model::AnalysisPassRow& out);
+    // Cancel a running job (pass_id 0 = whichever is running).
+    virtual bool cancel_analysis(std::int64_t pass_id);
     virtual bool create_function_tag(
         const std::string& name,
         const std::string& comment);

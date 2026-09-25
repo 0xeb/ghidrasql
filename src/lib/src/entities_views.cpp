@@ -1471,34 +1471,6 @@ namespace ghidrasql::entities {
         )");
 
         db.exec(R"(
-            CREATE VIEW IF NOT EXISTS analysis_pass_timeline AS
-            SELECT
-                a.pass_id,
-                a.pass_name,
-                a.status,
-                a.started_unix,
-                a.ended_unix,
-                (a.ended_unix - a.started_unix) AS duration_sec,
-                a.notes
-            FROM analysis_passes a
-            ORDER BY a.pass_id
-        )");
-
-        db.exec(R"(
-            CREATE VIEW IF NOT EXISTS transaction_log AS
-            SELECT
-                t.tx_id,
-                t.tx_name,
-                t.tx_kind,
-                t.start_revision,
-                t.end_revision,
-                (t.end_revision - t.start_revision) AS revision_delta,
-                t.committed
-            FROM transactions t
-            ORDER BY t.tx_id
-        )");
-
-        db.exec(R"(
             CREATE VIEW IF NOT EXISTS relocation_map AS
             SELECT
                 r.addr,

@@ -76,6 +76,64 @@ inline std::string string_from_json_or_raw(
 // Templated on the name/value pair type (aggregate-initialized {name, value})
 // so this header stays libghidra-free and unit-testable without the CLI binary;
 // call sites instantiate it with libghidra::client::LoaderArg.
+// Split a comma-separated analyzer pattern list ("Objective-C, Shared Return") into
+// trimmed, non-empty patterns. Used by --analyzers-off/--analyzers-on.
+inline std::vector<std::string> split_pattern_list(const std::string& value) {
+    std::vector<std::string> out;
+    std::string current;
+    for (char c : value) {
+        if (c == ',') {
+            current = trim_copy(current);
+            if (!current.empty()) {
+                out.push_back(current);
+            }
+            current.clear();
+            continue;
+        }
+        current.push_back(c);
+    }
+    current = trim_copy(current);
+    if (!current.empty()) {
+        out.push_back(current);
+    }
+    return out;
+}
+
+// Analyzer patterns for an import request body: a JSON array of strings, or one
+// comma-separated string, under `key`; `fallback` (the CLI flags) when absent or
+// malformed. The SINGLE source of truth for the HTTP /project/import handler, so a
+// body that omits the key keeps the startup --analyzers-off/--analyzers-on policy.
+inline std::vector<std::string> patterns_from_json(
+    const std::string& body,
+    const std::string& key,
+    const std::vector<std::string>& fallback)
+{
+    try {
+        auto j = xsql::json::parse(body);
+        if (j.is_object() && j.contains(key)) {
+            const auto& value = j[key];
+            if (value.is_string()) {
+                return split_pattern_list(value.get<std::string>());
+            }
+            if (value.is_array()) {
+                std::vector<std::string> out;
+                for (const auto& item : value) {
+                    if (!item.is_string()) {
+                        return fallback;
+                    }
+                    std::string pattern = trim_copy(item.get<std::string>());
+                    if (!pattern.empty()) {
+                        out.push_back(pattern);
+                    }
+                }
+                return out;
+            }
+        }
+    } catch (...) {
+    }
+    return fallback;
+}
+
 template <typename LoaderArgT>
 std::vector<LoaderArgT> import_loader_args(bool load_libraries) {
     if (!load_libraries) {

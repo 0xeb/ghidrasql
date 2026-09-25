@@ -617,6 +617,9 @@ bool Source::read_decomp_tokens(std::vector<model::DecompTokenRow>& out) const {
 bool Source::read_capabilities(std::vector<model::CapabilityRow>& out) const { return clear_and_fail(out); }
 bool Source::read_parity_findings(std::vector<model::ParityFindingRow>& out) const { return clear_and_fail(out); }
 bool Source::read_perf_benchmarks(std::vector<model::PerfBenchmarkRow>& out) const { return clear_and_fail(out); }
+bool Source::read_program_options(std::vector<model::ProgramOptionRow>& out) const { return clear_and_fail(out); }
+bool Source::read_analysis_passes(std::vector<model::AnalysisPassRow>& out) const { return clear_and_fail(out); }
+bool Source::read_transactions(std::vector<model::TransactionRow>& out) const { return clear_and_fail(out); }
 bool Source::read_live_meta(std::vector<model::LiveMetaRow>& out) const { return clear_and_fail(out); }
 
 bool Source::rename_function(std::int64_t, const std::string&) { return false; }
@@ -651,6 +654,9 @@ bool Source::set_bookmark_comment(std::int64_t, const std::string&, const std::s
 bool Source::delete_bookmark(std::int64_t, const std::string&, const std::string&) { return false; }
 bool Source::add_perf_benchmark(const model::PerfBenchmarkRow&) { return false; }
 bool Source::delete_perf_benchmark(const std::string&) { return false; }
+bool Source::set_program_option(const std::string&, const std::string&, const std::string&) { return false; }
+bool Source::start_analysis(const std::string&, model::AnalysisPassRow&) { return false; }
+bool Source::cancel_analysis(std::int64_t) { return false; }
 bool Source::create_function_tag(const std::string&, const std::string&) { return false; }
 bool Source::delete_function_tag(const std::string&) { return false; }
 bool Source::tag_function(std::int64_t, const std::string&) { return false; }

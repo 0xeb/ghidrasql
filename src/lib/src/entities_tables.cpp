@@ -6,6 +6,7 @@
 
 #include "internal/entities_detail.hpp"
 
+#include <xsql/json.hpp>
 #include <xsql/runtime_settings.hpp>
 #include <xsql/runtime_settings_table.hpp>
 #include <xsql/interruption.hpp>
@@ -3224,51 +3225,144 @@ inline xsql::CachedTableDef<model::TailCallRow> define_tail_calls(const std::sha
         .build();
 }
 
+// JSON array text for a list column, or SQL NULL when the list is empty.
+inline std::optional<std::string> json_string_array_or_null(const std::vector<std::string>& values) {
+    if (values.empty()) {
+        return std::nullopt;
+    }
+    return xsql::json(values).dump();
+}
+
+// The program's real Ghidra options, every category. Analyzer settings are the
+// option_scope = 'Analyzers' rows; UPDATE option_value on a settable row writes it
+// through to the program (typed by the host: a value the option's type rejects
+// fails the statement), persisted by save_database() and reverted by
+// discard_changes(). Other categories are read-only.
+//
+//   UPDATE program_options SET option_value = 'false'
+//    WHERE option_scope = 'Analyzers' AND option_key LIKE 'Objective-C%';
+//   INSERT INTO analysis_passes(mode) VALUES ('changed');
 inline xsql::CachedTableDef<model::ProgramOptionRow> define_program_options(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::ProgramOptionRow>("program_options")
         .no_shared_cache()
-        .estimate_rows([]() { return size_t(20); })
+        .estimate_rows([]() { return size_t(200); })
         .cache_builder([source](std::vector<model::ProgramOptionRow>& out) {
-            out = derive_program_option_rows(source);
+            out.clear();
+            if (!source->read_program_options(out)) {
+                report_read_error_if_any(source, "program_options: failed to read program options");
+            }
         })
         .column_text("option_key", [](const model::ProgramOptionRow& r) { return r.option_key; })
-        .column_text("option_value", [](const model::ProgramOptionRow& r) { return r.option_value; })
+        .column_text_rw(
+            "option_value",
+            [](const model::ProgramOptionRow& r) { return r.option_value; },
+            [source](model::ProgramOptionRow& row, const char* value) {
+                if (row.settable == 0) {
+                    xsql::set_vtab_error("program_options: '" + row.option_scope + "' option '" +
+                                         row.option_key + "' (" + row.value_type +
+                                         ") is not settable");
+                    return false;
+                }
+                const std::string next = value ? value : "";
+                if (next == row.option_value) {
+                    return true;
+                }
+                if (!source->set_program_option(row.option_scope, row.option_key, next)) {
+                    report_write_error(source, "UPDATE program_options failed for '" + row.option_key + "'");
+                    return false;
+                }
+                row.option_value = next;
+                return true;
+            })
         .column_text("value_type", [](const model::ProgramOptionRow& r) { return r.value_type; })
         .column_text("option_scope", [](const model::ProgramOptionRow& r) { return r.option_scope; })
+        .column_text("description", [](const model::ProgramOptionRow& r) { return r.description; })
+        .column_text("default_value", [](const model::ProgramOptionRow& r) { return r.default_value; })
+        .column_int("settable", [](const model::ProgramOptionRow& r) { return r.settable; })
+        .column_text_nullable("allowed_values", [](const model::ProgramOptionRow& r) {
+            return json_string_array_or_null(r.allowed_values);
+        })
         .build();
 }
 
+// Background auto-analysis jobs of the current program, oldest first. INSERT starts
+// one and returns at once -- analysis of a large program runs for minutes, far past
+// any query timeout -- and the job then owns the program: other queries fail with
+// analysis_running until it finishes. Poll this table (it stays readable) and
+// DELETE the running row to cancel. mode is 'changed' (default: what is new or
+// changed, or everything if the program was never analyzed) or 'all'.
 inline xsql::CachedTableDef<model::AnalysisPassRow> define_analysis_passes(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::AnalysisPassRow>("analysis_passes")
         .no_shared_cache()
-        .estimate_rows([]() { return size_t(10); })
+        .estimate_rows([]() { return size_t(4); })
         .cache_builder([source](std::vector<model::AnalysisPassRow>& out) {
-            out = derive_analysis_pass_rows(source);
+            out.clear();
+            if (!source->read_analysis_passes(out)) {
+                report_read_error_if_any(source, "analysis_passes: failed to read analysis jobs");
+            }
         })
         .column_int64("pass_id", [](const model::AnalysisPassRow& r) { return r.pass_id; })
-        .column_text("pass_name", [](const model::AnalysisPassRow& r) { return r.pass_name; })
-        .column_text("status", [](const model::AnalysisPassRow& r) { return r.status; })
-        .column_int64("started_unix", [](const model::AnalysisPassRow& r) { return r.started_unix; })
-        .column_int64("ended_unix", [](const model::AnalysisPassRow& r) { return r.ended_unix; })
-        .column_text("notes", [](const model::AnalysisPassRow& r) { return r.notes; })
-        .index_on("pass_id", [](const model::AnalysisPassRow& r) { return r.pass_id; })
+        .column_text("mode", [](const model::AnalysisPassRow& r) { return r.mode; })
+        .column_text("state", [](const model::AnalysisPassRow& r) { return r.state; })
+        .column_int64("started_unix_ms", [](const model::AnalysisPassRow& r) { return r.started_unix_ms; })
+        // 0 while the pass is still running.
+        .column_int64("ended_unix_ms", [](const model::AnalysisPassRow& r) { return r.ended_unix_ms; })
+        .column_int64("elapsed_ms", [](const model::AnalysisPassRow& r) { return r.elapsed_ms; })
+        .column_text("message", [](const model::AnalysisPassRow& r) { return r.message; })
+        // INSERT: argv is in column order (0 pass_id, 1 mode, 2 state, ...); only
+        // mode may be given.
+        .insertable([source](int argc, xsql::FunctionArg* argv) {
+            for (int i = 0; i < argc; ++i) {
+                if (i != 1 && !argv[i].is_null()) {
+                    xsql::set_vtab_error(
+                        "INSERT INTO analysis_passes takes only mode ('changed' or 'all')");
+                    return false;
+                }
+            }
+            const std::string mode = (argc > 1 && !argv[1].is_null()) ? argv[1].as_text() : std::string{};
+            model::AnalysisPassRow started;
+            if (!source->start_analysis(mode, started)) {
+                report_write_error(source, "INSERT INTO analysis_passes failed");
+                return false;
+            }
+            return true;
+        })
+        .deletable([source](model::AnalysisPassRow& row) {
+            if (row.state != "running") {
+                xsql::set_vtab_error("analysis_passes: pass " + std::to_string(row.pass_id) +
+                                     " is " + row.state + "; only a running pass can be deleted (cancelled)");
+                return false;
+            }
+            if (!source->cancel_analysis(row.pass_id)) {
+                report_write_error(source, "DELETE FROM analysis_passes failed for pass " +
+                                               std::to_string(row.pass_id));
+                return false;
+            }
+            return true;
+        })
         .build();
 }
 
+// The program's transaction history: undo stack (tx_position 1 = most recent),
+// redo stack (1 = next to redo), and the transaction in progress (tx_kind 'open',
+// tx_position 0) with its open sub-transactions. Ghidra records names only; it
+// exposes no per-entry revision.
 inline xsql::CachedTableDef<model::TransactionRow> define_transactions(const std::shared_ptr<Source>& source) {
     return xsql::cached_table<model::TransactionRow>("transactions")
         .no_shared_cache()
-        .estimate_rows([]() { return size_t(10); })
+        .estimate_rows([]() { return size_t(16); })
         .cache_builder([source](std::vector<model::TransactionRow>& out) {
-            out = derive_transaction_rows(source);
+            out.clear();
+            if (!source->read_transactions(out)) {
+                report_read_error_if_any(source, "transactions: failed to read transaction history");
+            }
         })
-        .column_int64("tx_id", [](const model::TransactionRow& r) { return r.tx_id; })
+        .column_int64("tx_position", [](const model::TransactionRow& r) { return r.tx_position; })
         .column_text("tx_name", [](const model::TransactionRow& r) { return r.tx_name; })
         .column_text("tx_kind", [](const model::TransactionRow& r) { return r.tx_kind; })
-        .column_int64("start_revision", [](const model::TransactionRow& r) { return r.start_revision; })
-        .column_int64("end_revision", [](const model::TransactionRow& r) { return r.end_revision; })
-        .column_int("committed", [](const model::TransactionRow& r) { return r.committed; })
-        .index_on("tx_id", [](const model::TransactionRow& r) { return r.tx_id; })
+        .column_text_nullable("open_subtransactions", [](const model::TransactionRow& r) {
+            return json_string_array_or_null(r.open_subtransactions);
+        })
         .build();
 }
 
@@ -4455,6 +4549,16 @@ inline xsql::CachedTableDef<model::CapabilityRow> define_sql_capabilities(const 
                        "WHERE pattern = '<FlexHex>' or byte_search('<FlexHex>'); "
                        "client-side over read_bytes, no Java leg)";
             out.push_back(std::move(bs));
+            // Analysis control: real program options (UPDATE the 'Analyzers' rows)
+            // and background analysis jobs (INSERT/DELETE analysis_passes).
+            model::CapabilityRow ac;
+            ac.area = "ghidrasql";
+            ac.feature = "feature.analysis_control";
+            ac.state = "available";
+            ac.notes = "UPDATE program_options.option_value (option_scope='Analyzers'); "
+                       "INSERT INTO analysis_passes(mode) starts a background job, "
+                       "DELETE of the running row cancels it";
+            out.push_back(std::move(ac));
             // Cross-tool low-IR: ghidrasql's leg is the P-code anchor
             // (pcode_ops.op is already the canonical vocabulary). ir_ops is the
             // canonical projection + the ir_v_* semantic views.

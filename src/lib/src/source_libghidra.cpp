@@ -1377,6 +1377,72 @@ public:
         return true;
     }
 
+    bool read_program_options(std::vector<model::ProgramOptionRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        auto listed = client_.ListProgramOptions(std::string{}, std::string{});
+        if (!ok_or_record_error_locked(listed, "ListProgramOptions")) return false;
+        out.reserve(listed.value->options.size());
+        for (const auto& rec : listed.value->options) {
+            model::ProgramOptionRow row;
+            row.option_key = rec.name;
+            row.option_value = rec.value;
+            row.value_type = rec.type;
+            row.option_scope = rec.category;
+            row.description = rec.description;
+            row.default_value = rec.default_value;
+            row.settable = rec.settable ? 1 : 0;
+            row.allowed_values = rec.allowed_values;
+            out.push_back(std::move(row));
+        }
+        return true;
+    }
+
+    static model::AnalysisPassRow to_analysis_pass_row(
+        const libghidra::client::AnalysisJobRecord& job) {
+        model::AnalysisPassRow row;
+        row.pass_id = static_cast<std::int64_t>(job.job_id);
+        row.mode = job.mode;
+        row.state = job.state;
+        row.started_unix_ms = job.started_unix_ms;
+        row.ended_unix_ms = job.ended_unix_ms;
+        row.elapsed_ms = static_cast<std::int64_t>(job.elapsed_ms);
+        row.message = job.message;
+        return row;
+    }
+
+    bool read_analysis_passes(std::vector<model::AnalysisPassRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        auto listed = client_.ListAnalysisJobs();
+        if (!ok_or_record_error_locked(listed, "ListAnalysisJobs")) return false;
+        out.reserve(listed.value->jobs.size());
+        for (const auto& job : listed.value->jobs) {
+            out.push_back(to_analysis_pass_row(job));
+        }
+        return true;
+    }
+
+    bool read_transactions(std::vector<model::TransactionRow>& out) const override {
+        out.clear();
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) return false;
+        auto listed = client_.ListTransactions();
+        if (!ok_or_record_error_locked(listed, "ListTransactions")) return false;
+        out.reserve(listed.value->transactions.size());
+        for (const auto& rec : listed.value->transactions) {
+            model::TransactionRow row;
+            row.tx_position = static_cast<std::int64_t>(rec.position);
+            row.tx_name = rec.name;
+            row.tx_kind = rec.kind;
+            row.open_subtransactions = rec.open_subtransactions;
+            out.push_back(std::move(row));
+        }
+        return true;
+    }
+
     bool read_signatures(std::vector<model::SignatureRow>& out) const override {
         out.clear();
         std::lock_guard<std::mutex> lock(mu_);
@@ -3136,6 +3202,55 @@ public:
         return true;
     }
 
+    // -- Program options and analysis jobs ------------------------------------
+
+    bool set_program_option(const std::string& scope, const std::string& key,
+                            const std::string& value) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto applied = client_.SetProgramOption(scope, key, value);
+        if (!ok_or_record_error_locked(applied, "SetProgramOption")) {
+            return false;
+        }
+        if (!applied.value->applied) {
+            last_error_ = "option not applied: '" + key + "'";
+            return false;
+        }
+        return true;
+    }
+
+    bool start_analysis(const std::string& mode, model::AnalysisPassRow& out) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto started = client_.StartAnalysis(mode);
+        if (!ok_or_record_error_locked(started, "StartAnalysis")) {
+            return false;
+        }
+        out = to_analysis_pass_row(started.value->job);
+        last_error_.clear();
+        return true;
+    }
+
+    bool cancel_analysis(std::int64_t pass_id) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ensure_session_open_locked()) {
+            return false;
+        }
+        auto cancelled = client_.CancelAnalysis(static_cast<std::uint64_t>(pass_id));
+        if (!ok_or_record_error_locked(cancelled, "CancelAnalysis")) {
+            return false;
+        }
+        if (!cancelled.value->cancelled) {
+            last_error_ = "analysis pass " + std::to_string(pass_id) + " is not running";
+            return false;
+        }
+        return true;
+    }
+
     // -- Function tags --------------------------------------------------------
 
     bool create_function_tag(
@@ -3735,7 +3850,6 @@ private:
             req.project_path = options_.project_path;
             req.project_name = options_.project_name;
             req.program_path = options_.program_path;
-            req.analyze = options_.analyze;
             req.read_only = options_.read_only;
         }
         auto opened = client_.OpenProgram(req);

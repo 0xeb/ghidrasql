@@ -2301,36 +2301,6 @@ std::vector<model::TailCallRow> derive_tail_call_rows(const std::shared_ptr<Sour
     return out;
 }
 
-std::vector<model::ProgramOptionRow> derive_program_option_rows(const std::shared_ptr<Source>& source) {
-    model::ProgramInfoRow info;
-    source->read_program_info(info);
-
-    std::vector<model::SegmentRow> segments;
-    source->read_segments(segments);
-    std::int64_t image_base = info.image_base;
-    if (image_base == 0 && !segments.empty()) {
-        image_base = segments.front().start_ea;
-    }
-
-    std::vector<model::ProgramOptionRow> out;
-    out.push_back({"analysis.headless", (info.is_headless != 0) ? "true" : "false", "bool", "analysis"});
-    out.push_back({"analysis.language_id", info.language_id, "text", "analysis"});
-    out.push_back({"analysis.compiler_spec", info.compiler_spec, "text", "analysis"});
-    out.push_back({"analysis.image_base", std::to_string(image_base), "int64", "analysis"});
-    return out;
-}
-
-std::vector<model::AnalysisPassRow> derive_analysis_pass_rows(const std::shared_ptr<Source>& source) {
-    (void)source;
-    return {};
-}
-
-std::vector<model::TransactionRow> derive_transaction_rows(const std::shared_ptr<Source>& source) {
-    model::ProgramInfoRow info;
-    (void)info;
-    return {};
-}
-
 std::vector<model::ProjectPropertyRow> derive_project_property_rows(const std::shared_ptr<Source>& source) {
     model::ProgramInfoRow info;
     if (!source->read_program_info(info)) {

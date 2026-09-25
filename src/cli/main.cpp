@@ -145,6 +145,9 @@ struct Args {
     bool analyze = true;        // default: analyze in headless
     bool analyze_explicit = false;
     bool load_libraries = false; // default: imports skip external system libraries
+    // Analyzer toggles forced off/on for every --binary import, before analysis runs.
+    std::vector<std::string> analyzers_off;
+    std::vector<std::string> analyzers_on;
     bool readonly = false;
     bool fresh = false;
 
@@ -274,6 +277,15 @@ void print_help() {
         << "  --project-name <name>      Project name\n"
         << "  --analyze                  Run analysis (default in headless)\n"
         << "  --no-analyze               Skip analysis\n"
+        << "                             With --program (no --binary) or --url, an explicit\n"
+        << "                             --analyze re-runs full analysis before serving.\n"
+        << "  --analyzers-off <pats>     Disable analyzers for --binary imports, before\n"
+        << "                             analysis runs. Comma-separated, case-insensitive;\n"
+        << "                             '*' makes a glob, otherwise a substring match\n"
+        << "                             (e.g. --analyzers-off 'Objective-C,Shared Return').\n"
+        << "  --analyzers-on <pats>      Enable analyzers for --binary imports (applied\n"
+        << "                             after --analyzers-off). Existing programs are tuned\n"
+        << "                             with UPDATE program_options instead.\n"
         << "  --load-libraries           Load/link external system libraries during --binary\n"
         << "                             import (ordinal->name resolution). Off by default;\n"
         << "                             slower, and pulls kernel32/CRT into the project.\n"
@@ -520,6 +532,15 @@ bool parse_args(int argc, char** argv, Args& args) {
         } else if (arg == "--no-analyze") {
             args.analyze = false;
             args.analyze_explicit = true;
+        } else if (arg == "--analyzers-off" || arg == "--analyzers-on") {
+            if (i + 1 >= argc) {
+                std::cerr << arg << " requires a comma-separated pattern list\n";
+                return false;
+            }
+            auto& target = arg == "--analyzers-off" ? args.analyzers_off : args.analyzers_on;
+            for (auto& pattern : ghidrasql::cli::split_pattern_list(argv[++i])) {
+                target.push_back(std::move(pattern));
+            }
         } else if (arg == "--load-libraries") {
             args.load_libraries = true;
         } else if (arg == "--readonly") {
@@ -685,6 +706,12 @@ bool validate_headless_args(Args& args) {
     }
     if (args.readonly && !args.binary_paths.empty()) {
         std::cerr << "--readonly cannot be combined with --binary imports\n";
+        ok = false;
+    }
+    if ((!args.analyzers_off.empty() || !args.analyzers_on.empty()) && args.binary_paths.empty()) {
+        std::cerr << "--analyzers-off/--analyzers-on apply to --binary imports; for an existing "
+                     "program use UPDATE program_options SET option_value = ... WHERE "
+                     "option_scope = 'Analyzers', then INSERT INTO analysis_passes(mode)\n";
         ok = false;
     }
     // --port / --rpc-port / --max-runtime ranges are enforced at parse time
@@ -1059,6 +1086,69 @@ libghidra::client::ShutdownPolicy shutdown_policy_from_string(const std::string&
     throw std::invalid_argument("invalid shutdown policy: " + raw);
 }
 
+// Echo what each --analyzers-off/--analyzers-on pattern matched. An unmatched
+// pattern is a warning, not a failure: analyzer names differ across Ghidra versions
+// and processors, and a stale name in a saved command line should not abort.
+void report_analyzer_matches(
+    const std::string& binary_path,
+    const std::vector<libghidra::client::AnalyzerPatternMatch>& matches)
+{
+    for (const auto& match : matches) {
+        if (match.options.empty()) {
+            std::cerr << "warning: no analyzer matched '" << match.pattern << "' in "
+                      << binary_path << "\n";
+            continue;
+        }
+        for (const auto& option : match.options) {
+            std::cerr << "analyzer " << (match.enabled ? "on" : "off") << ": " << option << "\n";
+        }
+    }
+}
+
+// An explicit --analyze without a --binary import means "re-analyze the program I
+// am opening": the import path analyzes by itself.
+bool reanalyze_requested(const Args& args) {
+    return args.analyze && args.analyze_explicit && args.binary_paths.empty();
+}
+
+// Run a full analysis job through the SQL surface and wait for it. Analysis is a
+// background job on the host (it can run for minutes, far past any query timeout),
+// so this polls analysis_passes -- which stays readable while the job owns the
+// program -- and cancels the job on Ctrl-C.
+bool run_full_analysis_and_wait(ghidrasql::QueryEngine& engine) {
+    auto started = engine.query("INSERT INTO analysis_passes(mode) VALUES ('all')");
+    if (!started.success) {
+        std::cerr << "analysis did not start: " << started.error << "\n";
+        return false;
+    }
+    std::cerr << "re-analyzing the program (--analyze)...\n";
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (g_stop.load()) {
+            engine.query("DELETE FROM analysis_passes WHERE state = 'running'");
+            std::cerr << "analysis cancelled\n";
+            return false;
+        }
+        auto status = engine.query(
+            "SELECT state, elapsed_ms, message FROM analysis_passes ORDER BY pass_id DESC LIMIT 1");
+        if (!status.success || status.rows.empty()) {
+            std::cerr << "cannot read analysis progress: " << status.error << "\n";
+            return false;
+        }
+        const std::string state = status.rows[0][0];
+        if (state == "running") {
+            continue;
+        }
+        if (state == "done") {
+            std::cerr << "analysis done in " << status.rows[0][1] << " ms\n";
+            engine.refresh();
+            return true;
+        }
+        std::cerr << "analysis " << state << ": " << status.rows[0][2] << "\n";
+        return false;
+    }
+}
+
 bool import_programs_and_open_active(
     libghidra::client::HeadlessClient& headless,
     const Args& args,
@@ -1070,6 +1160,8 @@ bool import_programs_and_open_active(
         req.source_path = binary_path;
         req.overwrite = true;
         req.analyze = args.analyze;
+        req.analyzers_off = args.analyzers_off;
+        req.analyzers_on = args.analyzers_on;
         // Off by default (LibGhidraHost skips external libraries); --load-libraries
         // re-enables the loader's ordinal lookup / library load+link. The arg set
         // is shared with the HTTP /project/import handler via import_loader_args.
@@ -1088,6 +1180,7 @@ bool import_programs_and_open_active(
         if (session.active_program_path.empty()) {
             session.active_program_path = imported.value->primary_program_path;
         }
+        report_analyzer_matches(binary_path, imported.value->analyzer_matches);
     }
 
     const std::string selected_program = selected_program_arg(args);
@@ -1103,11 +1196,6 @@ bool import_programs_and_open_active(
     open_req.project_path = args.project;
     open_req.project_name = args.project_name;
     open_req.program_path = session.active_program_path;
-    // Honor the headless --analyze default (true) when opening an existing
-    // program too; without this an existing --program reopen always behaved as
-    // analyze=false, ignoring the documented default and forcing users to do
-    // nothing for fast reopens (only --no-analyze should skip analysis).
-    open_req.analyze = args.analyze;
     open_req.read_only = args.readonly;
     auto opened = headless->OpenProgram(open_req);
     if (!opened.ok()) {
@@ -1176,6 +1264,10 @@ int run_headless_live_query_local(const Args& args) {
 
     int exit_code = 0;
     ghidrasql::QueryEngine engine(source);
+    if (reanalyze_requested(args) && !run_full_analysis_and_wait(engine)) {
+        headless->close(shutdown_policy_from_string(args.shutdown));
+        return 1;
+    }
     if (args.list_project_programs) {
         exit_code = print_project_programs(engine, args.format);
     } else if (!args.query.empty()) {
@@ -1280,6 +1372,10 @@ int run_headless_live_server(const Args& args) {
     }
 
     ghidrasql::QueryEngine engine(source);
+    if (reanalyze_requested(args) && !run_full_analysis_and_wait(engine)) {
+        headless->close(shutdown_policy_from_string(args.shutdown));
+        return 1;
+    }
     // Declared before `http` so it outlives the server whose worker threads use
     // it: HTTP worker lambdas (and the MCP callback) capture &session_mu, and
     // ~HttpServer::stop() joins those workers. Reverse-order destruction would
@@ -1347,6 +1443,8 @@ int run_headless_live_server(const Args& args) {
         req.source_path = source_path;
         req.overwrite = bool_from_json(body, "overwrite", true);
         req.analyze = bool_from_json(body, "analyze", args.analyze);
+        req.analyzers_off = ghidrasql::cli::patterns_from_json(body, "analyzers_off", args.analyzers_off);
+        req.analyzers_on = ghidrasql::cli::patterns_from_json(body, "analyzers_on", args.analyzers_on);
         // External system libraries are skipped by default; a "load_libraries":true
         // body field (or the --load-libraries CLI default) re-enables them. The
         // arg set is shared with the headless startup import via import_loader_args.
@@ -1380,10 +1478,19 @@ int run_headless_live_server(const Args& args) {
             session.active_program_path = imported.value->primary_program_path;
         }
         engine.refresh();
+        xsql::json analyzer_matches = xsql::json::array();
+        for (const auto& match : imported.value->analyzer_matches) {
+            analyzer_matches.push_back({
+                {"pattern", match.pattern},
+                {"enabled", match.enabled},
+                {"options", match.options},
+            });
+        }
         return xsql::json{
             {"success", true},
             {"program_paths", imported.value->program_paths},
             {"primary_program_path", imported.value->primary_program_path},
+            {"analyzer_matches", analyzer_matches},
         }.dump();
     };
 
@@ -1741,13 +1848,6 @@ int main(int argc, char** argv) {
     opts.project_path = args.project;
     opts.project_name = args.project_name;
     opts.program_path = selected_program;
-    // Connect mode attaches to a program that is normally already open and
-    // analyzed in the host, so — unlike headless, which default-analyzes
-    // (args.analyze defaults to true) — it re-runs analysis on auto-open ONLY
-    // when the user asked for it explicitly (`--analyze`/`--no-analyze` set
-    // args.analyze_explicit). This intentional asymmetry avoids re-analyzing an
-    // already-analyzed attached program by default.
-    opts.analyze = args.analyze && args.analyze_explicit;
     opts.read_only = args.readonly;
     opts.read_timeout_ms = args.rpc_timeout_ms;
     source = ghidrasql::create_libghidra_live_source(opts);
@@ -1760,6 +1860,12 @@ int main(int argc, char** argv) {
     std::cout << "Using libghidra source at " << args.url << "\n";
 
     ghidrasql::QueryEngine engine(source);
+    // Connect mode attaches to a program that is normally already analyzed, so it
+    // re-analyzes only on an explicit --analyze (the headless default is not
+    // applied here). A GUI-attached host reports NOT_SUPPORTED for this.
+    if (args.analyze && args.analyze_explicit && !run_full_analysis_and_wait(engine)) {
+        return 1;
+    }
     // One shared mutex serializes ALL engine access in connect serve mode. The
     // QueryEngine is not concurrency-safe, so concurrent HTTP requests (httplib
     // worker threads) and the MCP server thread must take the same lock — mirrors

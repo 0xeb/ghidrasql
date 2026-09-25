@@ -243,8 +243,10 @@ SELECT save_database();
 | `--program <name>` | Existing program inside the project — use to reopen what was already imported; for fresh imports use `--binary` |
 | `--project <dir>` | Project directory |
 | `--project-name <name>` | Project name |
-| `--analyze` | Run analysis (default in headless) |
+| `--analyze` | Run analysis (default for `--binary` imports). With `--program` (no `--binary`) or `--url`, an explicit `--analyze` re-runs a full analysis job before serving |
 | `--no-analyze` | Skip analysis |
+| `--analyzers-off <patterns>` | Turn Ghidra analyzers off for every `--binary` import before analysis runs. Comma-separated, case-insensitive; `*` makes a glob, otherwise a substring (e.g. `'Objective-C,Shared Return'`) |
+| `--analyzers-on <patterns>` | Turn analyzers on for every `--binary` import (applied after `--analyzers-off`) |
 | `--load-libraries` | Load/link external system libraries during `--binary` import (ordinal→name resolution). Off by default — slower, and pulls kernel32/CRT into the project |
 | `--readonly` | Read-only session |
 
@@ -287,7 +289,7 @@ changes. `--shutdown none` performs no save or discard action.
 
 ## SQL Surface
 
-66 public tables and 80 views covering every aspect of a Ghidra program database.
+67 public tables and 78 views covering every aspect of a Ghidra program database.
 
 ### Tables
 
@@ -303,7 +305,7 @@ changes. `--shutdown none` performs no save or discard action.
 | **Comments** | `comments` |
 | **Data** | `data_items`, `relocations` |
 | **Search** | `text_index`, `search_index` |
-| **Program** | `program_options`, `analysis_passes`, `transactions`, `project_properties`, `breakpoints` |
+| **Program** | `program_options` (writable), `analysis_passes` (INSERT starts analysis), `transactions`, `project_properties`, `breakpoints` |
 | **Meta** | `sql_capabilities`, `parity_findings`, `perf_benchmarks`, `live_meta`, `binary` |
 
 ### Selected Views
@@ -318,6 +320,32 @@ changes. `--shutdown none` performs no save or discard action.
 | **Decompiler** | `decompiler_listing`, `ctree`, `ctree_v_calls`, `ctree_v_loops`, `ctree_v_ifs`, `ir_ops`, `ir_operands`, `ir_maturities`, `ir_v_*` |
 
 Use `.tables` in the REPL to see the full list, or `SELECT name FROM sqlite_master ORDER BY name`.
+
+### Analysis Control
+
+Ghidra's analyzer set is program data. `program_options` lists the program's real
+options (every category); the `option_scope = 'Analyzers'` rows are writable, typed
+by Ghidra, persisted by `save_database()` and reverted by `discard_changes()`.
+`analysis_passes` runs analysis as a background job, and `transactions` shows the
+undo history.
+
+```sql
+-- analyzers that can be switched
+SELECT option_key, option_value FROM program_options
+ WHERE option_scope = 'Analyzers' AND value_type = 'boolean' AND settable = 1;
+
+-- turn off what does not apply to this target, then re-run analysis
+UPDATE program_options SET option_value = 'false'
+ WHERE option_scope = 'Analyzers' AND option_key LIKE 'Objective-C%';
+INSERT INTO analysis_passes(mode) VALUES ('all');       -- returns at once
+SELECT state, elapsed_ms FROM analysis_passes ORDER BY pass_id DESC LIMIT 1;
+SELECT save_database();
+```
+
+A running job owns the program: until it finishes, other queries fail with
+`analysis_running` (`analysis_passes` stays readable for polling), and
+`DELETE FROM analysis_passes WHERE state = 'running'` cancels it. For a fresh
+import, choose the analyzers up front with `--analyzers-off` / `--analyzers-on`.
 
 ### Write Operations
 

@@ -142,9 +142,6 @@ bool derive_pcode_varnode_rows_for(
 std::vector<model::RegisterVarRow> derive_register_var_rows(const std::shared_ptr<Source>& source);
 std::vector<model::FunctionChunkRow> derive_function_chunk_rows(const std::shared_ptr<Source>& source);
 std::vector<model::TailCallRow> derive_tail_call_rows(const std::shared_ptr<Source>& source);
-std::vector<model::ProgramOptionRow> derive_program_option_rows(const std::shared_ptr<Source>& source);
-std::vector<model::AnalysisPassRow> derive_analysis_pass_rows(const std::shared_ptr<Source>& source);
-std::vector<model::TransactionRow> derive_transaction_rows(const std::shared_ptr<Source>& source);
 std::vector<model::ProjectPropertyRow> derive_project_property_rows(const std::shared_ptr<Source>& source);
 bool try_parse_int64_token(const std::string& token, std::int64_t& out);
 bool extract_first_numeric_literal(const std::string& text, std::int64_t& out);
