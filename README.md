@@ -71,9 +71,9 @@ If you would rather drive the build yourself, see **Get Running** below.
 
 ## Get Running
 
-### Alpha Quickstart
+### Quickstart
 
-For the current alpha, the most reliable path is:
+The most reliable path is:
 
 1. Install `LibGhidraHost` from `libghidra/ghidra-extension`.
 2. Start a live `libghidra` host from Ghidra GUI or headless.
