@@ -95,11 +95,10 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
     message(STATUS "ghidrasql: Added libxsql from ghidrasql/external/libxsql")
 else()
     message(STATUS "ghidrasql: Fetching libxsql from GitHub (shallow clone)...")
-    # libxsql is a first-party dep we own — track main so ghidrasql builds
-    # against the latest (only third-party deps like cpp-httplib are pinned).
+    # Pinned to the libxsql release this ghidrasql was built and tested against.
     FetchContent_Declare(libxsql
         GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        main
+        GIT_TAG        v1.0.20
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libxsql)
