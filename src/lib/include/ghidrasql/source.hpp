@@ -813,7 +813,8 @@ struct SourceCallbacks {
     std::function<bool(std::vector<model::TransactionRow>&)> read_transactions;
     std::function<bool(std::vector<model::LiveMetaRow>&)> read_live_meta;
     std::function<bool(std::int64_t, const std::string&)> rename_function;
-    std::function<bool(std::int64_t, const std::string&)> rename_symbol;
+    // (address, old_name, new_name): renames exactly the symbol named old_name.
+    std::function<bool(std::int64_t, const std::string&, const std::string&)> rename_symbol;
     std::function<bool(std::int64_t, const std::string&)> delete_symbol;
     std::function<bool(std::int64_t, const std::string&)> rename_data_item;
     std::function<bool(std::int64_t, const std::string&)> set_data_item_type;
@@ -918,9 +919,37 @@ std::int64_t instruction_byte_span(const model::InstructionRow& row);
 std::int64_t string_byte_span(const model::StringRow& row);
 std::int64_t data_item_byte_span(const model::DataItemRow& row);
 
+// Addresses are unsigned 64-bit values carried in int64 (bit-cast), and SQL
+// orders them signed: an address at or above 2^63 is a negative INTEGER and
+// sorts before every address below it. Memory is contiguous in unsigned terms,
+// so a run of addresses that holds both 2^63 - 1 and 2^63 (a block or function
+// straddling the seam) is TWO runs in SQL order: [INT64_MIN, last] first, then
+// [start, INT64_MAX].
+struct AddressRun {
+    std::int64_t first = 0;  // inclusive; first <= last as signed values
+    std::int64_t last = 0;
+};
+
+// The unsigned run [start, start + size - 1] as 1-2 AddressRuns in ascending
+// SQL order; returns how many were written to `out` (0 when size is 0). A run
+// that would pass 0xFFFFFFFFFFFFFFFF ends there.
+std::size_t address_runs(std::int64_t start, std::uint64_t size, AddressRun out[2]);
+
+// Bytes in [start, end_excl) where the exclusive end is taken modulo 2^64, the
+// way block and function ends are reported: a block through
+// 0xFFFFFFFFFFFFFFFF ends at 2^64, which is 0. Returns 0 when end_excl equals
+// start or lies below it in unsigned terms.
+std::uint64_t address_span_size(std::int64_t start, std::int64_t end_excl);
+
+// Bytes a function body spans from its entry (>= 1): end_ea - address when the
+// end lies above the entry in unsigned terms (a body ending at 2^64 has
+// end_ea 0), else max(size, 1) for sources that report no end.
+std::uint64_t function_extent(const model::FunctionRow& fn);
+
 // True when the `span` bytes starting at `item_start` intersect the INCLUSIVE
-// signed-int64 address window [start_address, end_address]. The item's end is
-// clamped on signed overflow (an absurd span never wraps past INT64_MAX).
+// signed-int64 address window [start_address, end_address]. The item's bytes
+// are taken in unsigned terms (see address_runs), so an item straddling 2^63
+// intersects windows on both sides of the seam.
 bool byte_span_intersects_range(
     std::int64_t item_start,
     std::int64_t span,
@@ -1112,7 +1141,9 @@ public:
 
     // Optional write callbacks.
     virtual bool rename_function(std::int64_t address, const std::string& new_name);
-    virtual bool rename_symbol(std::int64_t address, const std::string& new_name);
+    // Renames exactly the symbol `old_name` at `address` (primary or not).
+    virtual bool rename_symbol(
+        std::int64_t address, const std::string& old_name, const std::string& new_name);
     virtual bool delete_symbol(std::int64_t address, const std::string& name);
     virtual bool rename_data_item(std::int64_t address, const std::string& new_name);
     virtual bool set_data_item_type(std::int64_t address, const std::string& new_type);

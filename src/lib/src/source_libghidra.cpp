@@ -157,7 +157,7 @@ public:
         // Do not use offset pagination here. The Java host implements an offset
         // by reopening the function iterator at the program minimum and skipping
         // `offset` rows. For N rows that makes a full read O(N^2/page_size), which
-        // is very visible on 20k-function firmware images. Advance the address
+        // is costly on large programs. Advance the address
         // range instead, so every function is traversed once.
         constexpr int page_size = 2048;
         std::uint64_t range_start = kAllAddressesMin;
@@ -458,17 +458,17 @@ public:
         if (end_address < start_address) return true;
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        for (const auto& win : rpc_windows(start_address, end_address)) {
-            const auto signed_start = to_i64(win.first);
-            const auto signed_end = to_i64(win.second);
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
+            const auto signed_start = to_i64(span.lo);
+            const auto signed_end = to_i64(span.hi);
             // The host lists strings by START address, so widen the low RPC
             // bound so a string that begins just below the window but covers
             // into it is still listed (kItemLowSlackBytes documents the
             // heuristic bound); the span-intersection filter clamps the result.
-            const std::uint64_t lo = widen_low(win.first, kItemLowSlackBytes);
+            const std::uint64_t lo = widen_low(span.lo, kItemLowSlackBytes);
             std::vector<model::StringRow> page;
             const bool ok = paginate_locked(2048, page, [&](int ps, int off, auto& dest, std::size_t& count) {
-                auto listed = client_.ListDefinedStrings(lo, win.second, ps, off);
+                auto listed = client_.ListDefinedStrings(lo, span.hi, ps, off);
                 if (!ok_or_record_error_locked(listed, "ListDefinedStrings")) return false;
                 const auto& rows = listed.value->strings;
                 count = rows.size();
@@ -540,9 +540,9 @@ public:
                 [](std::int64_t addr, const model::FunctionRow& fn) { return addr < fn.address; });
             if (it != functions.begin()) {
                 --it;
-                const std::int64_t fn_end = it->end_ea > it->address
-                    ? it->end_ea : (it->address + std::max<std::int64_t>(it->size, 1));
-                if (ea >= it->address && ea < fn_end) {
+                // Unsigned offset from the entry: exact for a body straddling 2^63.
+                if (static_cast<std::uint64_t>(ea) - static_cast<std::uint64_t>(it->address) <
+                    function_extent(*it)) {
                     return it->address;
                 }
             }
@@ -1139,13 +1139,13 @@ public:
         out.clear();
         if (end_address < start_address) return true;
         std::lock_guard<std::mutex> lock(mu_);
-        // Split a window crossing the sign seam (start < 0 <= end, e.g. an
-        // unconstrained `addr <= X`) into the upper- and lower-half unsigned
-        // ranges the host RPCs expect; a bare cast would yield lo > hi and
-        // silently return nothing (see rpc_windows).
-        for (const auto& win : rpc_windows(start_address, end_address)) {
+        // A window crossing the sign seam (start < 0 <= end, e.g. an
+        // unconstrained `addr <= X`) is two unsigned spans for the host RPCs; a
+        // bare cast would yield lo > hi and silently return nothing (see
+        // address_window).
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
             std::vector<model::FunctionFrameRow> page;
-            if (!read_stack_frames_range_locked(win.first, win.second, page)) return false;
+            if (!read_stack_frames_range_locked(span.lo, span.hi, page)) return false;
             out.insert(out.end(),
                        std::make_move_iterator(page.begin()),
                        std::make_move_iterator(page.end()));
@@ -1165,11 +1165,11 @@ public:
         out.clear();
         if (end_address < start_address) return true;
         std::lock_guard<std::mutex> lock(mu_);
-        // See read_stack_frames_in_range: route through rpc_windows so a
+        // See read_stack_frames_in_range: route through address_window so a
         // sign-seam-crossing range is not collapsed to an empty lo > hi RPC.
-        for (const auto& win : rpc_windows(start_address, end_address)) {
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
             std::vector<model::StackVarRow> page;
-            if (!read_stack_vars_range_locked(win.first, win.second, page)) return false;
+            if (!read_stack_vars_range_locked(span.lo, span.hi, page)) return false;
             out.insert(out.end(),
                        std::make_move_iterator(page.begin()),
                        std::make_move_iterator(page.end()));
@@ -1239,13 +1239,13 @@ public:
         if (end_address < start_address) return true;
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        for (const auto& win : rpc_windows(start_address, end_address)) {
-            const auto signed_start = to_i64(win.first);
-            const auto signed_end = to_i64(win.second);
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
+            const auto signed_start = to_i64(span.lo);
+            const auto signed_end = to_i64(span.hi);
             // Widen the low RPC bound so an item that starts just below the
             // window but covers into it is still listed (see kItemLowSlackBytes
             // for the heuristic's limits); span-intersection filters the rest.
-            const std::uint64_t lo = widen_low(win.first, kItemLowSlackBytes);
+            const std::uint64_t lo = widen_low(span.lo, kItemLowSlackBytes);
             constexpr int page_size = 2048;
             std::uint64_t range_start = lo;
             for (;;) {
@@ -1254,7 +1254,7 @@ public:
                     return false;
                 }
                 auto listed = client_.ListDataItems(
-                    range_start, win.second, page_size, 0);
+                    range_start, span.hi, page_size, 0);
                 if (!ok_or_record_error_locked(listed, "ListDataItems")) {
                     out.clear();
                     return false;
@@ -1271,7 +1271,7 @@ public:
                 }
                 if (rows.size() < static_cast<std::size_t>(page_size)) break;
                 const std::uint64_t last = rows.back().address;
-                if (last == win.second || last == kAllAddressesMax) break;
+                if (last == span.hi || last == kAllAddressesMax) break;
                 range_start = last + 1;
             }
         }
@@ -1714,7 +1714,10 @@ public:
                            : libghidra::client::PcodeMaturity::High;
         auto got = client_.GetPcode(to_u64(address), req_mat, decompile_timeout_ms());
         if (!ok_or_record_error_locked(got, "GetPcode")) return false;
-        if (!got.value->pcode.has_value()) {
+        // Not found, or the function CONTAINING an interior address: func_addr
+        // is entry-exact, so neither yields rows.
+        if (!got.value->pcode.has_value() ||
+            to_i64(got.value->pcode->function_entry_address) != address) {
             last_error_.clear();
             return true;
         }
@@ -1762,7 +1765,10 @@ public:
                            : libghidra::client::PcodeMaturity::High;
         auto got = client_.GetPcode(to_u64(address), req_mat, decompile_timeout_ms());
         if (!ok_or_record_error_locked(got, "GetPcode")) return false;
-        if (!got.value->pcode.has_value()) {
+        // Not found, or the function CONTAINING an interior address: func_addr
+        // is entry-exact, so neither yields rows.
+        if (!got.value->pcode.has_value() ||
+            to_i64(got.value->pcode->function_entry_address) != address) {
             last_error_.clear();
             return true;
         }
@@ -1870,15 +1876,15 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
         // The host uses an all-zero range as "all addresses", so [0, 0] must
-        // be clamped client-side. rpc_windows also preserves signed SQL address
-        // ordering across the uint64 sign seam.
-        for (const auto& win : rpc_windows(start_address, end_address)) {
+        // be clamped client-side. address_window also preserves signed SQL
+        // address ordering across the uint64 sign seam.
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
             std::vector<model::InstructionOperandRow> page;
             const bool ok = paginate_locked(
                 4096, page,
                 [&](int ps, int off, auto& dest, std::size_t& count) {
                     auto listed = client_.ListInstructionOperands(
-                        win.first, win.second, ps, off);
+                        span.lo, span.hi, ps, off);
                     if (!ok_or_record_error_locked(
                             listed, "ListInstructionOperands")) {
                         return false;
@@ -1888,8 +1894,8 @@ public:
                     dest.reserve(dest.size() + count);
                     for (const auto& row : rows) {
                         const auto row_address = to_i64(row.address);
-                        if (row.address < win.first ||
-                            row.address > win.second ||
+                        if (row.address < span.lo ||
+                            row.address > span.hi ||
                             row_address < start_address ||
                             row_address > end_address) {
                             continue;
@@ -1921,6 +1927,8 @@ public:
         if (!ensure_session_open_locked()) return false;
         auto got = client_.GetInstruction(to_u64(address));
         if (!ok_or_record_error_locked(got, "GetInstruction")) return false;
+        // No instruction starts here (inside one, in data, unmapped): the
+        // record is absent -- libghidra's "not found".
         if (!got.value->instruction.has_value()) {
             last_error_.clear();
             return false;
@@ -1938,14 +1946,14 @@ public:
         if (end_address < start_address) return true;
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) return false;
-        for (const auto& win : rpc_windows(start_address, end_address)) {
-            const auto signed_start = to_i64(win.first);
-            const auto signed_end = to_i64(win.second);
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
+            const auto signed_start = to_i64(span.lo);
+            const auto signed_end = to_i64(span.hi);
             // The host lists instructions by START address; an instruction can
             // begin up to (max ISA length - 1) bytes below the window and still
             // cover into it, so widen the low RPC bound by 16 (x86 max is 15)
             // and let the span-intersection filter clamp the result.
-            const std::uint64_t lo = widen_low(win.first, kInstructionLowSlackBytes);
+            const std::uint64_t lo = widen_low(span.lo, kInstructionLowSlackBytes);
             constexpr int page_size = 4096;
             std::uint64_t range_start = lo;
             for (;;) {
@@ -1954,7 +1962,7 @@ public:
                     return false;
                 }
                 auto listed = client_.ListInstructions(
-                    range_start, win.second, page_size, 0);
+                    range_start, span.hi, page_size, 0);
                 if (!ok_or_record_error_locked(listed, "ListInstructions")) {
                     out.clear();
                     return false;
@@ -1971,7 +1979,7 @@ public:
                 }
                 if (rows.size() < static_cast<std::size_t>(page_size)) break;
                 const std::uint64_t last = rows.back().address;
-                if (last == win.second || last == kAllAddressesMax) break;
+                if (last == span.hi || last == kAllAddressesMax) break;
                 range_start = last + 1;
             }
         }
@@ -2063,9 +2071,9 @@ public:
         // Split a sign-seam-crossing window into upper/lower unsigned ranges so
         // the GetComments RPC is not handed lo > hi (which returns nothing); the
         // per-window post-filter also neutralizes the host's 0/0 "all" sentinel.
-        for (const auto& win : rpc_windows(start_address, end_address)) {
+        for (const auto& span : address_window(start_address, end_address).unsigned_spans()) {
             constexpr int page_size = 4096;
-            std::uint64_t range_start = win.first;
+            std::uint64_t range_start = span.lo;
             int offset_at_start = 0;
             for (;;) {
                 if (xsql::vtab_interrupted()) {
@@ -2073,7 +2081,7 @@ public:
                     return false;
                 }
                 auto listed = client_.GetComments(
-                    range_start, win.second, page_size, offset_at_start);
+                    range_start, span.hi, page_size, offset_at_start);
                 if (!ok_or_record_error_locked(listed, "GetComments")) {
                     out.clear();
                     return false;
@@ -2082,8 +2090,8 @@ public:
                 if (rows.empty()) break;
                 out.reserve(out.size() + rows.size());
                 for (const auto& row : rows) {
-                    if (row.address >= win.first &&
-                        row.address <= win.second) {
+                    if (row.address >= span.lo &&
+                        row.address <= span.hi) {
                         out.push_back(map_comment(row));
                     }
                 }
@@ -2600,22 +2608,19 @@ public:
         }
         trace_rpc_locked("RenameFunction");
         auto renamed = client_.RenameFunction(to_u64(address), new_name);
-        if (!ok_or_record_error_locked(renamed, "RenameFunction") || !renamed.value->renamed) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(renamed, "RenameFunction");
     }
 
-    bool rename_symbol(std::int64_t address, const std::string& new_name) override {
+    bool rename_symbol(
+        std::int64_t address, const std::string& old_name, const std::string& new_name) override {
         std::lock_guard<std::mutex> lock(mu_);
         if (!ensure_session_open_locked()) {
             return false;
         }
-        auto renamed = client_.RenameSymbol(to_u64(address), new_name);
-        if (!ok_or_record_error_locked(renamed, "RenameSymbol") || !renamed.value->renamed) {
-            return false;
-        }
-        return true;
+        // old_name picks exactly one symbol at the address, so a secondary
+        // label is renamed rather than the address's primary symbol.
+        auto renamed = client_.RenameSymbol(to_u64(address), new_name, old_name);
+        return ok_or_record_error_locked(renamed, "RenameSymbol");
     }
 
     bool delete_symbol(std::int64_t address, const std::string& name) override {
@@ -2624,10 +2629,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteSymbol(to_u64(address), name);
-        if (!ok_or_record_error_locked(deleted, "DeleteSymbol") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteSymbol");
     }
 
     bool rename_data_item(std::int64_t address, const std::string& new_name) override {
@@ -2636,10 +2638,7 @@ public:
             return false;
         }
         auto renamed = client_.RenameDataItem(to_u64(address), new_name);
-        if (!ok_or_record_error_locked(renamed, "RenameDataItem") || !renamed.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(renamed, "RenameDataItem");
     }
 
     bool set_data_item_type(std::int64_t address, const std::string& new_type) override {
@@ -2648,10 +2647,7 @@ public:
             return false;
         }
         auto updated = client_.ApplyDataType(to_u64(address), new_type);
-        if (!ok_or_record_error_locked(updated, "ApplyDataType") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "ApplyDataType");
     }
 
     bool delete_data_item(std::int64_t address) override {
@@ -2660,10 +2656,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteDataItem(to_u64(address));
-        if (!ok_or_record_error_locked(deleted, "DeleteDataItem") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteDataItem");
     }
 
     bool create_symbol(std::int64_t address, const std::string& name) override {
@@ -2671,11 +2664,9 @@ public:
         if (!ensure_session_open_locked()) {
             return false;
         }
-        auto renamed = client_.RenameSymbol(to_u64(address), name);
-        if (!ok_or_record_error_locked(renamed, "RenameSymbol") || !renamed.value->renamed) {
-            return false;
-        }
-        return true;
+        // A new label beside whatever the address has; never a rename.
+        auto created = client_.CreateLabel(to_u64(address), name);
+        return ok_or_record_error_locked(created, "CreateLabel");
     }
 
     bool create_data_item(std::int64_t address, const std::string& data_type, const std::string& name) override {
@@ -2684,12 +2675,12 @@ public:
             return false;
         }
         auto applied = client_.ApplyDataType(to_u64(address), data_type);
-        if (!ok_or_record_error_locked(applied, "ApplyDataType") || !applied.value->updated) {
+        if (!ok_or_record_error_locked(applied, "ApplyDataType")) {
             return false;
         }
         if (!name.empty()) {
             auto renamed = client_.RenameDataItem(to_u64(address), name);
-            if (!ok_or_record_error_locked(renamed, "RenameDataItem") || !renamed.value->updated) {
+            if (!ok_or_record_error_locked(renamed, "RenameDataItem")) {
                 return false;
             }
         }
@@ -2702,10 +2693,7 @@ public:
             return false;
         }
         auto written = client_.WriteBytes(to_u64(address), {value});
-        if (!ok_or_record_error_locked(written, "WriteBytes") || written.value->bytes_written == 0) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(written, "WriteBytes");
     }
 
     bool set_comment(std::int64_t address, const std::string& comment, bool repeatable) override {
@@ -2717,10 +2705,7 @@ public:
             to_u64(address),
             repeatable ? libghidra::client::CommentKind::kRepeatable : libghidra::client::CommentKind::kEol,
             comment);
-        if (!ok_or_record_error_locked(set, "SetComment") || !set.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(set, "SetComment");
     }
 
     bool delete_comment(std::int64_t address, bool repeatable) override {
@@ -2731,10 +2716,7 @@ public:
         auto deleted = client_.DeleteComment(
             to_u64(address),
             repeatable ? libghidra::client::CommentKind::kRepeatable : libghidra::client::CommentKind::kEol);
-        if (!ok_or_record_error_locked(deleted, "DeleteComment") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteComment");
     }
 
     bool set_comment_by_kind(std::int64_t address, const std::string& comment, const std::string& kind) override {
@@ -2743,10 +2725,7 @@ public:
             return false;
         }
         auto set = client_.SetComment(to_u64(address), string_to_comment_kind(kind), comment);
-        if (!ok_or_record_error_locked(set, "SetComment") || !set.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(set, "SetComment");
     }
 
     bool delete_comment_by_kind(std::int64_t address, const std::string& kind) override {
@@ -2755,10 +2734,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteComment(to_u64(address), string_to_comment_kind(kind));
-        if (!ok_or_record_error_locked(deleted, "DeleteComment") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteComment");
     }
 
     bool set_function_signature(std::int64_t owner_addr, const std::string& prototype) override {
@@ -2768,16 +2744,7 @@ public:
         }
         trace_rpc_locked("SetFunctionSignature");
         auto updated = client_.SetFunctionSignature(to_u64(owner_addr), prototype);
-        if (!ok_or_record_error_locked(updated, "SetFunctionSignature")) {
-            return false;
-        }
-        if (!updated.value->updated) {
-            if (last_error_.empty()) {
-                last_error_ = "SetFunctionSignature rejected prototype";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetFunctionSignature");
     }
 
     bool create_memory_block(std::int64_t start_address, std::int64_t end_address,
@@ -2786,31 +2753,25 @@ public:
         if (!ensure_session_open_locked()) {
             return false;
         }
-        if (end_address <= start_address) {
-            last_error_ = "create_memory_block: end_address must be > start_address";
+        // end_address is exclusive and modulo 2^64 (0 ends at 0xFFFFFFFFFFFFFFFF).
+        const std::uint64_t size = address_span_size(start_address, end_address);
+        if (size == 0) {
+            last_error_ = "create_memory_block: end_address must be above start_address "
+                          "(unsigned)";
             return false;
         }
         trace_rpc_locked("CreateMemoryBlock");
         libghidra::client::CreateMemoryBlockSpec spec;
         spec.name = name;
         spec.start_address = to_u64(start_address);
-        spec.size = static_cast<std::uint64_t>(end_address - start_address);
+        spec.size = size;
         spec.is_read = (perm & 4) != 0;
         spec.is_write = (perm & 2) != 0;
         spec.is_execute = (perm & 1) != 0;
         spec.initialized = initialized;
         spec.overlay = false;
         auto res = client_.CreateMemoryBlock(spec);
-        if (!ok_or_record_error_locked(res, "CreateMemoryBlock")) {
-            return false;
-        }
-        if (!res.value->created) {
-            if (last_error_.empty()) {
-                last_error_ = "CreateMemoryBlock rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(res, "CreateMemoryBlock");
     }
 
     bool remove_memory_block(std::int64_t address) override {
@@ -2820,16 +2781,7 @@ public:
         }
         trace_rpc_locked("RemoveMemoryBlock");
         auto res = client_.RemoveMemoryBlock(to_u64(address));
-        if (!ok_or_record_error_locked(res, "RemoveMemoryBlock")) {
-            return false;
-        }
-        if (!res.value->removed) {
-            if (last_error_.empty()) {
-                last_error_ = "RemoveMemoryBlock rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(res, "RemoveMemoryBlock");
     }
 
     bool move_memory_block(std::int64_t address, std::int64_t new_start_address) override {
@@ -2839,16 +2791,7 @@ public:
         }
         trace_rpc_locked("MoveMemoryBlock");
         auto res = client_.MoveMemoryBlock(to_u64(address), to_u64(new_start_address));
-        if (!ok_or_record_error_locked(res, "MoveMemoryBlock")) {
-            return false;
-        }
-        if (!res.value->moved) {
-            if (last_error_.empty()) {
-                last_error_ = "MoveMemoryBlock rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(res, "MoveMemoryBlock");
     }
 
     bool set_memory_block_attributes(std::int64_t address, const std::optional<std::string>& name,
@@ -2868,26 +2811,19 @@ public:
             spec.is_execute = (*perm & 1) != 0;
         }
         if (end_address.has_value()) {
-            // ghidrasql models end as EXCLUSIVE; the host speaks Ghidra's INCLUSIVE end.
-            // Guard the empty range rather than wrapping to 0xffff... on the wire.
-            if (*end_address <= address) {
-                last_error_ = "segments.end_addr must be greater than start_addr";
+            // ghidrasql models end as EXCLUSIVE and modulo 2^64 (0 is the end of
+            // the address space); the host speaks Ghidra's INCLUSIVE end. Guard
+            // the empty or backwards range rather than sending a wrapped end.
+            if (address_span_size(address, *end_address) == 0) {
+                last_error_ = "segments.end_addr must be above start_addr (unsigned; an "
+                              "address >= 2^63 is a negative INTEGER)";
                 return false;
             }
-            spec.end_address = to_u64(*end_address - 1);
+            spec.end_address = to_u64(*end_address) - 1;
         }
         trace_rpc_locked("SetMemoryBlockAttributes");
         auto res = client_.SetMemoryBlockAttributes(spec);
-        if (!ok_or_record_error_locked(res, "SetMemoryBlockAttributes")) {
-            return false;
-        }
-        if (!res.value->updated) {
-            if (last_error_.empty()) {
-                last_error_ = "SetMemoryBlockAttributes rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(res, "SetMemoryBlockAttributes");
     }
 
     bool rename_function_param(std::int64_t func_addr, std::int64_t ordinal, const std::string& new_name) override {
@@ -2896,16 +2832,7 @@ public:
             return false;
         }
         auto updated = client_.RenameFunctionParameter(to_u64(func_addr), static_cast<int>(ordinal), new_name);
-        if (!ok_or_record_error_locked(updated, "RenameFunctionParameter")) {
-            return false;
-        }
-        if (!updated.value->updated) {
-            if (last_error_.empty()) {
-                last_error_ = "RenameFunctionParameter rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "RenameFunctionParameter");
     }
 
     bool set_function_param_type(
@@ -2917,16 +2844,7 @@ public:
             return false;
         }
         auto updated = client_.SetFunctionParameterType(to_u64(func_addr), static_cast<int>(ordinal), new_type);
-        if (!ok_or_record_error_locked(updated, "SetFunctionParameterType")) {
-            return false;
-        }
-        if (!updated.value->updated) {
-            if (last_error_.empty()) {
-                last_error_ = "SetFunctionParameterType rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetFunctionParameterType");
     }
 
     bool rename_decomp_local(
@@ -2938,16 +2856,7 @@ public:
             return false;
         }
         auto updated = client_.RenameFunctionLocal(to_u64(func_addr), local_id, new_name);
-        if (!ok_or_record_error_locked(updated, "RenameFunctionLocal")) {
-            return false;
-        }
-        if (!updated.value->updated) {
-            if (last_error_.empty()) {
-                last_error_ = "RenameFunctionLocal rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "RenameFunctionLocal");
     }
 
     bool set_decomp_local_type(
@@ -2959,16 +2868,7 @@ public:
             return false;
         }
         auto updated = client_.SetFunctionLocalType(to_u64(func_addr), local_id, new_type);
-        if (!ok_or_record_error_locked(updated, "SetFunctionLocalType")) {
-            return false;
-        }
-        if (!updated.value->updated) {
-            if (last_error_.empty()) {
-                last_error_ = "SetFunctionLocalType rejected";
-            }
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetFunctionLocalType");
     }
 
     bool add_breakpoint(
@@ -2988,10 +2888,7 @@ public:
             true,
             condition,
             group);
-        if (!ok_or_record_error_locked(added, "AddBreakpoint") || !added.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(added, "AddBreakpoint");
     }
 
     bool set_breakpoint_enabled(std::int64_t address, bool enabled) override {
@@ -3000,10 +2897,7 @@ public:
             return false;
         }
         auto updated = client_.SetBreakpointEnabled(to_u64(address), enabled);
-        if (!ok_or_record_error_locked(updated, "SetBreakpointEnabled") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetBreakpointEnabled");
     }
 
     bool set_breakpoint_type(std::int64_t address, int type) override {
@@ -3012,10 +2906,7 @@ public:
             return false;
         }
         auto updated = client_.SetBreakpointKind(to_u64(address), breakpoint_kind_from_type(type));
-        if (!ok_or_record_error_locked(updated, "SetBreakpointKind") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetBreakpointKind");
     }
 
     bool set_breakpoint_size(std::int64_t address, std::int64_t size) override {
@@ -3024,10 +2915,7 @@ public:
             return false;
         }
         auto updated = client_.SetBreakpointSize(to_u64(address), to_u64(size));
-        if (!ok_or_record_error_locked(updated, "SetBreakpointSize") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetBreakpointSize");
     }
 
     bool set_breakpoint_condition(std::int64_t address, const std::string& condition) override {
@@ -3036,10 +2924,7 @@ public:
             return false;
         }
         auto updated = client_.SetBreakpointCondition(to_u64(address), condition);
-        if (!ok_or_record_error_locked(updated, "SetBreakpointCondition") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetBreakpointCondition");
     }
 
     bool set_breakpoint_group(std::int64_t address, const std::string& group) override {
@@ -3048,10 +2933,7 @@ public:
             return false;
         }
         auto updated = client_.SetBreakpointGroup(to_u64(address), group);
-        if (!ok_or_record_error_locked(updated, "SetBreakpointGroup") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetBreakpointGroup");
     }
 
     bool delete_breakpoint(std::int64_t address) override {
@@ -3060,10 +2942,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteBreakpoint(to_u64(address));
-        if (!ok_or_record_error_locked(deleted, "DeleteBreakpoint") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteBreakpoint");
     }
 
     bool add_bookmark(
@@ -3076,10 +2955,7 @@ public:
             return false;
         }
         auto added = client_.AddBookmark(to_u64(address), type, category, comment);
-        if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(added, "AddBookmark");
     }
 
     bool set_bookmark_type(
@@ -3096,14 +2972,11 @@ public:
             return false;
         }
         auto deleted = client_.DeleteBookmark(to_u64(address), old_type, old_category);
-        if (!ok_or_record_error_locked(deleted, "DeleteBookmark") || !deleted.value->deleted) {
+        if (!ok_or_record_error_locked(deleted, "DeleteBookmark")) {
             return false;
         }
         auto added = client_.AddBookmark(to_u64(address), new_type, old_category, existing.comment);
-        if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(added, "AddBookmark");
     }
 
     bool set_bookmark_category(
@@ -3120,14 +2993,11 @@ public:
             return false;
         }
         auto deleted = client_.DeleteBookmark(to_u64(address), type, old_category);
-        if (!ok_or_record_error_locked(deleted, "DeleteBookmark") || !deleted.value->deleted) {
+        if (!ok_or_record_error_locked(deleted, "DeleteBookmark")) {
             return false;
         }
         auto added = client_.AddBookmark(to_u64(address), type, new_category, existing.comment);
-        if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(added, "AddBookmark");
     }
 
     bool set_bookmark_comment(
@@ -3144,14 +3014,11 @@ public:
             return false;
         }
         auto deleted = client_.DeleteBookmark(to_u64(address), type, category);
-        if (!ok_or_record_error_locked(deleted, "DeleteBookmark") || !deleted.value->deleted) {
+        if (!ok_or_record_error_locked(deleted, "DeleteBookmark")) {
             return false;
         }
         auto added = client_.AddBookmark(to_u64(address), type, category, comment);
-        if (!ok_or_record_error_locked(added, "AddBookmark") || !added.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(added, "AddBookmark");
     }
 
     bool delete_bookmark(
@@ -3163,10 +3030,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteBookmark(to_u64(address), type, category);
-        if (!ok_or_record_error_locked(deleted, "DeleteBookmark") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteBookmark");
     }
 
     // -- Perf benchmarks ------------------------------------------------------
@@ -3177,10 +3041,7 @@ public:
             return false;
         }
         auto added = client_.AddPerfBenchmark(to_perf_record(row));
-        if (!ok_or_record_error_locked(added, "AddPerfBenchmark") || !added.value->added) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(added, "AddPerfBenchmark");
     }
 
     // One host-side transaction per DELETE. The old list/clear/re-add
@@ -3192,14 +3053,7 @@ public:
             return false;
         }
         auto deleted = client_.DeletePerfBenchmark(bench_id);
-        if (!ok_or_record_error_locked(deleted, "DeletePerfBenchmark")) {
-            return false;
-        }
-        if (!deleted.value->deleted) {
-            last_error_ = "perf benchmark not found: '" + bench_id + "'";
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeletePerfBenchmark");
     }
 
     // -- Program options and analysis jobs ------------------------------------
@@ -3211,14 +3065,7 @@ public:
             return false;
         }
         auto applied = client_.SetProgramOption(scope, key, value);
-        if (!ok_or_record_error_locked(applied, "SetProgramOption")) {
-            return false;
-        }
-        if (!applied.value->applied) {
-            last_error_ = "option not applied: '" + key + "'";
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(applied, "SetProgramOption");
     }
 
     bool start_analysis(const std::string& mode, model::AnalysisPassRow& out) override {
@@ -3241,14 +3088,7 @@ public:
             return false;
         }
         auto cancelled = client_.CancelAnalysis(static_cast<std::uint64_t>(pass_id));
-        if (!ok_or_record_error_locked(cancelled, "CancelAnalysis")) {
-            return false;
-        }
-        if (!cancelled.value->cancelled) {
-            last_error_ = "analysis pass " + std::to_string(pass_id) + " is not running";
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(cancelled, "CancelAnalysis");
     }
 
     // -- Function tags --------------------------------------------------------
@@ -3261,10 +3101,7 @@ public:
             return false;
         }
         auto created = client_.CreateFunctionTag(name, comment);
-        if (!ok_or_record_error_locked(created, "CreateFunctionTag") || !created.value->created) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "CreateFunctionTag");
     }
 
     bool delete_function_tag(const std::string& name) override {
@@ -3273,10 +3110,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteFunctionTag(name);
-        if (!ok_or_record_error_locked(deleted, "DeleteFunctionTag") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteFunctionTag");
     }
 
     bool tag_function(
@@ -3287,10 +3121,7 @@ public:
             return false;
         }
         auto tagged = client_.TagFunction(to_u64(func_addr), tag_name);
-        if (!ok_or_record_error_locked(tagged, "TagFunction") || !tagged.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(tagged, "TagFunction");
     }
 
     bool untag_function(
@@ -3301,10 +3132,7 @@ public:
             return false;
         }
         auto untagged = client_.UntagFunction(to_u64(func_addr), tag_name);
-        if (!ok_or_record_error_locked(untagged, "UntagFunction") || !untagged.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(untagged, "UntagFunction");
     }
 
     bool rename_type(const std::string& type_id, const std::string& new_name) override {
@@ -3313,10 +3141,7 @@ public:
             return false;
         }
         auto updated = client_.RenameType(type_id, new_name);
-        if (!ok_or_record_error_locked(updated, "RenameType") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "RenameType");
     }
 
     bool create_type(
@@ -3331,10 +3156,7 @@ public:
         (void)declaration;
         const std::string normalized_kind = kind.empty() ? "struct" : kind;
         auto created = client_.CreateType(name, normalized_kind, to_u64(size));
-        if (!ok_or_record_error_locked(created, "CreateType") || !created.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "CreateType");
     }
 
     bool delete_type(const std::string& type_id) override {
@@ -3343,10 +3165,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteType(type_id);
-        if (!ok_or_record_error_locked(deleted, "DeleteType") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteType");
     }
 
     bool create_type_alias(
@@ -3357,10 +3176,7 @@ public:
             return false;
         }
         auto created = client_.CreateTypeAlias(name, target_type);
-        if (!ok_or_record_error_locked(created, "CreateTypeAlias") || !created.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "CreateTypeAlias");
     }
 
     bool delete_type_alias(const std::string& type_id) override {
@@ -3369,10 +3185,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteTypeAlias(type_id);
-        if (!ok_or_record_error_locked(deleted, "DeleteTypeAlias") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteTypeAlias");
     }
 
     bool set_type_alias_target(
@@ -3383,10 +3196,7 @@ public:
             return false;
         }
         auto updated = client_.SetTypeAliasTarget(type_id, target_type);
-        if (!ok_or_record_error_locked(updated, "SetTypeAliasTarget") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetTypeAliasTarget");
     }
 
     bool create_type_enum(
@@ -3398,10 +3208,7 @@ public:
             return false;
         }
         auto created = client_.CreateTypeEnum(name, to_u64(width), is_signed);
-        if (!ok_or_record_error_locked(created, "CreateTypeEnum") || !created.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "CreateTypeEnum");
     }
 
     bool delete_type_enum(const std::string& type_id) override {
@@ -3410,10 +3217,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteTypeEnum(type_id);
-        if (!ok_or_record_error_locked(deleted, "DeleteTypeEnum") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteTypeEnum");
     }
 
     bool add_type_enum_member(
@@ -3425,10 +3229,7 @@ public:
             return false;
         }
         auto created = client_.AddTypeEnumMember(type_id, name, value);
-        if (!ok_or_record_error_locked(created, "AddTypeEnumMember") || !created.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "AddTypeEnumMember");
     }
 
     bool delete_type_enum_member(
@@ -3439,10 +3240,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteTypeEnumMember(type_id, to_u64(ordinal));
-        if (!ok_or_record_error_locked(deleted, "DeleteTypeEnumMember") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteTypeEnumMember");
     }
 
     bool rename_type_member(
@@ -3454,10 +3252,7 @@ public:
             return false;
         }
         auto updated = client_.RenameTypeMember(parent_type_id, to_u64(ordinal), new_name);
-        if (!ok_or_record_error_locked(updated, "RenameTypeMember") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "RenameTypeMember");
     }
 
     bool add_type_member(
@@ -3470,10 +3265,7 @@ public:
             return false;
         }
         auto created = client_.AddTypeMember(parent_type_id, member_name, member_type, to_u64(size));
-        if (!ok_or_record_error_locked(created, "AddTypeMember") || !created.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "AddTypeMember");
     }
 
     bool delete_type_member(
@@ -3484,10 +3276,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteTypeMember(parent_type_id, to_u64(ordinal));
-        if (!ok_or_record_error_locked(deleted, "DeleteTypeMember") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteTypeMember");
     }
 
     bool set_type_member_type(
@@ -3499,10 +3288,7 @@ public:
             return false;
         }
         auto updated = client_.SetTypeMemberType(parent_type_id, to_u64(ordinal), new_type);
-        if (!ok_or_record_error_locked(updated, "SetTypeMemberType") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetTypeMemberType");
     }
 
     bool set_type_member_comment(
@@ -3514,10 +3300,7 @@ public:
             return false;
         }
         auto updated = client_.SetTypeMemberComment(parent_type_id, to_u64(ordinal), comment);
-        if (!ok_or_record_error_locked(updated, "SetTypeMemberComment") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetTypeMemberComment");
     }
 
     bool rename_type_enum_member(
@@ -3529,10 +3312,7 @@ public:
             return false;
         }
         auto updated = client_.RenameTypeEnumMember(type_id, to_u64(ordinal), new_name);
-        if (!ok_or_record_error_locked(updated, "RenameTypeEnumMember") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "RenameTypeEnumMember");
     }
 
     bool set_type_enum_member_value(
@@ -3544,10 +3324,7 @@ public:
             return false;
         }
         auto updated = client_.SetTypeEnumMemberValue(type_id, to_u64(ordinal), new_value);
-        if (!ok_or_record_error_locked(updated, "SetTypeEnumMemberValue") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetTypeEnumMemberValue");
     }
 
     bool set_type_enum_member_comment(
@@ -3559,10 +3336,7 @@ public:
             return false;
         }
         auto updated = client_.SetTypeEnumMemberComment(type_id, to_u64(ordinal), comment);
-        if (!ok_or_record_error_locked(updated, "SetTypeEnumMemberComment") || !updated.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(updated, "SetTypeEnumMemberComment");
     }
 
     bool create_type_union(
@@ -3575,10 +3349,7 @@ public:
         }
         (void)declaration;
         auto created = client_.CreateType(name, "union", to_u64(size));
-        if (!ok_or_record_error_locked(created, "CreateType") || !created.value->updated) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(created, "CreateType");
     }
 
     bool delete_type_union(const std::string& type_id) override {
@@ -3587,10 +3358,7 @@ public:
             return false;
         }
         auto deleted = client_.DeleteType(type_id);
-        if (!ok_or_record_error_locked(deleted, "DeleteType") || !deleted.value->deleted) {
-            return false;
-        }
-        return true;
+        return ok_or_record_error_locked(deleted, "DeleteType");
     }
 
     bool save_database() override {
@@ -3599,7 +3367,7 @@ public:
             return false;
         }
         auto saved = client_.SaveProgram();
-        return ok_or_record_error_locked(saved, "SaveProgram") && saved.value->saved;
+        return ok_or_record_error_locked(saved, "SaveProgram");
     }
 
     bool discard_changes() override {
@@ -3608,7 +3376,7 @@ public:
             return false;
         }
         auto discarded = client_.DiscardProgram();
-        return ok_or_record_error_locked(discarded, "DiscardProgram") && discarded.value->discarded;
+        return ok_or_record_error_locked(discarded, "DiscardProgram");
     }
 
     bool refresh() override {
@@ -3626,11 +3394,8 @@ public:
             return -1;
         }
         auto parsed = client_.ParseDeclarations(source_text);
+        // All or nothing: a syntax error is parse_error and creates no type.
         if (!ok_or_record_error_locked(parsed, "ParseDeclarations")) {
-            return -1;
-        }
-        if (!parsed.value->errors.empty()) {
-            last_error_ = parsed.value->errors[0];
             return -1;
         }
         return parsed.value->types_created;
@@ -3650,14 +3415,14 @@ public:
         if (!ok_or_record_error_locked(decomp, "GetDecompilation")) {
             return std::nullopt;
         }
+        // No function contains the address: not found, which is no rows, not
+        // an error. A record always names its function's real entry (which
+        // may be 0), so it is used as is.
         if (!decomp.value->decompilation.has_value()) {
-            last_error_ = "GetDecompilation returned empty response";
+            last_error_.clear();
             return std::nullopt;
         }
         auto detail = to_decompilation_detail(*decomp.value->decompilation);
-        if (detail.func_addr == 0) {
-            detail.func_addr = address;
-        }
         last_error_.clear();
         return detail;
     }
@@ -3907,24 +3672,16 @@ private:
     static constexpr std::uint64_t kInstructionLowSlackBytes = 16;
     static constexpr std::uint64_t kItemLowSlackBytes = 4096;
 
-    // Split an INCLUSIVE signed-int64 address window into 1-2 inclusive u64 RPC
-    // windows. Model addresses are ordered by SIGNED value (the SQL convention)
-    // while the host RPCs take unsigned bounds, so a window crossing the sign
-    // seam (start < 0 <= end, e.g. an unconstrained scan) must be split into
-    // the upper-half and lower-half unsigned ranges.
-    static std::vector<std::pair<std::uint64_t, std::uint64_t>> rpc_windows(
-            std::int64_t start, std::int64_t end) {
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
-        if (end < start) {
-            return out;
-        }
-        if (start < 0 && end >= 0) {
-            out.emplace_back(to_u64(start), std::numeric_limits<std::uint64_t>::max());
-            out.emplace_back(std::uint64_t{0}, to_u64(end));
-        } else {
-            out.emplace_back(to_u64(start), to_u64(end));
-        }
-        return out;
+    // The host RPCs take INCLUSIVE unsigned bounds, while model addresses are
+    // ordered by SIGNED value (the SQL convention: an address >= 2^63 is a
+    // negative INTEGER). A signed window's unsigned spans, in SQL order, come
+    // from xsql::Int64KeyRange::unsigned_spans(): one span, or two for a window
+    // crossing zero (e.g. an unconstrained scan), the part >= 2^63 first.
+    static xsql::Int64KeyRange address_window(std::int64_t start, std::int64_t end) {
+        xsql::Int64KeyRange range;
+        range.constrain(xsql::ConstraintOp::Ge, start);
+        range.constrain(xsql::ConstraintOp::Le, end);
+        return range;
     }
 
     static std::uint64_t widen_low(std::uint64_t lo, std::uint64_t slack) {

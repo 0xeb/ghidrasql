@@ -5,7 +5,7 @@
 # See LICENSE.
 #
 cmake_minimum_required(VERSION 3.26)
-project(ghidrasql VERSION 0.0.7 LANGUAGES C CXX)
+project(ghidrasql VERSION 0.0.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,8 @@ if(MSVC AND GHIDRASQL_STATIC_MSVC_RUNTIME)
 endif()
 
 if(MSVC)
+    # Environment reads copy getenv's result; use the portable C/C++ API.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     if(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY AND CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
         set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
     else()
@@ -95,10 +97,10 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
     message(STATUS "ghidrasql: Added libxsql from ghidrasql/external/libxsql")
 else()
     message(STATUS "ghidrasql: Fetching libxsql from GitHub (shallow clone)...")
-    # Pinned to the libxsql release this ghidrasql was built and tested against.
+    # Keep standalone builds on the tested API even when a newer libxsql ships.
     FetchContent_Declare(libxsql
         GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        v1.0.20
+        GIT_TAG        v1.0.24
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libxsql)
@@ -139,7 +141,13 @@ if(GHIDRASQL_WITH_MCP)
     endif()
 
     if(MSVC AND TARGET fastmcpp_core)
-        target_compile_options(fastmcpp_core PRIVATE /MP)
+        # fastmcpp forward-declares httplib's Response struct as a class;
+        # MSVC's C4099 is a declaration-tag advisory in that dependency.
+        target_compile_options(fastmcpp_core PRIVATE /MP /wd4099)
+        get_target_property(_fastmcpp_includes fastmcpp_core INTERFACE_INCLUDE_DIRECTORIES)
+        if(_fastmcpp_includes)
+            target_include_directories(fastmcpp_core SYSTEM INTERFACE ${_fastmcpp_includes})
+        endif()
     endif()
 
     # fastmcpp_core is a static library that gets linked into the ghidrasql

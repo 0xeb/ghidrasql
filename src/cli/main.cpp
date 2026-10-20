@@ -15,6 +15,7 @@
 
 #include <xsql/script.hpp>
 #include <xsql/query_script.hpp>
+#include <xsql/thinclient/clipboard.hpp>
 #ifdef GHIDRASQL_HAS_LIBGHIDRA
 #include <libghidra/headless.hpp>
 #include <libghidra/http.hpp>
@@ -1325,10 +1326,11 @@ int run_headless_live_server(const Args& args) {
     std::cout
         << "Launching Ghidra headless API host + ghidrasql server\n"
         << "  ghidra:        " << opts.ghidra_dir << "\n"
-        << "  headless RPC:  http://" << opts.bind << ":"
+        << "  headless RPC:  http://" << xsql::thinclient::format_url_host(opts.bind) << ":"
         << headless_port_label(opts.port) << "\n";
     if (args.serve) {
-        std::cout << "  ghidrasql API: http://" << args.bind << ":" << args.port << "\n";
+        std::cout << "  ghidrasql API: http://" << xsql::thinclient::format_url_host(args.bind)
+                  << ":" << args.port << "\n";
     }
     if (args.mcp) {
         std::cout << "  ghidrasql MCP: enabled\n";

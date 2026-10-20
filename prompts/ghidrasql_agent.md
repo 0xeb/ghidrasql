@@ -212,11 +212,11 @@ SELECT text, kind, var_name, var_type FROM decomp_tokens WHERE func_addr = 0x401
 -- 1. Rename the function
 UPDATE funcs SET name = 'parseConfig' WHERE addr = 0x4011F0;
 
--- 2. Set function signature
+-- 2. Set function signature (const/volatile/__restrict are accepted and dropped: Ghidra types carry none)
 UPDATE funcs SET prototype = 'int parseConfig(const char* path, Config* out)' WHERE addr = 0x4011F0;
 
 -- 3. Query the canonical local_id first, then rename that exact row
--- Example local_id values are source-defined and may look like arg0 or local:stack[-0x8]:4
+-- local_id is an opaque key such as local:Stack[-0x8] (a stack variable) or local:<storage>:<first use>
 UPDATE decomp_lvars SET name = 'configPath' WHERE func_addr = 0x4011F0 AND local_id = '<local_id_from_query>';
 
 -- 4. Set a variable's type
@@ -312,6 +312,27 @@ SELECT content FROM strings WHERE length > 10 ORDER BY length DESC LIMIT 20;
 
 ### Addresses
 Everything in a binary has an **address** — a memory location where code or data lives. SQL shows these as integers; use `printf('0x%X', addr)` or `hex(addr)` for hex display.
+
+#### High addresses (>= 2^63)
+SQLite integers are signed, so an address at or above `0x8000000000000000`
+(kernel images: `0xFFFFF800...`, `0xFFFFFFFF8...`, `0xC000000000000000`) is a
+**negative INTEGER** in every `addr`-like column, and `ORDER BY addr` puts the
+high half **first** (most negative first), then `0`, then the low half. Every
+table returns and orders such rows the way SQLite would, including a block or
+function that straddles 2^63.
+
+- Write a high address as a **hex literal** (`0xFFFFF80000100000`) or its
+  negative decimal (`-8796091973632`). **Never** as a decimal >= 2^63
+  (`18446735277617577984`): SQLite reads that as a REAL, which no address
+  equals, so the query silently matches nothing (`segments` / `memory_blocks`
+  INSERT refuse it).
+- `addr >= 0xFFFFF80000000000` also matches **every low-half address** (they are
+  signed-greater). For the high half only, write
+  `addr BETWEEN 0xFFFFF80000000000 AND -1` (or add `AND addr < 0`).
+- `hex(addr)` and `printf('0x%X', addr)` print the unsigned form.
+- A block's `end_addr` is exclusive and modulo 2^64: a block through
+  `0xFFFFFFFFFFFFFFFF` reports `end_addr = 0`, and one straddling 2^63 reports
+  an `end_addr` below its `start_addr`. The `size` column is always the byte count.
 
 ### Functions
 Ghidra groups code into **functions** with:
@@ -504,7 +525,7 @@ Decompiled C-like pseudocode. **MUST be function-scoped by `func_addr` or exact 
 
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
-| `func_addr` | INT64 | | Function address |
+| `func_addr` | INT64 | | Function entry point (an address inside a function matches no rows) |
 | `func_name` | TEXT | | Function name |
 | `text` | TEXT | | **Full Ghidra `getC()` text on success; synthetic diagnostic comment only on fallback** |
 | `is_stale` | INT | | Compatibility flag: 1 when incomplete or fallback |
@@ -534,7 +555,7 @@ Decompiler local variables. **MUST be function-scoped; use `func_addr`, or exact
 
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
-| `func_addr` | INT64 | | Function address |
+| `func_addr` | INT64 | | Function entry point (an address inside a function matches no rows) |
 | `func_name` | TEXT | | Function name |
 | `local_id` | TEXT | | Stable source-defined local identifier; query it first and use it verbatim for writes |
 | `name` | TEXT | UPDATE | Variable name |
@@ -561,7 +582,7 @@ Structured decompiler tokens with semantic information from Ghidra's ClangToken 
 
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
-| `func_addr` | INT64 | | Function entry point |
+| `func_addr` | INT64 | | Function entry point (an address inside a function matches no rows) |
 | `token_index` | INT64 | | Sequential ID within function |
 | `text` | TEXT | | Token text |
 | `kind` | TEXT | | Token kind: keyword/variable/type/function/parameter/global/const/comment/default/error/special |
@@ -595,7 +616,7 @@ decompiles every function once). Read-only.
 
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
-| `func_addr` | INT64 | | Containing function address |
+| `func_addr` | INT64 | | Function entry point (an address inside a function matches no rows) |
 | `seq` | INT64 | | Intra-function order |
 | `addr` | INT64 | | Source machine address (NULL only when absent; a real address 0 stays 0) |
 | `op` | TEXT | | Canonical P-code mnemonic (`COPY`, `LOAD`, `STORE`, `INT_ADD`, `INT_SUB`, `CALL`, `RETURN`, `MULTIEQUAL`, ...) |
@@ -687,11 +708,23 @@ All named locations (symbols).
 | `is_primary` | INT | | Primary symbol flag |
 | `is_external` | INT | | External symbol flag |
 
-**Write support:** UPDATE name, INSERT, DELETE
+**Write support:** UPDATE name, INSERT, DELETE. An INSERT always **adds** a
+label (Ghidra's createLabel): the address keeps the symbols it has, and the new
+label is primary only when the address had none. The same name already at that
+address fails with `duplicate_name`. (Ghidra's one exception: on a function that
+still has its default `FUN_...` name, the label becomes the function's name.)
+An UPDATE renames exactly the
+row's symbol (its `addr` and current `name`), primary or not: renaming a
+secondary label (`is_primary = 0`) leaves the primary symbol at that address
+alone. An external symbol (`is_external = 1`) cannot be renamed or deleted
+here: its `addr` is an offset in Ghidra's EXTERNAL space, not a memory address.
 
 ```sql
--- Create a new symbol
+-- Add a label (a second INSERT at the address adds a second label)
 INSERT INTO names (addr, name) VALUES (0x401000, 'myLabel');
+
+-- Rename one symbol (primary or secondary label)
+UPDATE names SET name = 'parse_loop' WHERE addr = 0x401020 AND name = 'LAB_00401020';
 
 -- Delete a symbol
 DELETE FROM names WHERE addr = 0x401000;
@@ -817,6 +850,16 @@ SELECT addr FROM byte_search
 WHERE pattern = 'CC CC CC' AND start_addr = 0x401000 AND end_addr = 0x402000;
 ```
 
+**Order and high addresses:** matches come back in `addr` order as SQL sorts
+it, so a match at or above `0x8000000000000000` (a negative `addr`) comes before
+the low-half matches, and `ORDER BY addr LIMIT n` is free. A match must fit
+inside one memory block, which may straddle 2^63. `start_addr` / `end_addr` are
+plain **unsigned** scan bounds (a match starts at or after `start_addr` and
+before `end_addr`); to keep only kernel-half matches filter on `addr`
+(`AND addr BETWEEN 0xFFFFF80000000000 AND -1`), since `addr >= <high hex>`
+includes the low half too. `hex(matched_bytes)` gives the bytes as uppercase hex
+digits, as SQLite's own `hex()` does for a BLOB.
+
 ### segments
 Memory segments / blocks. **Writable**: INSERT a region (Ghidra
 createUninitializedBlock), DELETE it (removeBlock), and UPDATE `start_addr`
@@ -828,11 +871,15 @@ the same map; resize/rename/perm writes go through `segments`.
 | Column | Type | Writable | Description |
 |--------|------|----------|-------------|
 | `start_addr` | INT64 | UPDATE | Segment start; UPDATE rebases (moves) the block |
-| `end_addr` | INT64 | UPDATE | Segment end (exclusive); UPDATE resizes — see the warning below |
+| `end_addr` | INT64 | UPDATE | Segment end (exclusive, modulo 2^64: `0` is the end of the address space); UPDATE resizes — see the warning below |
 | `name` | TEXT | UPDATE | Segment / block name |
 | `class` | TEXT | | Segment class |
 | `perm` | INT | INSERT, UPDATE | Permissions (R=4, W=2, X=1) |
 | `bitness` | INT | | Architecture bitness |
+
+Bounds are unsigned: `end_addr` must lie above `start_addr` in unsigned terms, a
+block may straddle `0x8000000000000000` (write the bounds as hex literals, see
+"High addresses"), and `end_addr = 0` maps through `0xFFFFFFFFFFFFFFFF`.
 
 > **Shrinking discards data.** Growing appends a block of the same
 > initialized-ness and permissions and joins it on; shrinking splits at the new
@@ -1518,7 +1565,7 @@ ladder (`maturity`, `stage`, `ordinal`, `is_default`, `is_ssa` — 2 rows: `high
 ### Decompiler Variable Mutation
 | Function | Description |
 |----------|-------------|
-| `rename_local(func_addr, local_id, new_name)` | Rename decompiler local variable. Returns 1 on success. |
+| `rename_local(func_addr, local_id, new_name)` | Rename decompiler local variable. Returns 1 on success; a failure is a SQL error carrying `[code]: message` (e.g. `[not_found]` for an unknown `local_id`). |
 | `set_local_type(func_addr, local_id, new_type)` | Set decompiler local variable type. Returns 1 on success. |
 
 **Note:** These functions are equivalent to `UPDATE decomp_lvars SET name/type`. Use whichever is more convenient.
@@ -1526,7 +1573,7 @@ ladder (`maturity`, `stage`, `ordinal`, `is_default`, `is_ssa` — 2 rows: `high
 ### Type Import
 | Function | Description |
 |----------|-------------|
-| `parse_decls(source_text)` | Parse C declarations and import them into Ghidra's type system. Returns count of newly created types. Uses Ghidra's CParser — standard C syntax only (no preprocessor, no `#include`). |
+| `parse_decls(source_text)` | Parse C declarations and import them into Ghidra's type system. Returns the count of newly created types. Text that does not parse is a SQL error carrying `[parse_error]: message`, and no type is created (all or nothing). Uses Ghidra's CParser — standard C syntax only (no preprocessor, no `#include`). |
 
 ```sql
 -- Import a single struct
@@ -1545,8 +1592,10 @@ SELECT name, kind, size FROM types WHERE name = 'Session';
 - Returns `0` if all types already existed (e.g., recovered from PDB)
 - Returns `>0` for newly created types
 - Standard C syntax only — no `#include`, no macros, no `#pragma`
-- The live host seeds exact `int8_t`/`uint8_t` through `int64_t`/`uint64_t`
-  typedef identities, so declarations may use those names without `<stdint.h>`
+- Fixed-width names such as `uint32_t` must already exist in the program or
+  be declared in the input text; `parse_decls()` does not provide `<stdint.h>`.
+  For a target with 32-bit `unsigned int`, use `typedef unsigned int uint32_t;`.
+  Direct type applications resolve these aliases on demand through a separate path.
 - Supports: structs, unions, enums, typedefs, function pointer types
 - Types are immediately available for use in `UPDATE funcs SET prototype = ...`
 
@@ -1651,6 +1700,27 @@ underlying source itself needs an explicit reload.
 | `function_tag_mappings` | Row match (func_addr + tag_name) |
 | `perf_benchmarks` | Row match (bench_id); each row DELETE is one host-side RPC; DELETE with no WHERE removes all rows (one RPC per row) |
 | `analysis_passes` | The running row only (`WHERE state = 'running'`) — cancels the job; finished rows are rejected |
+
+### Write Errors
+
+A write either takes effect or fails the statement; it never reports success
+without changing anything. The error names the statement, the Ghidra operation,
+an error code in brackets and the reason:
+
+```
+UPDATE funcs.name failed at 0x401000: RenameFunction failed [not_found]: <reason>
+```
+
+| Code | Meaning |
+|------|---------|
+| `not_found` | The target (function, symbol, comment, type, member ordinal, ...) does not exist |
+| `unmapped_address` | The address is outside every memory block |
+| `not_loaded` | No program is open |
+| `invalid_argument` | The value is not acceptable (wrong type kind, mid-instruction address, overlap, ...) |
+| `duplicate_name` | The name is already taken |
+| `unknown_type` | A type named as an argument (parameter, member, data type, alias target) does not exist |
+| `parse_error` | A prototype or declaration did not parse; nothing was applied |
+| `not_supported` | The connected backend does not implement this write |
 
 ### Durable Shutdown Model
 
@@ -1887,7 +1957,7 @@ Multi-statement bodies use the same shape with one entry per statement in `resul
 
 **Example with curl:**
 ```bash
-curl -X POST http://localhost:8081/query -d "SELECT name, size FROM funcs LIMIT 5"
+curl -X POST http://localhost:8081/query --data-binary "SELECT name, size FROM funcs LIMIT 5"
 
 # With auth
 curl -X POST http://localhost:8081/query -H "Authorization: Bearer mysecret" \

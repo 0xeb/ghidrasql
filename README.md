@@ -174,7 +174,7 @@ ghidrasql --ghidra /path/to/ghidra_dist \
   --binary target.exe --project ./proj --project-name demo \
   --http --port 8081
 
-# Then query it: curl -X POST http://localhost:8081/query -d "SELECT * FROM funcs LIMIT 5"
+# Then query it: curl -X POST http://localhost:8081/query --data-binary "SELECT * FROM funcs LIMIT 5"
 
 # Cancel an in-flight query (the explicit empty body supplies Content-Length: 0)
 curl -X POST -d '' http://localhost:8081/cancel

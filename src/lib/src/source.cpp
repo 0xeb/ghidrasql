@@ -19,16 +19,97 @@ bool clear_and_fail(std::vector<Row>& out) {
     return false;
 }
 
-// Body end of a function: prefer end_ea when it is past the start; otherwise
-// derive it from size (clamped to at least 1 byte so a zero-size function still
-// covers its own start address).
-inline std::int64_t function_body_end(const model::FunctionRow& fn) {
-    return fn.end_ea > fn.address
-        ? fn.end_ea
-        : fn.address + std::max<std::int64_t>(fn.size, 1);
+// A function body as SQL-ordered address runs (1, or 2 for a body that
+// straddles 2^63). See address_runs / function_extent.
+struct FuncSpan {
+    std::int64_t first;
+    std::int64_t last;
+    std::int64_t func_addr;
+};
+
+inline void append_function_spans(const model::FunctionRow& fn, std::vector<FuncSpan>& out) {
+    AddressRun runs[2];
+    const std::size_t n = address_runs(fn.address, function_extent(fn), runs);
+    for (std::size_t i = 0; i < n; ++i) {
+        out.push_back({runs[i].first, runs[i].last, fn.address});
+    }
+}
+
+inline std::vector<FuncSpan> sorted_function_spans(const std::vector<model::FunctionRow>& funcs) {
+    std::vector<FuncSpan> spans;
+    spans.reserve(funcs.size());
+    for (const auto& fn : funcs) {
+        append_function_spans(fn, spans);
+    }
+    std::sort(spans.begin(), spans.end(),
+              [](const FuncSpan& a, const FuncSpan& b) { return a.first < b.first; });
+    return spans;
+}
+
+// getFunctionContaining over sorted spans: every span before the upper_bound
+// starts at or below addr; walk back (decreasing start) and take the first
+// that also reaches addr. On a non-overlapping layout that is the immediate
+// predecessor (O(1)); under nested/overlapping bodies an earlier span with a
+// larger body may still contain addr, so keep walking -- the linear
+// containing_func_addr() answer, not the nearest candidate's. A span's start is
+// its piece of the body, so the upper piece of a body straddling 2^63 starts at
+// INT64_MIN and yields to any function that starts inside it.
+inline std::int64_t lookup_func_addr(const std::vector<FuncSpan>& spans, std::int64_t addr) {
+    auto it = std::upper_bound(
+        spans.begin(), spans.end(), addr,
+        [](std::int64_t a, const FuncSpan& s) { return a < s.first; });
+    while (it != spans.begin()) {
+        --it;
+        if (addr <= it->last) {  // it->first <= addr already guaranteed
+            return it->func_addr;
+        }
+    }
+    return 0;
 }
 
 }  // namespace
+
+std::size_t address_runs(std::int64_t start, std::uint64_t size, AddressRun out[2]) {
+    if (size == 0) {
+        return 0;
+    }
+    const std::uint64_t lo = static_cast<std::uint64_t>(start);
+    const std::uint64_t top = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t hi = size - 1 > top - lo ? top : lo + (size - 1);
+    const std::uint64_t seam = std::uint64_t{1} << 63;
+    if (lo < seam && hi >= seam) {
+        out[0] = {std::numeric_limits<std::int64_t>::min(), static_cast<std::int64_t>(hi)};
+        out[1] = {start, std::numeric_limits<std::int64_t>::max()};
+        return 2;
+    }
+    out[0] = {start, static_cast<std::int64_t>(hi)};
+    return 1;
+}
+
+std::uint64_t address_span_size(std::int64_t start, std::int64_t end_excl) {
+    const std::uint64_t lo = static_cast<std::uint64_t>(start);
+    const std::uint64_t end = static_cast<std::uint64_t>(end_excl);
+    if (end == lo) {
+        return 0;
+    }
+    if (end == 0) {
+        return std::uint64_t{0} - lo;  // through 0xFFFFFFFFFFFFFFFF
+    }
+    return end > lo ? end - lo : 0;
+}
+
+std::uint64_t function_extent(const model::FunctionRow& fn) {
+    // end_ea is exclusive and modulo 2^64. 0 below a high-half entry is the end
+    // of the address space; 0 above a low-half entry is "no end reported".
+    const bool ends_at_top = fn.end_ea == 0 && fn.address < 0;
+    if (ends_at_top || static_cast<std::uint64_t>(fn.end_ea) > static_cast<std::uint64_t>(fn.address)) {
+        const std::uint64_t extent = address_span_size(fn.address, fn.end_ea);
+        if (extent != 0) {
+            return extent;
+        }
+    }
+    return static_cast<std::uint64_t>(std::max<std::int64_t>(fn.size, 1));
+}
 
 std::int64_t containing_func_addr(
     const std::vector<model::FunctionRow>& funcs, std::int64_t addr) {
@@ -36,10 +117,14 @@ std::int64_t containing_func_addr(
     std::int64_t best_start = 0;
     bool found = false;
     for (const auto& fn : funcs) {
-        if (addr >= fn.address && addr < function_body_end(fn)) {
+        // Unsigned offset from the entry: exact for a body straddling 2^63.
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(addr) - static_cast<std::uint64_t>(fn.address);
+        if (offset < function_extent(fn)) {
             // On overlap, prefer the function with the greatest start <= addr
             // (innermost / most specific), matching getFunctionContaining.
-            if (!found || fn.address > best_start) {
+            if (!found || offset < static_cast<std::uint64_t>(addr) -
+                                       static_cast<std::uint64_t>(best_start)) {
                 best = fn.address;
                 best_start = fn.address;
                 found = true;
@@ -55,76 +140,24 @@ void assign_instruction_func_addrs(
     if (instructions.empty()) {
         return;
     }
-    // Build a sorted (start, end, func_addr) index once, then binary-search each
-    // instruction: the candidate is the last function whose start <= addr.
-    struct FuncSpan {
-        std::int64_t start;
-        std::int64_t end;
-    };
-    std::vector<FuncSpan> spans;
-    spans.reserve(funcs.size());
-    for (const auto& fn : funcs) {
-        spans.push_back({fn.address, function_body_end(fn)});
-    }
-    std::sort(spans.begin(), spans.end(),
-              [](const FuncSpan& a, const FuncSpan& b) { return a.start < b.start; });
-
+    // Build the sorted spans once, then binary-search each instruction.
+    const auto spans = sorted_function_spans(funcs);
     for (auto& insn : instructions) {
-        // Assign the SAME function containing_func_addr() would (getFunction
-        // Containing semantics): the greatest-start function whose body contains
-        // addr. Spans are sorted by start ascending, so every span before the
-        // upper_bound has start <= addr; walk backward (decreasing start) and take
-        // the first one that also satisfies addr < end. On a non-overlapping layout
-        // that is the immediate predecessor (O(1)); under nested/overlapping bodies
-        // an earlier span with a larger body may still contain addr, so we keep
-        // walking — matching the linear path exactly instead of giving up after the
-        // single nearest candidate (which previously disagreed and returned 0).
-        insn.func_addr = 0;
-        auto it = std::upper_bound(
-            spans.begin(), spans.end(), insn.address,
-            [](std::int64_t addr, const FuncSpan& s) { return addr < s.start; });
-        while (it != spans.begin()) {
-            --it;
-            if (insn.address < it->end) {  // it->start <= addr already guaranteed
-                insn.func_addr = it->start;
-                break;
-            }
-        }
+        insn.func_addr = lookup_func_addr(spans, insn.address);
     }
 }
 
 void assign_operand_func_addrs(
     const std::vector<model::FunctionRow>& funcs,
     std::vector<model::InstructionOperandRow>& operands) {
-    // Same sorted-span getFunctionContaining sweep as assign_instruction_func_addrs,
-    // over operand rows (each operand sits at its instruction's address).
+    // Same getFunctionContaining sweep as assign_instruction_func_addrs, over
+    // operand rows (each operand sits at its instruction's address).
     if (operands.empty()) {
         return;
     }
-    struct FuncSpan {
-        std::int64_t start;
-        std::int64_t end;
-    };
-    std::vector<FuncSpan> spans;
-    spans.reserve(funcs.size());
-    for (const auto& fn : funcs) {
-        spans.push_back({fn.address, function_body_end(fn)});
-    }
-    std::sort(spans.begin(), spans.end(),
-              [](const FuncSpan& a, const FuncSpan& b) { return a.start < b.start; });
-
+    const auto spans = sorted_function_spans(funcs);
     for (auto& op : operands) {
-        op.func_addr = 0;
-        auto it = std::upper_bound(
-            spans.begin(), spans.end(), op.address,
-            [](std::int64_t addr, const FuncSpan& s) { return addr < s.start; });
-        while (it != spans.begin()) {
-            --it;
-            if (op.address < it->end) {
-                op.func_addr = it->start;
-                break;
-            }
-        }
+        op.func_addr = lookup_func_addr(spans, op.address);
     }
 }
 
@@ -172,15 +205,14 @@ bool byte_span_intersects_range(
     if (span <= 0 || end_address < start_address) {
         return false;
     }
-    // Inclusive item end, clamped on overflow (a span reaching past INT64_MAX
-    // saturates rather than wrapping). Computed in unsigned arithmetic so the
-    // overflow itself is well-defined.
-    std::int64_t item_end = static_cast<std::int64_t>(
-        static_cast<std::uint64_t>(item_start) + static_cast<std::uint64_t>(span - 1));
-    if (item_end < item_start) {
-        item_end = std::numeric_limits<std::int64_t>::max();
+    AddressRun runs[2];
+    const std::size_t n = address_runs(item_start, static_cast<std::uint64_t>(span), runs);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (runs[i].first <= end_address && runs[i].last >= start_address) {
+            return true;
+        }
     }
-    return item_start <= end_address && item_end >= start_address;
+    return false;
 }
 
 std::string Source::last_error() const { return {}; }
@@ -623,7 +655,7 @@ bool Source::read_transactions(std::vector<model::TransactionRow>& out) const { 
 bool Source::read_live_meta(std::vector<model::LiveMetaRow>& out) const { return clear_and_fail(out); }
 
 bool Source::rename_function(std::int64_t, const std::string&) { return false; }
-bool Source::rename_symbol(std::int64_t, const std::string&) { return false; }
+bool Source::rename_symbol(std::int64_t, const std::string&, const std::string&) { return false; }
 bool Source::delete_symbol(std::int64_t, const std::string&) { return false; }
 bool Source::rename_data_item(std::int64_t, const std::string&) { return false; }
 bool Source::set_data_item_type(std::int64_t, const std::string&) { return false; }

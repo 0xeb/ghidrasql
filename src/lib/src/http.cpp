@@ -178,9 +178,9 @@ static std::string build_http_help_text() {
         "  continue_on_error=1  - run every statement regardless of earlier failures\n"
         "  include_sql=1        - echo each statement's SQL back in its result\n\n"
         "Example (single statement):\n"
-        "  curl -X POST http://localhost:<port>/query -d \"SELECT name FROM funcs LIMIT 10\"\n"
+        "  curl -X POST http://localhost:<port>/query --data-binary \"SELECT name FROM funcs LIMIT 10\"\n"
         "Example (multi-statement):\n"
-        "  curl -X POST http://localhost:<port>/query -d \"UPDATE funcs SET name='x' WHERE addr=0x1000; SELECT save_database();\"\n";
+        "  curl -X POST http://localhost:<port>/query --data-binary \"UPDATE funcs SET name='x' WHERE addr=0x1000; SELECT save_database();\"\n";
 }
 
 HttpServer::~HttpServer() {

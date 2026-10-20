@@ -21,8 +21,14 @@ if(GHIDRASQL_WITH_MCP)
     target_compile_definitions(ghidrasql-cli PRIVATE GHIDRASQL_HAS_MCP=1)
 endif()
 
+# The Visual Studio generator gives every executable an import library named
+# after its output (/IMPLIB:<archive dir>/ghidrasql.lib) -- the path of the
+# static library this executable links. MSBuild then records ghidrasql.lib as a
+# link OUTPUT, so a rebuilt library never relinks ghidrasql.exe and it keeps
+# serving the old code. Give the import library its own name.
 set_target_properties(ghidrasql-cli PROPERTIES
     OUTPUT_NAME "ghidrasql"
+    ARCHIVE_OUTPUT_NAME "ghidrasql-cli"
 )
 
 install(TARGETS ghidrasql-cli

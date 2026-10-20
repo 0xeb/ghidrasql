@@ -414,8 +414,9 @@ public:
         return call_write(callbacks_.rename_function, address, new_name);
     }
 
-    bool rename_symbol(std::int64_t address, const std::string& new_name) override {
-        return call_write(callbacks_.rename_symbol, address, new_name);
+    bool rename_symbol(
+        std::int64_t address, const std::string& old_name, const std::string& new_name) override {
+        return call_write(callbacks_.rename_symbol, address, old_name, new_name);
     }
 
     bool delete_symbol(std::int64_t address, const std::string& name) override {

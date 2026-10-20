@@ -21,17 +21,46 @@
 
 namespace ghidrasql::entities {
 
+// Lookup ranges over segments / function bodies: inclusive [first, last] in
+// signed (SQL) order. A segment or body straddling 2^63 contributes two
+// ranges (see ghidrasql::address_runs), both naming it.
 struct SegmentRange {
-    std::int64_t start = 0;
-    std::int64_t end = 0;
+    std::int64_t first = 0;
+    std::int64_t last = 0;
     std::string name;
 };
 
 struct FunctionRange {
-    std::int64_t start = 0;
-    std::int64_t end = 0;
+    std::int64_t first = 0;
+    std::int64_t last = 0;
     std::int64_t func_addr = 0;
 };
+
+// Read the rows `reader(first, last, part)` returns for each SQL-ordered run
+// of `fn`'s body (two for a body straddling 2^63) into `out`, appended in that
+// order. A reader may also return rows that only overlap its run (the
+// *_in_range readers do); each row is kept in the run its `address` starts in,
+// so one straddling the seam is not listed twice. False as soon as one read
+// fails.
+template <typename Row, typename Reader>
+bool read_function_body_runs(const model::FunctionRow& fn, std::vector<Row>& out, Reader&& reader) {
+    out.clear();
+    AddressRun runs[2];
+    const std::size_t n = address_runs(fn.address, function_extent(fn), runs);
+    for (std::size_t i = 0; i < n; ++i) {
+        std::vector<Row> part;
+        if (!reader(runs[i].first, runs[i].last, part)) {
+            out.clear();
+            return false;
+        }
+        for (auto& row : part) {
+            if (row.address >= runs[i].first && row.address <= runs[i].last) {
+                out.push_back(std::move(row));
+            }
+        }
+    }
+    return true;
+}
 
 std::string build_row_counts_json(const std::shared_ptr<Source>& source);
 

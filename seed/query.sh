@@ -12,5 +12,5 @@ if (( $# < 1 || $# > 2 )); then
 fi
 
 port="${2:-${GHIDRASQL_PORT:-8081}}"
-curl -fsS -X POST "http://127.0.0.1:$port/query" --data "$1"
+curl -fsS -X POST "http://127.0.0.1:$port/query" --data-binary "$1"
 echo

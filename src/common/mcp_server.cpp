@@ -11,6 +11,7 @@
 #include <fastmcpp/tools/manager.hpp>
 #include <fastmcpp/tools/tool.hpp>
 #include <nlohmann/json.hpp>
+#include <xsql/thinclient/clipboard.hpp>
 
 #include <sstream>
 #include <unordered_map>
@@ -182,14 +183,13 @@ void GhidrasqlMcpServer::stop() {
 }
 
 std::string GhidrasqlMcpServer::url() const {
-    std::ostringstream ss;
-    ss << "http://" << bind_addr_ << ":" << port_;
-    return ss.str();
+    return "http://" + xsql::thinclient::format_url_host(bind_addr_) + ":" +
+           std::to_string(port_);
 }
 
 std::string format_mcp_info(int port, const std::string& bind_addr) {
-    return "ghidrasql MCP server: http://" + bind_addr + ":"
-           + std::to_string(port) + "/sse\n";
+    return "ghidrasql MCP server: http://" + xsql::thinclient::format_url_host(bind_addr) +
+           ":" + std::to_string(port) + "/sse\n";
 }
 
 } // namespace ghidrasql

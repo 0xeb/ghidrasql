@@ -560,14 +560,10 @@ std::int64_t function_for_address(
     std::int64_t address)
 {
     for (const auto& fn : functions) {
-        std::int64_t fn_end = fn.end_ea;
-        if (fn_end <= fn.address && fn.size > 0) {
-            fn_end = fn.address + fn.size;
-        }
-        if (fn_end <= fn.address) {
-            fn_end = fn.address + 1;
-        }
-        if (address >= fn.address && address < fn_end) {
+        // Unsigned offset from the entry: exact for a body straddling 2^63.
+        const std::uint64_t offset =
+            static_cast<std::uint64_t>(address) - static_cast<std::uint64_t>(fn.address);
+        if (offset < function_extent(fn)) {
             return fn.address;
         }
     }
@@ -578,14 +574,15 @@ std::vector<SegmentRange> build_segment_ranges(const std::vector<model::SegmentR
     std::vector<SegmentRange> ranges;
     ranges.reserve(segments.size());
     for (const auto& seg : segments) {
-        SegmentRange r;
-        r.start = seg.start_ea;
-        r.end = seg.end_ea;
-        r.name = seg.name;
-        ranges.push_back(std::move(r));
+        AddressRun runs[2];
+        const std::size_t n =
+            address_runs(seg.start_ea, address_span_size(seg.start_ea, seg.end_ea), runs);
+        for (std::size_t i = 0; i < n; ++i) {
+            ranges.push_back(SegmentRange{runs[i].first, runs[i].last, seg.name});
+        }
     }
     std::sort(ranges.begin(), ranges.end(), [](const SegmentRange& a, const SegmentRange& b) {
-        return a.start < b.start;
+        return a.first < b.first;
     });
     return ranges;
 }
@@ -599,29 +596,27 @@ std::string segment_name_for_address(const std::vector<SegmentRange>& ranges, st
         ranges.end(),
         address,
         [](std::int64_t value, const SegmentRange& r) {
-            return value < r.start;
+            return value < r.first;
         });
     if (it == ranges.begin()) {
         return {};
     }
     --it;
-    return (address >= it->start && address < it->end) ? it->name : std::string{};
+    return address <= it->last ? it->name : std::string{};
 }
 
 std::vector<FunctionRange> build_function_ranges(const std::vector<model::FunctionRow>& functions) {
     std::vector<FunctionRange> ranges;
     ranges.reserve(functions.size());
     for (const auto& fn : functions) {
-        FunctionRange r;
-        r.start = fn.address;
-        r.end = fn.end_ea > fn.address
-            ? fn.end_ea
-            : (fn.address + std::max<std::int64_t>(fn.size, 1));
-        r.func_addr = fn.address;
-        ranges.push_back(r);
+        AddressRun runs[2];
+        const std::size_t n = address_runs(fn.address, function_extent(fn), runs);
+        for (std::size_t i = 0; i < n; ++i) {
+            ranges.push_back(FunctionRange{runs[i].first, runs[i].last, fn.address});
+        }
     }
     std::sort(ranges.begin(), ranges.end(), [](const FunctionRange& a, const FunctionRange& b) {
-        return a.start < b.start;
+        return a.first < b.first;
     });
     return ranges;
 }
@@ -635,13 +630,13 @@ std::int64_t function_for_address(const std::vector<FunctionRange>& ranges, std:
         ranges.end(),
         address,
         [](std::int64_t value, const FunctionRange& r) {
-            return value < r.start;
+            return value < r.first;
         });
     if (it == ranges.begin()) {
         return 0;
     }
     --it;
-    return (address >= it->start && address < it->end) ? it->func_addr : 0;
+    return address <= it->last ? it->func_addr : 0;
 }
 
 int hex_nibble(char ch) {
@@ -820,12 +815,13 @@ std::vector<model::PseudocodeRow> derive_pseudocode_row_for(
     if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
         // Direct libghidra clients may decompile an address anywhere inside a
         // function. A SQL equality predicate is stricter: never return a row
-        // whose canonical entry point differs from WHERE func_addr = X.
-        if (detail->func_addr != 0 && detail->func_addr != func_addr) {
+        // whose canonical entry point differs from WHERE func_addr = X (a
+        // function at address 0 included).
+        if (detail->func_addr != func_addr) {
             return {};
         }
         model::PseudocodeRow row;
-        row.func_addr = detail->func_addr == 0 ? func_addr : detail->func_addr;
+        row.func_addr = detail->func_addr;
         row.func_name = detail->func_name;
         if (row.func_name.empty()) {
             if (auto fn = read_function_row_for(source, func_addr); fn.has_value()) {
@@ -868,7 +864,10 @@ std::vector<model::DecompLvarRow> derive_decomp_lvar_rows_for(
     };
 
     if (source->has_authoritative_decompile_detail()) {
-        if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
+        // Only the function that starts at func_addr: a decompilation of the
+        // function containing an interior address is not its locals.
+        if (auto detail = source->decompile_detail(func_addr);
+            detail.has_value() && detail->func_addr == func_addr) {
             return stamp_for_function(std::move(detail->locals), detail->func_name);
         }
         return {};
@@ -893,17 +892,26 @@ std::vector<model::DecompCommentRow> derive_decomp_comment_rows_for(
     // Resolve the function's address range so we can scope the comment lookup.
     auto fn = read_function_row_for(source, func_addr);
 
+    // The body's runs in SQL order (two for a body straddling 2^63); without a
+    // function row, just the address itself.
+    model::FunctionRow scope;
+    scope.address = func_addr;
+    scope.end_ea = func_addr + 1;
+    if (fn.has_value()) {
+        scope = *fn;
+    }
+    const std::uint64_t extent = function_extent(scope);
     std::vector<model::CommentRow> comments;
-    const std::int64_t range_start = func_addr;
-    const std::int64_t range_end =
-        fn.has_value() && fn->end_ea > func_addr ? (fn->end_ea - 1) : func_addr;
-    if (!source->read_comments_in_range(range_start, range_end, comments) || comments.empty()) {
+    if (!read_function_body_runs(scope, comments,
+            [&](std::int64_t first, std::int64_t last, std::vector<model::CommentRow>& part) {
+                return source->read_comments_in_range(first, last, part);
+            }) || comments.empty()) {
         return {};
     }
 
     std::vector<model::DecompCommentRow> out;
     for (const auto& c : comments) {
-        if (c.address < range_start || c.address > range_end) {
+        if (static_cast<std::uint64_t>(c.address) - static_cast<std::uint64_t>(func_addr) >= extent) {
             continue;
         }
         model::DecompCommentRow row;
@@ -945,7 +953,8 @@ std::vector<model::DecompTokenRow> derive_decomp_token_rows_for(
 {
     // Authoritative path: decompile only the target function and extract tokens.
     if (source->has_authoritative_decompile_detail()) {
-        if (auto detail = source->decompile_detail(func_addr); detail.has_value()) {
+        if (auto detail = source->decompile_detail(func_addr);
+            detail.has_value() && detail->func_addr == func_addr) {
             return detail->tokens;
         }
         return {};
@@ -1208,7 +1217,7 @@ std::vector<model::MemoryBlockRow> derive_memory_block_rows(const std::shared_pt
         row.block_class = seg.segment_class;
         row.perm = seg.perm;
         row.bitness = seg.bitness;
-        row.size = seg.end_ea > seg.start_ea ? (seg.end_ea - seg.start_ea) : 0;
+        row.size = static_cast<std::int64_t>(address_span_size(seg.start_ea, seg.end_ea));
         row.is_read = (seg.perm & 4) != 0 ? 1 : 0;
         row.is_write = (seg.perm & 2) != 0 ? 1 : 0;
         row.is_exec = (seg.perm & 1) != 0 ? 1 : 0;
@@ -1374,9 +1383,8 @@ std::vector<model::BlockRow> derive_block_rows(const std::shared_ptr<Source>& so
             model::BlockRow row;
             row.func_addr = fn.address;
             row.start_ea = fn.address;
-            const std::int64_t size_hint = fn.size > 0 ? fn.size : 1;
-            const std::int64_t end_hint = fn.end_ea > fn.address ? fn.end_ea : (fn.address + size_hint);
-            row.end_ea = end_hint;
+            row.end_ea = static_cast<std::int64_t>(
+                static_cast<std::uint64_t>(fn.address) + function_extent(fn));
             row.in_degree = 0;
             row.out_degree = 0;
             out.push_back(std::move(row));
@@ -1479,11 +1487,15 @@ inline const char* mem_item_kind_name(MemItemKind kind) {
     return "data";
 }
 
+// One SQL-ordered run of an item's bytes: [start, end_incl]. An item
+// straddling 2^63 (an instruction or string crossing the seam) is two runs
+// sharing its `origin`, the item's own start address.
 struct MemAttributionItem {
     std::int64_t start = 0;
     std::int64_t end_incl = 0;
+    std::int64_t origin = 0;
     MemItemKind kind = MemItemKind::kData;
-    // Value fallback for [start, start + fallback.size()): instruction hex
+    // Value fallback for [origin, origin + fallback.size()): instruction hex
     // bytes / string content. Empty for data items (read_bytes only).
     std::vector<std::uint8_t> fallback;
 };
@@ -1494,17 +1506,6 @@ struct MemRegion {
     std::int64_t end_incl = 0;
     Kind kind = kItemOnly;
 };
-
-// Inclusive span end with overflow clamp (span >= 1 assumed). Computed in
-// unsigned arithmetic so the overflow itself is well-defined.
-inline std::int64_t span_end_incl(std::int64_t start, std::int64_t span) {
-    std::int64_t end = static_cast<std::int64_t>(
-        static_cast<std::uint64_t>(start) + static_cast<std::uint64_t>(span - 1));
-    if (end < start) {
-        end = std::numeric_limits<std::int64_t>::max();
-    }
-    return end;
-}
 
 class MemoryBytesGenerator final : public xsql::Generator<model::MemoryByteRow> {
 public:
@@ -1575,9 +1576,8 @@ private:
 
         for (const auto& insn : instructions) {
             MemAttributionItem item;
-            item.start = insn.address;
+            item.origin = insn.address;
             item.kind = MemItemKind::kInstruction;
-            item.end_incl = span_end_incl(insn.address, instruction_byte_span(insn));
             // Fallback = the decodable hex prefix (offline sources; live
             // sources carry no hex and rely on read_bytes for values).
             const std::string hex = trim_copy(insn.bytes);
@@ -1589,15 +1589,14 @@ private:
                 }
                 item.fallback.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
             }
-            items_.push_back(std::move(item));
+            add_item(std::move(item), instruction_byte_span(insn));
         }
 
         for (const auto& s : strings) {
             MemAttributionItem item;
-            item.start = s.address;
+            item.origin = s.address;
             item.kind = MemItemKind::kString;
             const std::int64_t span = string_byte_span(s);
-            item.end_incl = span_end_incl(s.address, span);
             // Fallback = decoded content, clamped to the span, plus the single
             // NUL pad the legacy derivation emitted when content ran short of
             // the declared length. Raw read_bytes values still win when the
@@ -1613,7 +1612,7 @@ private:
             if (item.fallback.size() < static_cast<std::size_t>(span)) {
                 item.fallback.push_back(0);  // string NUL pad
             }
-            items_.push_back(std::move(item));
+            add_item(std::move(item), span);
         }
 
         for (const auto& di : data_items) {
@@ -1621,10 +1620,9 @@ private:
                 continue;  // sizeless items claim no bytes
             }
             MemAttributionItem item;
-            item.start = di.address;
+            item.origin = di.address;
             item.kind = MemItemKind::kData;
-            item.end_incl = span_end_incl(di.address, data_item_byte_span(di));
-            items_.push_back(std::move(item));
+            add_item(std::move(item), data_item_byte_span(di));
         }
 
         std::sort(items_.begin(), items_.end(),
@@ -1640,20 +1638,42 @@ private:
         }
     }
 
-    void build_regions(std::vector<model::MemoryBlockRow> blocks) {
-        // Block spans clipped to the window, sorted, overlap-clamped.
-        std::sort(blocks.begin(), blocks.end(),
-                  [](const model::MemoryBlockRow& a, const model::MemoryBlockRow& b) {
-                      return a.start_ea < b.start_ea;
-                  });
-        std::vector<MemRegion> block_regions;
-        block_regions.reserve(blocks.size());
+    // An item's bytes as SQL-ordered runs (two when it straddles 2^63), each
+    // attributed to the item's own start.
+    void add_item(MemAttributionItem item, std::int64_t span) {
+        AddressRun runs[2];
+        const std::size_t n =
+            address_runs(item.origin, static_cast<std::uint64_t>(std::max<std::int64_t>(span, 1)), runs);
+        for (std::size_t i = 0; i < n; ++i) {
+            items_.push_back(item);
+            items_.back().start = runs[i].first;
+            items_.back().end_incl = runs[i].last;
+        }
+    }
+
+    void build_regions(const std::vector<model::MemoryBlockRow>& blocks) {
+        // Block runs clipped to the window, sorted, overlap-clamped. A block's
+        // exclusive end is modulo 2^64 (a block through 0xFFFFFFFFFFFFFFFF ends
+        // at 0), and a block straddling 2^63 is two runs in SQL order.
+        std::vector<MemRegion> runs;
+        runs.reserve(blocks.size() + 1);
         for (const auto& blk : blocks) {
-            if (blk.end_ea <= blk.start_ea) {
-                continue;  // empty / wrapped span
+            AddressRun r[2];
+            const std::size_t n =
+                address_runs(blk.start_ea, address_span_size(blk.start_ea, blk.end_ea), r);
+            for (std::size_t i = 0; i < n; ++i) {
+                runs.push_back(MemRegion{
+                    r[i].first, r[i].last,
+                    blk.is_initialized != 0 ? MemRegion::kBlockInit : MemRegion::kBlockUninit});
             }
-            std::int64_t s = std::max(blk.start_ea, window_lo_);
-            const std::int64_t e = std::min(blk.end_ea - 1, window_hi_);
+        }
+        std::sort(runs.begin(), runs.end(),
+                  [](const MemRegion& a, const MemRegion& b) { return a.start < b.start; });
+        std::vector<MemRegion> block_regions;
+        block_regions.reserve(runs.size());
+        for (const auto& run : runs) {
+            std::int64_t s = std::max(run.start, window_lo_);
+            const std::int64_t e = std::min(run.end_incl, window_hi_);
             if (e < s) {
                 continue;
             }
@@ -1667,8 +1687,7 @@ private:
                     continue;
                 }
             }
-            block_regions.push_back(MemRegion{
-                s, e, blk.is_initialized != 0 ? MemRegion::kBlockInit : MemRegion::kBlockUninit});
+            block_regions.push_back(MemRegion{s, e, run.kind});
         }
 
         // Merged item coverage clipped to the window (items outside every
@@ -1877,7 +1896,7 @@ private:
                 if (have[i]) {
                     value = static_cast<int>(values[i]);
                 } else if (item != nullptr) {
-                    const std::uint64_t offset = addr_distance(item->start, addr);
+                    const std::uint64_t offset = addr_distance(item->origin, addr);
                     if (offset < item->fallback.size()) {
                         value = static_cast<int>(item->fallback[static_cast<std::size_t>(offset)]);
                     }
@@ -1891,8 +1910,8 @@ private:
 
             if (item != nullptr) {
                 row.source_kind = mem_item_kind_name(item->kind);
-                row.item_addr = item->start;
-                row.item_offset = static_cast<std::int64_t>(addr_distance(item->start, addr));
+                row.item_addr = item->origin;
+                row.item_offset = static_cast<std::int64_t>(addr_distance(item->origin, addr));
             } else if (kind == MemRegion::kBlockInit) {
                 row.source_kind = "raw";
                 row.item_addr = addr;
@@ -1960,9 +1979,7 @@ std::size_t estimate_memory_byte_rows(const std::shared_ptr<Source>& source) {
     if (source->read_memory_blocks(blocks) && !blocks.empty()) {
         std::uint64_t total = 0;
         for (const auto& blk : blocks) {
-            if (blk.end_ea > blk.start_ea) {
-                total += static_cast<std::uint64_t>(blk.end_ea - blk.start_ea);
-            }
+            total += address_span_size(blk.start_ea, blk.end_ea);
             if (total > (std::uint64_t{1} << 40)) {
                 total = std::uint64_t{1} << 40;  // cap the planner cost hint
                 break;
@@ -2213,7 +2230,8 @@ std::vector<model::FunctionChunkRow> derive_function_chunk_rows(const std::share
             row.func_addr = fn.address;
             row.chunk_id = "chunk0";
             row.start_ea = fn.address;
-            row.end_ea = fn.end_ea > fn.address ? fn.end_ea : fn.address + std::max<std::int64_t>(fn.size, 1);
+            row.end_ea = static_cast<std::int64_t>(
+                static_cast<std::uint64_t>(fn.address) + function_extent(fn));
             row.chunk_kind = "range";
             row.is_primary = 1;
             out.push_back(std::move(row));
@@ -2229,7 +2247,9 @@ std::vector<model::FunctionChunkRow> derive_function_chunk_rows(const std::share
             row.func_addr = fn.address;
             row.chunk_id = "chunk" + std::to_string(i);
             row.start_ea = blocks[i]->start_ea;
-            row.end_ea = blocks[i]->end_ea > blocks[i]->start_ea ? blocks[i]->end_ea : blocks[i]->start_ea + 1;
+            row.end_ea = address_span_size(blocks[i]->start_ea, blocks[i]->end_ea) != 0
+                ? blocks[i]->end_ea
+                : static_cast<std::int64_t>(static_cast<std::uint64_t>(blocks[i]->start_ea) + 1);
             row.chunk_kind = "block";
             row.is_primary = (i == 0 || blocks[i]->start_ea == fn.address) ? 1 : 0;
             out.push_back(std::move(row));
@@ -2260,10 +2280,11 @@ std::vector<model::TailCallRow> derive_tail_call_rows(const std::shared_ptr<Sour
         if (!src_fn) {
             continue;
         }
-        const std::int64_t fn_end = src_fn->end_ea > src_fn->address
-            ? src_fn->end_ea
-            : (src_fn->address + std::max<std::int64_t>(src_fn->size, 1));
-        const bool near_end = edge.call_site >= (fn_end - 8);
+        // Within the body's last 8 bytes, measured from the entry in unsigned
+        // terms (exact for a body straddling 2^63).
+        const std::uint64_t offset = static_cast<std::uint64_t>(edge.call_site) -
+                                     static_cast<std::uint64_t>(src_fn->address);
+        const bool near_end = offset < function_extent(*src_fn) && offset + 8 >= function_extent(*src_fn);
         const bool interproc = edge.dst_func_addr != 0 && edge.dst_func_addr != edge.src_func_addr;
         if (!near_end || !interproc) {
             continue;
@@ -2493,17 +2514,6 @@ std::vector<model::ConstantRow> derive_constant_rows_from(
     return out;
 }
 
-std::int64_t constant_function_end_inclusive(const model::FunctionRow& fn) {
-    if (fn.end_ea > fn.address) {
-        return fn.end_ea - 1;
-    }
-    const std::int64_t delta = std::max<std::int64_t>(fn.size, 1) - 1;
-    if (fn.address > std::numeric_limits<std::int64_t>::max() - delta) {
-        return std::numeric_limits<std::int64_t>::max();
-    }
-    return fn.address + delta;
-}
-
 }  // namespace
 
 std::vector<model::ConstantRow> derive_constant_rows(const std::shared_ptr<Source>& source) {
@@ -2529,13 +2539,18 @@ std::vector<model::ConstantRow> derive_constant_rows_for(
     if (!source->read_function_at(func_addr, function)) {
         return {};
     }
-    const auto end = constant_function_end_inclusive(function);
     std::vector<model::InstructionRow> instructions;
-    if (!source->read_instructions_in_range(function.address, end, instructions)) {
+    if (!read_function_body_runs(function, instructions,
+            [&](std::int64_t first, std::int64_t last, std::vector<model::InstructionRow>& part) {
+                return source->read_instructions_in_range(first, last, part);
+            })) {
         return {};
     }
     std::vector<model::DataItemRow> data_items;
-    if (!source->read_data_items_in_range(function.address, end, data_items)) {
+    if (!read_function_body_runs(function, data_items,
+            [&](std::int64_t first, std::int64_t last, std::vector<model::DataItemRow>& part) {
+                return source->read_data_items_in_range(first, last, part);
+            })) {
         return {};
     }
     return derive_constant_rows_from(

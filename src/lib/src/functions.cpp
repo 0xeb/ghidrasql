@@ -10,6 +10,8 @@
 #include <xsql/database.hpp>
 #include <xsql/functions.hpp>
 
+#include <sqlite3.h>
+
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
@@ -29,6 +31,14 @@ void notify_source_mutation(const MutationCallback& on_source_mutation) {
     if (on_source_mutation) {
         on_source_mutation();
     }
+}
+
+// The SQL error of a failed write: "<fn>: <Op> failed [code]: message" from the
+// source's last error, so the caller sees the backend's error code.
+std::string source_failure(const Source& source, const char* fn) {
+    const std::string detail = source.last_error();
+    return detail.empty() ? std::string(fn) + " failed [internal_error]: the source gave no detail"
+                          : std::string(fn) + ": " + detail;
 }
 
 std::string local_mutation_key(std::int64_t func_addr, const std::string& local_id) {
@@ -352,9 +362,30 @@ void register_sql_functions(
 {
     auto local_name_overrides = std::make_shared<std::unordered_map<std::string, std::string>>();
 
+    // hex() replaces SQLite's built-in, so a BLOB or TEXT argument keeps the
+    // built-in's meaning -- its bytes as uppercase hex digits, e.g.
+    // hex(matched_bytes) -- and NULL stays NULL. A number is an address:
+    // 0x-prefixed and printed unsigned, so one >= 2^63 (a negative INTEGER in
+    // SQL) reads as 0xFFFFF800...
     db.register_function("hex", 1, [](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 1 || argv[0].is_null()) {
             ctx.result_null();
+            return;
+        }
+        const int type = argv[0].type();
+        if (type == SQLITE_BLOB || type == SQLITE_TEXT) {
+            const auto* data = static_cast<const unsigned char*>(
+                type == SQLITE_BLOB ? argv[0].as_blob()
+                                    : static_cast<const void*>(argv[0].as_c_str()));
+            const int len = argv[0].bytes();
+            static const char kDigits[] = "0123456789ABCDEF";
+            std::string out;
+            out.reserve(static_cast<std::size_t>(len > 0 ? len : 0) * 2);
+            for (int i = 0; i < len && data; ++i) {
+                out += kDigits[data[i] >> 4];
+                out += kDigits[data[i] & 0x0F];
+            }
+            ctx.result_text(out);
             return;
         }
         ctx.result_text(to_hex(argv[0].as_int64()));
@@ -512,27 +543,28 @@ void register_sql_functions(
 
     db.register_function("rename_local", 3, [&source, on_source_mutation, local_name_overrides](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 3 || argv[0].is_null() || argv[1].is_null() || argv[2].is_null()) {
-            ctx.result_int(0);
+            ctx.result_error("rename_local [invalid_argument]: func_addr, local_id and new_name are required");
             return;
         }
         const std::int64_t func_addr = argv[0].as_int64();
         const std::string local_id = argv[1].as_text();
         const std::string new_name = argv[2].as_text();
         if (local_id.empty() || new_name.empty()) {
-            ctx.result_int(0);
+            ctx.result_error("rename_local [invalid_argument]: local_id and new_name must not be empty");
             return;
         }
-        const bool ok = source.rename_decomp_local(func_addr, local_id, new_name);
-        if (ok) {
-            (*local_name_overrides)[local_mutation_key(func_addr, local_id)] = new_name;
-            notify_source_mutation(on_source_mutation);
+        if (!source.rename_decomp_local(func_addr, local_id, new_name)) {
+            ctx.result_error(source_failure(source, "rename_local"));
+            return;
         }
-        ctx.result_int(ok ? 1 : 0);
+        (*local_name_overrides)[local_mutation_key(func_addr, local_id)] = new_name;
+        notify_source_mutation(on_source_mutation);
+        ctx.result_int(1);
     });
 
     db.register_function("parse_decls", 1, [&source, on_source_mutation](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
         if (argc < 1 || argv[0].is_null()) {
-            ctx.result_int(-1);
+            ctx.result_error("parse_decls [invalid_argument]: the declaration text is required");
             return;
         }
         const std::string source_text = argv[0].as_text();
@@ -541,9 +573,11 @@ void register_sql_functions(
             return;
         }
         const int parsed = source.parse_declarations(source_text);
-        if (parsed >= 0) {
-            notify_source_mutation(on_source_mutation);
+        if (parsed < 0) {
+            ctx.result_error(source_failure(source, "parse_decls"));
+            return;
         }
+        notify_source_mutation(on_source_mutation);
         ctx.result_int(parsed);
     });
 

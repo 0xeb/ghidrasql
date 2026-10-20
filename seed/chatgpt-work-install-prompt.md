@@ -102,7 +102,7 @@ stack.
    **Gate**: `build/bin/ghidrasql --help` prints usage.
 5. Run it directly:
    `ghidrasql --ghidra "$GHIDRA_INSTALL_DIR" --binary /bin/ls --project /tmp/gs --project-name boot --analyze --http --port 8081`,
-   then `curl -X POST http://127.0.0.1:8081/query --data 'SELECT COUNT(*) FROM funcs;'`.
+   then `curl -X POST http://127.0.0.1:8081/query --data-binary 'SELECT COUNT(*) FROM funcs;'`.
 
 ---
 
