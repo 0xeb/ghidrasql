@@ -1910,14 +1910,14 @@ GhidraSQL can run as an HTTP server for remote queries.
 **Starting the server:**
 ```bash
 # Start with HTTP server
-ghidrasql --ghidra C:/ghidra_dist/ghidra_12.1_DEV --binary program.exe --http
+ghidrasql --ghidra C:/ghidra_dist/ghidra_12.2_PUBLIC --binary program.exe --http
 
 # List programs in a multi-program project and exit
-ghidrasql --ghidra C:/ghidra_dist/ghidra_12.1_DEV \
+ghidrasql --ghidra C:/ghidra_dist/ghidra_12.2_PUBLIC \
   --project C:/work/projects --project-name firmware --list-project-programs
 
 # Import multiple binaries and make one project program active
-ghidrasql --ghidra C:/ghidra_dist/ghidra_12.1_DEV \
+ghidrasql --ghidra C:/ghidra_dist/ghidra_12.2_PUBLIC \
   --project C:/work/projects --project-name firmware \
   --binary loader.exe --binary payload.exe --program /payload.exe --http
 

@@ -73,7 +73,8 @@ launch_script="$runtime/$GHIDRA_DIRNAME/support/launch.sh"
 if ! ( : < <(echo probe) ) 2>/dev/null; then
     if grep -q 'done < <(' "$launch_script" 2>/dev/null; then
         echo "process substitution unavailable -> patching Ghidra's launcher"
-        patch --batch --forward -p0 -d "$runtime" \
+        # Paths in the patch are relative to the Ghidra root, so it applies to any version.
+        patch --batch --forward -p0 -d "$runtime/$GHIDRA_DIRNAME" \
             < "$GHIDRASQL_KIT_ROOT/patches/ghidra-launch-no-dev-fd.patch"
     fi
 fi

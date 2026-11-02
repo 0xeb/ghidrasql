@@ -84,11 +84,11 @@ The most reliable path is:
 
 ### Prerequisites
 
-- [Ghidra](https://ghidra-sre.org/) distribution (12.1+) and JDK 21
+- [Ghidra](https://ghidra-sre.org/) 12.2 distribution and JDK 25
 - [libghidra](https://github.com/0xeb/libghidra) -- provides the `LibGhidraHost` extension and C++ SDK
 - C++20 compiler (Visual Studio 2022, GCC 12+, or Clang 15+)
 - CMake 3.26+
-- Gradle (for building the Ghidra extension)
+- Gradle 9.1+ (for building the Ghidra extension)
 
 ### 1. Clone both repos
 
