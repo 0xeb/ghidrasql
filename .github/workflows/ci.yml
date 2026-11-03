@@ -121,14 +121,19 @@ jobs:
         # lines; pass through just the assignments.
         run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' seed/versions.env >> "$GITHUB_ENV"
 
+      # Ghidra 12.2 (seed/versions.env) requires JDK 25 to build the extension.
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "25"
 
+      # Ghidra 12.2's buildExtension.gradle requires Gradle >= 9.1
+      # (application.gradle.min); pin it rather than trust the runner image.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.8.2"
 
       - name: Download pinned Ghidra
         run: |

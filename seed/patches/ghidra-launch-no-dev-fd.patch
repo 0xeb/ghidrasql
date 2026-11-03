@@ -1,5 +1,5 @@
---- ghidra_12.1.2_PUBLIC/support/launch.sh.orig
-+++ ghidra_12.1.2_PUBLIC/support/launch.sh
+--- support/launch.sh.orig
++++ support/launch.sh
 @@ -172,16 +172,18 @@
  # Get the configurable environment variables from the launch properties
  # Only set them if they are currently unset or empty

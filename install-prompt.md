@@ -14,11 +14,11 @@ once the server is up: see `prompts/ghidrasql_agent.md`.
 
 | Check | Command | Expected | Remediation |
 |-------|---------|----------|-------------|
-| JDK 21 | `java -version` | `21` in output | Install Eclipse Adoptium 21: <https://adoptium.net/temurin/releases/?version=21> |
+| JDK 25 | `java -version` | `25` in output | Install Eclipse Adoptium 25: <https://adoptium.net/temurin/releases/?version=25>. Ghidra 12.2 refuses to start on an older JDK. |
 | CMake ≥ 3.20 | `cmake --version` | major.minor ≥ 3.20 | Install from <https://cmake.org/download/> |
 | C++20 compiler | `cl /?` (Win) or `g++ --version` / `clang++ --version` | any 2022+ MSVC, GCC 12+, or Clang 15+ | Install Visual Studio 2022, or `apt install build-essential` / `xcode-select --install` |
 | Git | `git --version` | any modern | <https://git-scm.com/downloads> |
-| Gradle ≥ 8.5 | `gradle --version` | ≥ 8.5 | Install from <https://gradle.org/install/> (**winget has no Gradle package** — do not try `winget install gradle`), or use the `gradlew` wrapper bundled in your Ghidra source checkout at `Ghidra/RuntimeScripts/support/gradle`. Gradle 9.x is verified for the distribution-based `installExtension` path documented here; if you instead build the extension inside a Ghidra **source** tree and hit a `:Doclets` project-not-found error under 9.x, drop to Gradle 8.14 for that build. |
+| Gradle ≥ 9.1 | `gradle --version` | ≥ 9.1 (Ghidra 12.2's `application.gradle.min`) | Install from <https://gradle.org/install/> (**winget has no Gradle package** — do not try `winget install gradle`), or use the `gradlew` wrapper bundled in your Ghidra source checkout at `Ghidra/RuntimeScripts/support/gradle`. Gradle 9.x is verified for the distribution-based `installExtension` path documented here. |
 | Python ≥ 3.10 | `python --version` | major.minor ≥ 3.10 | <https://www.python.org/downloads/> |
 
 **Environment note**: if `GHIDRA_INSTALL_DIR` is already set in your
@@ -33,7 +33,7 @@ bootstrap path itself.
 
 ## Step 1 — Acquire Ghidra distribution
 
-Download Ghidra 12.1+ from the official release page:
+Download Ghidra 12.2 from the official release page:
 <https://github.com/NationalSecurityAgency/ghidra/releases>
 
 Pick a release with a published SHA-256. Verify after download:
@@ -49,10 +49,10 @@ Extract to a stable location and set `GHIDRA_INSTALL_DIR`:
 
 ```bash
 # Windows (PowerShell)
-$env:GHIDRA_INSTALL_DIR = "C:/ghidra_dist/ghidra_12.1_PUBLIC"
+$env:GHIDRA_INSTALL_DIR = "C:/ghidra_dist/ghidra_12.2_PUBLIC"
 
 # POSIX
-export GHIDRA_INSTALL_DIR=/opt/ghidra_12.1_PUBLIC
+export GHIDRA_INSTALL_DIR=/opt/ghidra_12.2_PUBLIC
 ```
 
 **Gate**:

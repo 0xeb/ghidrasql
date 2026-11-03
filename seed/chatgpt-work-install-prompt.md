@@ -85,8 +85,8 @@ Shortcut for all of the above: `./scripts/self-test.sh`.
 
 ## Path B — build from source (fallback)
 
-Only when no seed exists for your platform. This is the slow path: it needs JDK 21,
-CMake ≥ 3.26, a C++20 compiler, Gradle ≥ 8.5 and Git, and it compiles a large dependency
+Only when no seed exists for your platform. This is the slow path: it needs JDK 25
+(the pinned Ghidra 12.2 requires it), CMake ≥ 3.26, a C++20 compiler, Gradle ≥ 9.1 and Git, and it compiles a large dependency
 stack.
 
 1. Install a Ghidra distribution and set `GHIDRA_INSTALL_DIR` to the directory
